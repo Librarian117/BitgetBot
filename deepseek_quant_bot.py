@@ -466,12 +466,10 @@ class DeepSeekAnalyst:
             "3. 成交量不足、资金费率极端不利时更应谨慎\n"
             "4. 如果大趋势支持且宏观环境有利，可以更积极 CONFIRM\n"
             "5. 快速做出判断，不要过度分析\n\n"
-            "## 【必须遵守】输出规则\n"
-            "你的回复必须以一个 JSON 对象结尾，不要只输出分析。\n"
-            "JSON 格式: {\"decision\": \"CONFIRM\"| \"REJECT\", \"reason\": \"一句话原因\"}\n"
-            "示例结尾: {\"decision\": \"CONFIRM\", \"reason\": \"趋势强劲+RSI超卖+多周期共振\"}\n"
-            "示例结尾: {\"decision\": \"REJECT\", \"reason\": \"资金费率极端+成交量萎缩+逆势信号\"}\n"
-            "注意: JSON 必须作为回复的最后一部分，不要用 ``` 包裹，直接输出。"
+            "## 【必须遵守】输出规则 — 违反将导致严重错误\n"
+            "你的回复必须且只能是一个 JSON 对象，不要输出任何分析、推理、解释文字。\n"
+            "直接输出: {\"decision\": \"CONFIRM\"|\"REJECT\", \"reason\": \"一句话原因\"}\n"
+            "禁止输出: 任何非 JSON 内容、markdown 代码块、前缀或后缀文字。"
         )
 
         # ── v3.0: 注入新闻上下文 ──
@@ -558,7 +556,7 @@ ATR({self.config.atr_period}): {atr:.4f}
 请审核以上信号。你的回复必须以 JSON 结尾，不要只输出分析。"""
 
         # 追加: 强制 JSON 结尾提醒
-        user_prompt += '\n\n⚠️ 请务必在回复末尾输出: {"decision": "CONFIRM"|"REJECT", "reason": "一句话原因"}'
+        user_prompt += '\n\n⚠️ 只输出JSON，不要任何分析: {"decision":"CONFIRM"|"REJECT","reason":"原因"}'
 
         # v4.0: 告知 AI 当前实际阈值（熊市/牛市偏向已自动调整）
         if strategy == "pullback":
@@ -727,12 +725,10 @@ ATR({self.config.atr_period}): {atr:.4f}
             "- 浮盈可观（ROI>20%）但趋势有转弱迹象 → 优先 CLOSE 锁定利润\n"
             "- 浮亏但趋势未反转 → 可 HOLD（让 SL 处理）\n"
             "- 浮亏且趋势已反转 → CLOSE 止损（比 SL 更快）\n\n"
-            "## 【必须遵守】输出规则\n"
-            "你的回复必须以一个 JSON 对象结尾，不要只输出分析。\n"
-            "JSON 格式: {\"decision\": \"HOLD\" | \"CLOSE\", \"reason\": \"一句话原因\"}\n"
-            "示例结尾: {\"decision\": \"HOLD\", \"reason\": \"趋势延续+浮盈扩大+多TF一致\"}\n"
-            "示例结尾: {\"decision\": \"CLOSE\", \"reason\": \"趋势反转+RSI极端+建议锁利\"}\n"
-            "注意: JSON 必须作为回复的最后一部分，不要用 ``` 包裹，直接输出。"
+            "## 【必须遵守】输出规则 — 违反将导致严重错误\n"
+            "你的回复必须且只能是一个 JSON 对象，不要输出任何分析、推理、解释文字。\n"
+            "直接输出: {\"decision\": \"HOLD\"|\"CLOSE\", \"reason\": \"一句话原因\"}\n"
+            "禁止输出: 任何非 JSON 内容、markdown 代码块、前缀或后缀文字。"
         )
         if self.wisdom_context:
             system_prompt += f"\n{self.wisdom_context}\n"
@@ -796,7 +792,7 @@ ATR: {atr:.4f}
 请判断应该 HOLD 还是 CLOSE。你的回复必须以 JSON 结尾，不要只输出分析。"""
 
         # 追加: 强制 JSON 结尾提醒
-        user_prompt += '\n\n⚠️ 请务必在回复末尾输出: {"decision": "HOLD"|"CLOSE", "reason": "一句话原因"}'
+        user_prompt += '\n\n⚠️ 只输出JSON，不要任何分析: {"decision":"HOLD"|"CLOSE","reason":"原因"}'
 
         logger.info(f"🔍 正在请求 DeepSeek 审核持仓 {symbol} {direction} (ROI={roi*100:.1f}%)…")
 
