@@ -801,14 +801,41 @@ class SelfLearner:
         # ── 全局回退: 按方向统计 ──
         recent = [t for t in recent_10 if t.get("direction") == direction]
         if len(recent) < min_trades:
+            # v4.0: 笔数不足时仅在大亏时暂停 (>20U 或 全输)
+            if len(recent) >= 3:
+                wins = sum(1 for t in recent if t.get("pnl", 0) > 0)
+                if wins == 0:  # 3笔全输 → 暂停
+                    total_pnl = sum(t.get("pnl", 0) for t in recent)
+                    return False, (
+                        f"{direction}方向{len(recent)}笔全输,累计{total_pnl:.1f}U，暂停"
+                    )
             return True, ""
         wins = sum(1 for t in recent if t.get("pnl", 0) > 0)
         wr = wins / len(recent)
-        if wr < win_rate_threshold:
+        total_pnl = sum(t.get("pnl", 0) for t in recent)
+
+        # v4.0: 分级暂停逻辑
+        # ① 5笔以上 + 胜率<30% → 暂停 (原逻辑)
+        if len(recent) >= 5 and wr < win_rate_threshold:
             return False, (
                 f"{direction}方向滚动{len(recent)}笔胜率{wr*100:.0f}%"
                 f"<{win_rate_threshold*100:.0f}%，自动暂停"
             )
+
+        # ② 累计大亏 (>30U) + 胜率不过半 → 暂停
+        if total_pnl < -30 and wr < 0.5:
+            return False, (
+                f"{direction}方向{len(recent)}笔累计亏损{total_pnl:.1f}U"
+                f"胜率{wr*100:.0f}%，暂停"
+            )
+
+        # ③ 3-4笔全输 + 累计亏 → 暂停
+        if len(recent) <= 4 and wins == 0 and total_pnl < -10:
+            return False, (
+                f"{direction}方向{len(recent)}笔全输"
+                f"累计亏损{total_pnl:.1f}U，暂停"
+            )
+
         return True, ""
 
     # ════════════════════════════════════════════
@@ -1080,9 +1107,9 @@ class SelfLearner:
 "IF market_regime=<regime> AND strategy=<strategy> AND direction=<direction> AND <condition> THEN <action>"
 
 参考示例:
-- IF market_regime=strong_trend AND strategy=pullback AND direction=SHORT AND adx>25 THEN confidence_penalty=-10
-- IF market_regime=ranging AND strategy=momentum AND direction=LONG AND rsi<30 THEN confidence_boost=+15
-- IF market_regime=weak_trend AND strategy=breakout AND direction=LONG AND volume_ratio<1.2 THEN skip_signal=true
+- IF market_regime=strong_bull AND strategy=pullback AND direction=SHORT AND adx>25 THEN confidence_penalty=-10
+- IF market_regime=range AND strategy=momentum AND direction=LONG AND rsi<30 THEN confidence_boost=+15
+- IF market_regime=bear AND strategy=momentum AND direction=LONG AND volume_ratio<1.2 THEN skip_signal=true
 
 动作类型: confidence_penalty, confidence_boost, skip_signal, reduce_position, increase_sl, tighten_tp
 
@@ -1785,8 +1812,8 @@ class SelfLearner:
 
         # ── 下调路径 (信号太少 → 放宽) ──
         if signal_rate < 0.05 and total >= 20:
-            # 严重干旱: 急放 ADX + 量比 (v4.0: 降低触发门槛)
-            new_adx = max(8, current_adx - 3)
+            # 严重干旱: 急放 ADX + 量比
+            new_adx = max(6, current_adx - 4)  # v4.0: floor降到6, 步长-4
             if new_adx != current_adx:
                 messages.append(f"ADX {current_adx}→{new_adx}")
                 self.config.adx_threshold = new_adx
@@ -1797,15 +1824,22 @@ class SelfLearner:
                 self.config.vol_ratio_threshold = new_vol
         elif signal_rate < 0.10 and total >= 15:
             # v4.0: 加速下调 — 信号持续偏低时更快响应
-            new_adx = max(8, current_adx - 2)
+            new_adx = max(6, current_adx - 3)  # v4.0: floor降到6
             if new_adx != current_adx:
                 messages.append(f"ADX {current_adx}→{new_adx}")
                 self.config.adx_threshold = new_adx
         elif signal_rate < 0.15 and total >= 15:
-            new_adx = max(8, current_adx - 2)  # v4.0: -2 instead of -1
+            new_adx = max(6, current_adx - 2)  # v4.0: floor降到6
             if new_adx != current_adx:
                 messages.append(f"ADX {current_adx}→{new_adx}")
                 self.config.adx_threshold = new_adx
+
+        # v4.0: 极端干旱 — 信号率连续为0, 直接降到底
+        if signal_rate == 0.0 and total >= 10:
+            floor_adx = 6
+            if current_adx > floor_adx:
+                messages.append(f"极端干旱! ADX {current_adx}→{floor_adx}")
+                self.config.adx_threshold = floor_adx
 
         # ── 上调路径 (信号太多但质量差 → 收紧) ──
         if signal_rate > 0.40 and win_rate < 0.35:

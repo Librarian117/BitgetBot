@@ -121,7 +121,7 @@ class ConfigManager:
         self.market_context_ttl = int(os.getenv("MARKET_CONTEXT_TTL", "14400"))  # 4小时
 
         # ── 日内风控 ──
-        self.daily_loss_limit = 0.05  # 日内累计亏损 > 5% → 停止交易
+        self.daily_loss_limit = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
 
         # ── v3.1: 初始资金 (用于计算总盈亏) ──
         self.initial_equity = float(os.getenv("INITIAL_EQUITY", "0"))

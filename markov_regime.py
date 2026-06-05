@@ -304,6 +304,88 @@ class MarkovRegime:
 
         return " | ".join(parts)
 
+    # ════════════════════════════════════════════
+    # v4.0: 6 状态映射
+    # ════════════════════════════════════════════
+
+    def get_six_state(self, prices: List[float], symbol: str = "",
+                      adx: float = 0, atr_pct: float = 0) -> Dict[str, Any]:
+        """
+        将 Markov 3 状态 + 辅助指标映射为 v4.0 6 状态。
+
+        映射逻辑:
+          Markov bull + ADX 强势  → strong_bull
+          Markov bull + ADX 一般  → bull
+          Markov bear + ADX 强势  → strong_bear
+          Markov bear + ADX 一般  → bear
+          Markov sideways          → range
+          极端 ATR% (>2.5%)      → panic (覆盖以上)
+
+        Returns:
+            与 _detect_market_regime 兼容的 dict, 包含 regime/recommended/direction 等
+        """
+        result = self.detect(prices, symbol)
+        regime_3 = result.get("current_regime", "sideways")
+        signal = result.get("signal", 0)
+
+        # 极端波动 → panic 覆盖
+        if atr_pct >= 2.5:
+            return {
+                "regime": "panic",
+                "direction": "neutral",
+                "volatility": "extreme",
+                "trend_strength": "strong" if adx >= 25 else "moderate",
+                "atr_pct": round(atr_pct, 3),
+                "consensus": 0.0,
+                "recommended": [],
+                "confidence": 85,
+                "detail": "🚨Markov:极端波动-仅观望",
+                "markov_bias": signal,
+            }
+
+        # 3→6 状态映射
+        adx_strong = adx >= 25
+
+        if regime_3 == "bull":
+            if adx_strong:
+                regime = "strong_bull"
+                recommended = ["momentum"]
+                detail = "🐂Markov牛市+ADX强势→强牛"
+            else:
+                regime = "bull"
+                recommended = ["pullback", "ema_cross"]
+                detail = "📈Markov牛市→回调做多"
+            direction = "bullish"
+        elif regime_3 == "bear":
+            if adx_strong:
+                regime = "strong_bear"
+                recommended = ["momentum"]
+                detail = "🐻Markov熊市+ADX强势→强熊"
+            else:
+                regime = "bear"
+                recommended = ["pullback", "counter_trend"]
+                detail = "📉Markov熊市→回调做空"
+            direction = "bearish"
+        else:  # sideways
+            regime = "range"
+            recommended = ["grid", "bollinger", "pullback"]
+            direction = "neutral"
+            detail = "📊Markov震荡→网格/布林"
+
+        return {
+            "regime": regime,
+            "direction": direction,
+            "volatility": "extreme" if atr_pct >= 1.0 else ("normal" if atr_pct >= 0.3 else "low"),
+            "trend_strength": "strong" if adx_strong else "moderate",
+            "atr_pct": round(atr_pct, 3),
+            "consensus": abs(signal),  # Markov signal 绝对值视为共识度
+            "recommended": recommended,
+            "confidence": result.get("confidence", 50),
+            "detail": detail,
+            "markov_bias": signal,
+            "_source": "markov",  # 标记来源，便于区分
+        }
+
     @staticmethod
     def _empty_result() -> Dict[str, Any]:
         return {

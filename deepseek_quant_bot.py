@@ -510,10 +510,12 @@ class DeepSeekAnalyst:
                     )
         if market_regime:
             regime_labels = {
-                "strong_trend": "强趋势市（大趋势明确，顺势信号胜率高）",
-                "weak_trend": "弱趋势市（有方向但不够强，注意假突破）",
-                "ranging": "震荡市（无明确方向，信号胜率低）",
-                "conflicting": "多周期冲突（方向不一致，建议观望）",
+                "strong_bull": "🐂强牛市（全周期看涨+高共识，顺势做多胜率高）",
+                "bull": "📈牛市（多数周期看涨，回调做多+EMA交叉）",
+                "range": "📊震荡市（无明确方向，网格/布林/回调双向）",
+                "bear": "📉熊市（多数周期看跌，回调做空+逆势空）",
+                "strong_bear": "🐻强熊市（全周期看跌+高共识，顺势做空优先）",
+                "panic": "🚨极端波动（ATR>2.5%，建议观望或仅减仓）",
             }
             tf_section += (
                 f"\n综合市场状态: {regime_labels.get(market_regime, market_regime)}"
@@ -575,8 +577,9 @@ ATR({self.config.atr_period}): {atr:.4f}
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": self.config.deepseek_temp,
-                "max_tokens": 800,  # v4.0: 增加空间，确保分析后有空间输出JSON
-                "response_format": {"type": "json_object"},  # v4.0: 强制JSON输出
+                "max_tokens": 800,
+                # v4.0: 移除 response_format — DeepSeek 推理模型不完全支持,
+                # _extract_json 已能处理自由文本中的 JSON
             }
 
             # 可选: 添加 Function Call 工具
@@ -751,10 +754,12 @@ ATR({self.config.atr_period}): {atr:.4f}
                     )
         if market_regime:
             regime_labels = {
-                "strong_trend": "强趋势市",
-                "weak_trend": "弱趋势市",
-                "ranging": "震荡市（持仓不利）",
-                "conflicting": "多周期冲突（高风险）",
+                "strong_bull": "🐂强牛市（顺势做多）",
+                "bull": "📈牛市（偏多）",
+                "range": "📊震荡市（双向）",
+                "bear": "📉熊市（偏空）",
+                "strong_bear": "🐻强熊市（顺势做空）",
+                "panic": "🚨极端波动（危险）",
             }
             tf_section += (
                 f"\n综合市场状态: {regime_labels.get(market_regime, market_regime)}"
@@ -803,8 +808,8 @@ ATR: {atr:.4f}
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": self.config.deepseek_temp,
-                "max_tokens": 800,  # v4.0: 增加空间，确保分析后有空间输出JSON
-                "response_format": {"type": "json_object"},
+                "max_tokens": 800,
+                # v4.0: 移除 response_format — DeepSeek 推理模型不完全支持
             }
 
             resp = self.session.post(
@@ -853,21 +858,17 @@ ATR: {atr:.4f}
 
     @staticmethod
     def _merge_content_reasoning(msg: Dict[str, Any]) -> str:
-        """v3.7: 正确合并 DeepSeek 推理模型的 content + reasoning_content。
+        """v4.0: 智能合并 DeepSeek 推理模型的 content + reasoning_content。
 
-        关键修复: deepseek-v4-pro 是推理模型，JSON 决策通常在 reasoning_content，
-        但 content 可能包含对话文本。之前的 `content or reasoning_content` 逻辑
-        会优先取 content 并丢弃 reasoning_content（当 content 非空时），
-        导致 JSON 决策被静默丢弃 → 回退到默认值 → 96.5% 解析失败。
-
-        现在: 始终合并两者，reasoning_content 优先放在前面（含关键 JSON）。
+        策略变更: content 优先放在前面（含关键 JSON），reasoning 补充在后面。
+        v3.7 的问题是 reasoning 放前面，其分析文本会混淆 JSON 解析器。
         """
         c = (msg.get("content") or "").strip()
         r = (msg.get("reasoning_content") or "").strip()
-        # reasoning_content 优先 → 确保 JSON 决策在最前面
-        if r and c:
-            return f"{r}\n{c}"
-        return r or c
+        # content 优先 → JSON 决策在最前面，解析器直接命中
+        if c and r:
+            return f"{c}\n{r}"
+        return c or r
 
     @staticmethod
     def _extract_json(raw: str, context: str = "entry_review") -> Dict[str, Any]:
@@ -1017,8 +1018,11 @@ ATR: {atr:.4f}
         m = _re.search(r'(?:decision|决定)[:\s]*["\']?\s*(CONFIRM|REJECT|CLOSE|HOLD|confirm|reject|close|hold)', raw, _re.IGNORECASE)
         if m:
             d = m.group(1).upper()
-            logger.warning(f"⚠️  正则推断 decision={d}")
+            logger.warning(f"⚠️  正则推断 decision={d} | raw[:200]={raw[:200]}")
             return {"decision": d, "reason": "正则推断"}
+
+        # v4.0: 记录解析失败详情便于诊断
+        logger.warning(f"⚠️  完全无法解析 DeepSeek 回复 (context={context}): raw[:300]={raw[:300]}")
 
         # v3.7: context 感知的默认值
         defaults = {
@@ -1373,7 +1377,7 @@ class RiskMonitor:
       - 连续亏损 3 次 → 暂停 4 小时
       - 连续亏损 5 次 → 暂停 24 小时
       - 币种越多, 阈值越宽 (动态调整)
-      - 日亏损 -8% 作为硬性兜底 (百分比锁保留)
+      - 日亏损硬止损 (从 .env MAX_DAILY_LOSS_PCT 读取, 默认 3%)
     """
 
     # v4.0: 基础阈值 (10 币种)
@@ -1381,7 +1385,6 @@ class RiskMonitor:
     BASE_STREAK_HARD = 5      # 连续亏损此次数 → 长暂停
     BASE_COOLDOWN_WARN_H = 4  # 暂停小时
     BASE_COOLDOWN_HARD_H = 24 # 长暂停小时
-    HARD_LOSS_PCT = -0.08     # 日内 -8% 硬兜底
 
     def __init__(self, config: ConfigManager, exchange: ExchangeInterface):
         self.config = config
@@ -1392,6 +1395,9 @@ class RiskMonitor:
         self._current_date: str = ""
         self.cumulative_fees: float = 0.0
         self.initial_equity: float = config.initial_equity
+
+        # v4.0: 从配置读取硬止损百分比 (默认 3%)
+        self.hard_loss_pct = -abs(getattr(config, 'daily_loss_limit', 0.05))
 
         # v4.0: 连续亏损追踪
         self.consecutive_losses: int = 0
@@ -1521,11 +1527,11 @@ class RiskMonitor:
             self.cooldown_reason = ""
             self.consecutive_losses = 0  # 重新计数
 
-        # 3. 百分比硬兜底: -8%
-        if self.daily_pnl_pct < self.HARD_LOSS_PCT:
+        # 3. 百分比硬兜底 (从 .env 读取, 默认 3%)
+        if self.daily_pnl_pct < self.hard_loss_pct:
             logger.error(
                 f"🚨 日内亏损 {self.daily_pnl_pct*100:.2f}% > "
-                f"{abs(self.HARD_LOSS_PCT)*100:.0f}%，硬止损！"
+                f"{abs(self.hard_loss_pct)*100:.0f}%，硬止损！"
             )
             return False
 
@@ -1541,7 +1547,7 @@ class RiskMonitor:
         streak_warn, streak_hard, _, _ = self._get_thresholds()
         cooldown_remaining = max(0, (self.cooldown_until - time.time()) / 3600) if self.cooldown_until > 0 else 0
 
-        blocked = time.time() < self.cooldown_until or self.daily_pnl_pct < self.HARD_LOSS_PCT
+        blocked = time.time() < self.cooldown_until or self.daily_pnl_pct < self.hard_loss_pct
         return {
             "date": self._current_date,
             "initial_equity": self.initial_equity,
@@ -1957,139 +1963,168 @@ class DeepSeekQuantBot:
 
     def _detect_market_regime(self, tf_context: Dict[str, Any],
                               atr: float = 0, close: float = 0,
-                              adx: float = 0, vol_ratio: float = 1.0) -> Dict[str, Any]:
-        """v3.7: 增强市场状态识别 — 多维度回归综合判断。
+                              adx: float = 0, vol_ratio: float = 1.0,
+                              markov_result: Dict[str, Any] = None) -> Dict[str, Any]:
+        """v4.0: 6 状态市场分类 — 多维度综合 + Markov 长期偏向。
+
+        六状态 → 默认策略映射:
+          strong_bull  → momentum (强趋势追涨)
+          bull         → pullback, ema_cross (回调做多)
+          range        → grid, bollinger, pullback (震荡双向)
+          bear         → pullback, counter_trend (回调做空/逆势)
+          strong_bear  → momentum (强趋势追空)
+          panic        → 不推荐开仓 (极端波动, 仅观望/减仓)
 
         输入:
           - tf_context: 多 TF 趋势上下文 (必需)
-          - atr, close: 用于波动率分级 (可选, 默认 0 → normal vol)
-          - adx: 趋势强度 (可选, 默认 0 → weak)
-          - vol_ratio: 量比 (可选, 默认 1.0 → 正常)
+          - atr, close: 用于波动率分级
+          - adx: 趋势强度
+          - vol_ratio: 量比
+          - markov_result: Markov 长期状态 (可选, 用于偏向微调)
 
-        返回 dict (向后兼容: 用 .get("regime") 取标签):
+        返回 dict (向后兼容, 用 .get("regime") 取标签):
         """
-        # ── 1. 多 TF 趋势一致性 (原有逻辑) ──
-        regimes = []
-        trends = []
+        # ── 1. 多 TF 方向共识 ──
+        bull_tfs = 0
+        bear_tfs = 0
+        total_tfs = 0
         for tf in self.config.higher_timeframes:
             ctx = tf_context.get(tf, {})
-            regimes.append(ctx.get("regime", "unknown"))
-            trends.append(ctx.get("trend", "unknown"))
-        both_trending = all(r == "trending" for r in regimes)
-        any_trending = any(r == "trending" for r in regimes)
-        same_direction = len(set(trends)) == 1 and "unknown" not in trends
-
-        if both_trending and same_direction:
-            trend_regime = "strong_trend"
-            trend_conf = 80
-        elif both_trending and not same_direction:
-            trend_regime = "conflicting"
-            trend_conf = 40
-        elif any_trending:
-            trend_regime = "weak_trend"
-            trend_conf = 55
-        else:
-            trend_regime = "ranging"
-            trend_conf = 60
+            trend = ctx.get("trend", "unknown")
+            if trend == "bullish":
+                bull_tfs += 1
+                total_tfs += 1
+            elif trend == "bearish":
+                bear_tfs += 1
+                total_tfs += 1
 
         # ── 2. 波动率分级 (ATR%) ──
         atr_pct = (atr / close * 100) if close > 0 else 0
-        # 参考范围: crypto 15m ATR% 通常 0.1%-3%
-        if atr_pct < 0.3:
-            volatility = "low"
-            vol_conf = 70
-        elif atr_pct < 1.0:
-            volatility = "normal"
-            vol_conf = 60
-        else:
+        # crypto 15m ATR% 通常 0.1%-3%, >2.5% 极端
+        if atr_pct >= 2.5:
+            volatility = "extreme"
+        elif atr_pct >= 1.0:
             volatility = "high"
-            vol_conf = 75
-
-        # ── 3. ADX 趋势强度分层 ──
-        if adx < 20:
-            adx_tier = "none"
-            adx_conf = 65
-        elif adx < 30:
-            adx_tier = "weak"
-            adx_conf = 55
+        elif atr_pct >= 0.3:
+            volatility = "normal"
         else:
-            adx_tier = "strong"
-            adx_conf = 70
+            volatility = "low"
 
-        # ── 4. 综合标签 ──
+        # ── 3. ADX 趋势强度 ──
+        if adx >= 25:
+            adx_tier = "strong"
+        elif adx >= 20:
+            adx_tier = "moderate"
+        else:
+            adx_tier = "weak"
+
+        # ── 4. 方向判断 ──
+        if bull_tfs > bear_tfs:
+            direction = "bullish"
+            consensus = bull_tfs / max(total_tfs, 1)
+        elif bear_tfs > bull_tfs:
+            direction = "bearish"
+            consensus = bear_tfs / max(total_tfs, 1)
+        else:
+            direction = "neutral"
+            consensus = 0.0
+
+        # ── 5. Markov 长期偏向 (可选) ──
+        markov_bias = 0.0
+        if markov_result and markov_result.get("confidence", 0) >= 40:
+            markov_bias = markov_result.get("signal", 0)  # -1.0 ~ +1.0
+
+        # ── 6. 六状态分类 ──
+        regime = "range"
         recommended = []
         detail_parts = []
 
-        # 核心判断: 趋势 × 波动
-        if trend_regime == "strong_trend":
-            if volatility == "high":
-                label = "high_vol_strong_trend"
-                recommended = ["momentum", "pullback", "ema_cross"]
-                detail_parts.append("高波强趋势-顺势追击")
-            else:
-                label = "strong_trend"
-                recommended = ["momentum", "pullback", "ema_cross"]
-                detail_parts.append("强趋势-动量/交叉优先")
+        # Panic: 极端波动 → 不推荐开仓
+        if volatility == "extreme":
+            regime = "panic"
+            recommended = []
+            detail_parts.append("🚨极端波动-仅观望/减仓")
 
-        elif trend_regime == "weak_trend":
-            if volatility == "low":
-                label = "low_vol_weak_trend"
-                recommended = ["pullback", "ema_cross"]
-                detail_parts.append("低波弱趋势-回调/交叉")
-            else:
-                label = "weak_trend"
-                recommended = ["pullback", "ema_cross"]
-                detail_parts.append("弱趋势-回调/交叉")
+        # Strong Bull: 全TF看涨 + ADX强势 + 高共识
+        elif direction == "bullish" and consensus >= 1.0 and adx_tier == "strong":
+            regime = "strong_bull"
+            recommended = ["momentum"]
+            detail_parts.append("🐂强牛市-动量追涨优先")
 
-        elif trend_regime == "ranging":
+        # Strong Bear: 全TF看跌 + ADX强势 + 高共识
+        elif direction == "bearish" and consensus >= 1.0 and adx_tier == "strong":
+            regime = "strong_bear"
+            recommended = ["momentum"]
+            detail_parts.append("🐻强熊市-动量追空优先")
+
+        # Bull: 多数TF看涨
+        elif direction == "bullish" and consensus >= 0.5:
+            regime = "bull"
+            recommended = ["pullback", "ema_cross"]
+            if adx_tier == "strong":
+                recommended.insert(0, "momentum")
+            detail_parts.append("📈牛市-回调做多+EMA交叉")
+
+        # Bear: 多数TF看跌
+        elif direction == "bearish" and consensus >= 0.5:
+            regime = "bear"
+            recommended = ["pullback", "counter_trend"]
+            if adx_tier == "strong":
+                recommended.insert(0, "momentum")
+            detail_parts.append("📉熊市-回调做空+逆势")
+
+        # Range: 无明确方向
+        else:
+            regime = "range"
             if volatility == "low":
-                label = "low_vol_ranging"
-                recommended = ["grid", "pullback", "bollinger"]
-                detail_parts.append("低波震荡-网格/布林优先")
-            elif volatility == "high":
-                label = "high_vol_ranging"
+                recommended = ["grid", "bollinger", "pullback"]
+                detail_parts.append("📊低波震荡-网格/布林/回调")
+            else:
                 recommended = ["pullback", "bollinger"]
-                detail_parts.append("高波震荡-回调/布林")
-            else:
-                label = "ranging"
-                recommended = ["grid", "pullback", "bollinger"]
-                detail_parts.append("震荡市-网格/回调/布林")
+                detail_parts.append("📊震荡市-回调/布林")
 
-        else:  # conflicting
-            if volatility == "high":
-                label = "high_vol_conflicting"
-                recommended = []
-                detail_parts.append("高波冲突-建议观望")
-            else:
-                label = "conflicting"
-                recommended = ["pullback"]
-                detail_parts.append("多周期冲突-保守回调")
+        # ── 7. Markov 长期偏向微调 ──
+        if markov_bias > 0.3 and regime in ("range", "bear"):
+            detail_parts.append(f"Markov偏多({markov_bias:.2f})→升一级")
+            if regime == "bear":
+                regime = "range"
+                recommended = ["pullback", "bollinger"]
+            elif regime == "range" and direction != "bearish":
+                regime = "bull"
+                recommended = ["pullback", "ema_cross"]
+        elif markov_bias < -0.3 and regime in ("range", "bull"):
+            detail_parts.append(f"Markov偏空({markov_bias:.2f})→降一级")
+            if regime == "bull":
+                regime = "range"
+                recommended = ["pullback", "bollinger"]
+            elif regime == "range" and direction != "bullish":
+                regime = "bear"
+                recommended = ["pullback", "counter_trend"]
 
-        # ADX 微调
-        if adx_tier == "strong" and "momentum" not in recommended:
-            recommended.insert(0, "momentum")
-            detail_parts.append("ADX强势→加推动量")
-        elif adx_tier == "none" and "momentum" in recommended:
-            recommended.remove("momentum")
-            detail_parts.append("ADX弱势→移除动量")
-
-        # 量比调整
+        # ── 8. 量比调整 ──
         if vol_ratio > 2.0:
-            detail_parts.append(f"放量{vol_ratio:.1f}x-信号可靠")
+            detail_parts.append(f"放量{vol_ratio:.1f}x")
         elif vol_ratio < 0.5 and vol_ratio > 0:
-            detail_parts.append("缩量-信号可信度降低")
+            detail_parts.append("缩量-谨慎")
 
-        # ── 综合置信度 ──
-        confidence = int((trend_conf + vol_conf + adx_conf) / 3)
+        # ── 9. 置信度 ──
+        confidence = 70 if consensus >= 1.0 else (55 if consensus >= 0.5 else 40)
+        if adx_tier == "strong":
+            confidence += 10
+        if volatility == "extreme":
+            confidence = 85
 
         return {
-            "regime": label,
+            "regime": regime,
+            "direction": direction,
             "volatility": volatility,
             "trend_strength": adx_tier,
             "atr_pct": round(atr_pct, 3),
+            "consensus": round(consensus, 2),
             "recommended": recommended,
-            "confidence": confidence,
+            "confidence": min(100, confidence),
             "detail": " | ".join(detail_parts),
+            "markov_bias": round(markov_bias, 3),
         }
 
     # ==================================================================
@@ -2254,10 +2289,10 @@ class DeepSeekQuantBot:
             # ── ① ADX 震荡过滤 (v3.6: 移除沙箱绕过，让过滤真正生效) ──
             session = SessionManager.get_session(
                 self.config.adx_threshold, self.config.vol_ratio_threshold)
-            # v3.6: 沙箱也不跳过ADX过滤，但阈值更宽松
+            # v4.0: 沙箱ADX阈值 — floor降到6, 与自动调参floor一致
             effective_adx = session["adx_threshold"]
             if self.config.is_sandbox:
-                effective_adx = max(10, effective_adx - 6)  # 沙箱模式放宽但不全跳
+                effective_adx = max(6, effective_adx - 4)  # 沙箱模式放宽但不全跳
             if adx < effective_adx:
                 logger.debug(
                     f"{symbol} ADX={adx:.2f} < {effective_adx} "
@@ -2574,23 +2609,37 @@ class DeepSeekQuantBot:
                         logger.debug("⚠️  静默异常", exc_info=True)
 
                 # 构建简化的 regime_info (单TF近似，供评分器使用)
-                # 后续 run_once 中的多TF分析会做更精确的判断
+                # 后续 run_once 中的多TF分析会做更精确的6状态分类
                 regime_info = None
                 try:
                     atr_pct = atr / close if close > 0 else 0
-                    if adx > 25:
-                        regime_label = "trending"
-                        recommended = ["momentum", "pullback", "ema_cross"]
+                    # v4.0: 6状态简化版 — 基于单TF趋势+ADX
+                    if atr_pct >= 0.025:  # >2.5% = 极端波动
+                        regime_label = "panic"
+                        recommended = []
+                    elif adx > 25 and is_bullish_trend:
+                        regime_label = "strong_bull"
+                        recommended = ["momentum"]
+                    elif adx > 25 and is_bearish_trend:
+                        regime_label = "strong_bear"
+                        recommended = ["momentum"]
+                    elif is_bullish_trend:
+                        regime_label = "bull"
+                        recommended = ["pullback", "ema_cross"]
+                    elif is_bearish_trend:
+                        regime_label = "bear"
+                        recommended = ["pullback", "counter_trend"]
                     else:
-                        regime_label = "ranging"
+                        regime_label = "range"
                         recommended = ["bollinger", "grid", "pullback"]
+                    atr_tier = "extreme" if atr_pct >= 0.025 else ("high" if atr_pct > 0.01 else "normal")
                     regime_info = {
                         "regime": regime_label,
                         "recommended": recommended,
-                        "confidence": 55,
-                        "volatility": "high" if atr_pct > 0.01 else "normal",
-                        "trend_strength": "strong" if adx > 30 else ("weak" if adx < 20 else "moderate"),
-                        "detail": f"单TF{regime_label} ADX={adx:.1f} ATR%={atr_pct*100:.2f}",
+                        "confidence": 60 if adx > 25 else 45,
+                        "volatility": atr_tier,
+                        "trend_strength": "strong" if adx > 25 else ("weak" if adx < 20 else "moderate"),
+                        "detail": f"单TF:{regime_label} ADX={adx:.1f} ATR%={atr_pct*100:.2f}",
                     }
                 except Exception:
                     logger.debug("⚠️  静默异常", exc_info=True)
@@ -2678,6 +2727,7 @@ class DeepSeekQuantBot:
                 "_hurst_regime": quant.get("hurst_regime", "random_walk"),
                 "_kalman_score": quant.get("kalman_score", 0),
                 "_vol_cone_sl_mult": quant.get("vol_cone_sl_mult", 1.0),
+                "_markov": markov_result,  # v4.0: 传给 _detect_market_regime
             }
 
         except Exception as e:
@@ -3401,8 +3451,10 @@ class DeepSeekQuantBot:
             # ── v2: 多时间周期分析 + v3.7 增强市场状态识别 ──
             tf_context = self._analyze_tf_context(symbol)
             vol_ratio_val = sig.get("vol_ratio", 1.0)
+            markov_sig = sig.get("_markov")
             regime_info = self._detect_market_regime(
-                tf_context, atr=atr, close=price, adx=adx, vol_ratio=vol_ratio_val)
+                tf_context, atr=atr, close=price, adx=adx, vol_ratio=vol_ratio_val,
+                markov_result=markov_sig)
             market_regime = regime_info.get("regime", "unknown")
             # v4.0: 记录当前市场状态，供平仓归因使用
             self._current_regime = market_regime
@@ -3476,8 +3528,8 @@ class DeepSeekQuantBot:
                 except Exception as e:
                     logger.warning(f"⚠️  周末网格部署失败 {symbol}: {e}")
 
-            # ── v3.0: 震荡市网格策略 ──
-            if market_regime == "ranging" and self.grid_manager:
+            # ── v4.0: 震荡市(rage) 网格策略 ──
+            if market_regime == "range" and self.grid_manager:
                 if not self.grid_manager.is_active(symbol):
                     try:
                         df = self.exchange.fetch_ohlcv(symbol)
@@ -3682,7 +3734,7 @@ class DeepSeekQuantBot:
                     sym_ctx = self._tf_cache.get(sym)
                     if sym_ctx:
                         regime = self._detect_market_regime(sym_ctx).get("regime", "unknown")
-                        if regime != "ranging":
+                        if regime != "range":
                             self.grid_manager.cancel_grid(sym)
                             logger.info(f"📋 市场不再震荡，取消 {sym} 网格")
 
