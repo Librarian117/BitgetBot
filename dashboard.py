@@ -97,8 +97,12 @@ def print_dashboard(ex):
             shorts += 1
 
         info = p.get("info", {})
-        has_sl = bool(info.get("stopLoss", "") or info.get("stopLossPrice", ""))
-        has_tp = bool(info.get("takeProfit", "") or info.get("takeProfitPrice", ""))
+        # v4.0 fix: 重用 bot 的双重 SL 检测 (fetch_positions + fetch_open_orders)
+        try:
+            has_sl, has_tp = ex._has_position_tpsl(sym_full, entry, side)
+        except Exception:
+            has_sl = bool(info.get("stopLoss", "") or info.get("stopLossPrice", ""))
+            has_tp = bool(info.get("takeProfit", "") or info.get("takeProfitPrice", ""))
         if not has_sl or not has_tp:
             bare += 1
 
