@@ -605,7 +605,7 @@ class GeneticEvolver:
                     "model": self.deepseek_model,
                     "messages": [
                         {"role": "system",
-                         "content": "你是量化交易参数优化专家。仅返回符合JSON格式的结果，不要额外文本。"},
+                         "content": "【必须使用中文回复，禁止使用英文】你是量化交易参数优化专家。仅返回符合JSON格式的结果，不要额外文本。"},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.3,

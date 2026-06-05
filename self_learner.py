@@ -1095,7 +1095,7 @@ class SelfLearner:
                     "model": self.config.deepseek_model,
                     "messages": [
                         {"role": "system",
-                         "content": "你是量化交易规则提炼专家。只输出 IF-THEN 格式的规则，不要额外解释，不要 JSON。"},
+                         "content": "【必须使用中文回复，禁止使用英文】你是量化交易规则提炼专家。只输出 IF-THEN 格式的规则，不要额外解释，不要 JSON。"},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.3,
@@ -1232,7 +1232,7 @@ class SelfLearner:
                 json={
                     "model": self.config.deepseek_model,
                     "messages": [
-                        {"role": "system", "content": "你是量化交易教练。基于真实交易数据提炼可操作教训。简洁、具体、能落地。"},
+                        {"role": "system", "content": "【必须使用中文回复，禁止使用英文】你是量化交易教练。基于真实交易数据提炼可操作教训。简洁、具体、能落地。"},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.4,
@@ -1334,7 +1334,7 @@ class SelfLearner:
                 json={
                     "model": self.config.deepseek_model,
                     "messages": [
-                        {"role": "system", "content": "你是量化策略分析师。基于实际数据提出可操作、可量化的改进建议。"},
+                        {"role": "system", "content": "【必须使用中文回复，禁止使用英文】你是量化策略分析师。基于实际数据提出可操作、可量化的改进建议。"},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.4,
@@ -1516,7 +1516,7 @@ class SelfLearner:
                 json={
                     "model": self.config.deepseek_model,
                     "messages": [
-                        {"role": "system", "content": "量化参数优化专家。只在实际需要调整时才建议。"},
+                        {"role": "system", "content": "【必须使用中文回复，禁止使用英文】量化参数优化专家。只在实际需要调整时才建议。"},
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.3,
