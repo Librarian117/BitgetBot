@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Recurse -File | Where-Object { $_.Length -gt 100KB } | Sort-Object Length -Descending | Select-Object -First 30 @{N='SizeKB';E={[math]::Round\\($_.Length/1KB,1\\)}}, FullName)",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force -ErrorAction SilentlyContinue)",
+      "Bash(Get-Content \"C:\\\\Users\\\\林华俊\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\e--BitgetBot\\\\c1839655-60f2-49de-936b-944238120725\\\\tasks\\\\bhmovwi82.output\" -Tail 50)",
+      "PowerShell(ssh root@8.210.3.197 \"tail -5 /root/BitgetBot/logs/trades.jsonl\")",
+      "PowerShell(if \\(-not \\(Test-Path \"$env:USERPROFILE\\\\.ssh\\\\id_ed25519\"\\)\\) { ssh-keygen -t ed25519 -f \"$env:USERPROFILE\\\\.ssh\\\\id_ed25519\" -N '\"\"' -q; Write-Host \"Key generated\" } else { Write-Host \"Key already exists\" }; Write-Host \"Copy this to server:\"; Write-Host \"\"; Get-Content \"$env:USERPROFILE\\\\.ssh\\\\id_ed25519.pub\")",
+      "PowerShell(ssh root@8.210.3.197 \"cd /root/BitgetBot && python3 dashboard.py\")",
+      "PowerShell(ssh root@8.210.3.197 \"curl -s -o /dev/null -w 'HTTP %{http_code} | Time: %{time_total}s' --connect-timeout 10 https://api.deepseek.com/v1/models\")",
+      "PowerShell(ssh root@8.210.3.197 \"cd /root/BitgetBot && python3 -c 'import requests, os; from dotenv import load_dotenv; load_dotenv\\(\\); key=os.getenv\\(\\\\\"DEEPSEEK_API_KEY\\\\\"\\); model=os.getenv\\(\\\\\"DEEPSEEK_MODEL\\\\\"\\); print\\(f\\\\\"Model: {model}\\\\\"\\); r=requests.post\\(\\\\\"https://api.deepseek.com/v1/chat/completions\\\\\", headers={\\\\\"Authorization\\\\\": \\\\\"Bearer \\\\\"+key, \\\\\"Content-Type\\\\\": \\\\\"application/json\\\\\"}, json={\\\\\"model\\\\\": model, \\\\\"messages\\\\\": [{\\\\\"role\\\\\": \\\\\"user\\\\\", \\\\\"content\\\\\": \\\\\"say ok\\\\\"}], \\\\\"max_tokens\\\\\": 10}, timeout=15\\); print\\(f\\\\\"Status: {r.status_code}\\\\\"\\); print\\(r.text[:300]\\)'\")",
+      "PowerShell(ssh root@8.210.3.197 \"curl -s -o /dev/null -w 'HTTP %{http_code}' --connect-timeout 10 -X POST 'https://api.deepseek.com/chat/completions' -H 'Authorization: Bearer sk-test' -H 'Content-Type: application/json' -d '{}'\")",
+      "PowerShell(ssh root@8.210.3.197 \"grep -c 'review_position\\\\|AI_EXIT_DECISION\\\\|AI_POSITION_REVIEW' /root/BitgetBot/deepseek_quant_bot.py\")",
+      "PowerShell(ssh -o ConnectTimeout=5 root@8.210.3.197 \"grep 'review_position\\\\|AI_POSITION_REVIEW\\\\|v3.6' /root/BitgetBot/deepseek_quant_bot.py | head -5\")",
+      "PowerShell(.\\\\deploy.ps1 -Restart -Logs)",
+      "PowerShell(ssh root@8.210.3.197 \"tmux kill-session -t bot 2>/dev/null; echo 'stopped'\")",
+      "PowerShell(scp -q deepseek_quant_bot.py root@8.210.3.197:/root/BitgetBot/)",
+      "PowerShell(ssh root@8.210.3.197 \"cd /root/BitgetBot && tmux new -s bot -d 'python3 deepseek_quant_bot.py'; sleep 3; tmux capture-pane -t bot -p | tail -5\")",
+      "PowerShell(ssh root@8.210.3.197 \"grep 'AI_EXIT_DECISION' /root/BitgetBot/logs/trades.jsonl | tail -5\")",
+      "PowerShell(scp -q test_ds_review.py root@8.210.3.197:/tmp/)",
+      "PowerShell(ssh root@8.210.3.197 \"python3 /tmp/test_ds_review.py\")",
+      "PowerShell(ssh root@8.210.3.197 \"tmux kill-session -t bot 2>/dev/null\")",
+      "PowerShell(ssh root@8.210.3.197 \"cd /root/BitgetBot && tmux new -s bot -d 'python3 deepseek_quant_bot.py'; sleep 3; tmux capture-pane -t bot -p | tail -3\")",
+      "PowerShell(ssh root@8.210.3.197 \"grep 'AI_EXIT_DECISION\\\\|?? DeepSeek �ֲ���˻ظ�\\\\|?? DeepSeek ԭʼ�ظ�' /root/BitgetBot/logs/trades.jsonl | tail -10\")",
+      "PowerShell(ssh root@8.210.3.197 \"grep 'AI_EXIT_DECISION' /root/BitgetBot/logs/trades.jsonl | tail -3\")",
+      "PowerShell(ssh root@8.210.3.197 \"tmux capture-pane -t bot -p | tail -20\")"
+    ]
+  },
+  "enabledPlugins": {
+    "remember@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "session-report@claude-plugins-official": true,
+    "exa@claude-plugins-official": true,
+    "brightdata-plugin@claude-plugins-official": true,
+    "bigdata-com@claude-plugins-official": true,
+    "data-agent-kit-starter-pack@claude-plugins-official": true,
+    "duckdb-skills@claude-plugins-official": true
+  }
+}

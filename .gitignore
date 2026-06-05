@@ -1,0 +1,36 @@
+# 密钥 — 绝对不能提交
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Bot 运行时数据 (服务器独立, 本地不跟踪)
+logs/
+*.jsonl
+status.json
+health.json
+performance.json
+strategy_performance.json
+trading_wisdom.json
+grid_state.json
+markov_state.json
+positions_state.json
+runtime_params.json
+alert.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.swp
+*.bak

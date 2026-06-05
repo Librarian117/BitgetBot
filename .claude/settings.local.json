@@ -1,0 +1,109 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python deepseek_quant_bot.py)",
+      "Bash(python *)",
+      "Bash(pip list *)",
+      "Bash(timeout *)",
+      "Bash(Start-Sleep *)",
+      "PowerShell(python *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Import-Csv *)",
+      "Bash(Select-String *)",
+      "Bash(claude plugin *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(timeout 60)",
+      "Bash(grep -c \"AI_DECISION\" logs/trades.jsonl)",
+      "Bash(grep -E \"15:3[5-8]|下单|execute|安全|止损|止盈|TP\" /c/Users/林华俊/AppData/Local/Temp/claude/e--BitgetBot/7c738ea5-54e7-4927-a895-6be871e8a54c/tasks/b4g5la68x.output 2>/dev/null | tail -20)",
+      "Read(//c/Users/林华俊/AppData/Local/Temp/claude/e--BitgetBot/7c738ea5-54e7-4927-a895-6be871e8a54c/tasks/**)",
+      "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
+      "Bash(findstr python *)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python -c \"import json; d=json.load(open('status.json')); a=d['account']; p=d.get('positions',[]); print(f'Bot v3.0 | Cycle:{d[\\\"cycle\\\"]} Equity:{a[\\\"equity\\\"]:.0f} PnL:{d[\\\"pnl_pct\\\"]:+.2f}% uPnL:{a[\\\"unrealized_pnl\\\"]} | {len(p)} pos | F&G:{d[\\\"market\\\"][\\\"fng\\\"]}')\" && tasklist /FI \"IMAGENAME eq python.exe\" 2>nul | findstr /C:\"python\" >nul && echo 'Bot: RUNNING' || echo 'Bot: STOPPED'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "^/bot-status",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python -c \"import json; d=json.load(open('status.json')); a=d['account']; m=d['market']; s=d['session']; p=d.get('positions',[]); print(f'Cycle:{d[\\\"cycle\\\"]} Runtime:{d[\\\"runtime_hours\\\"]}h Session:{s[\\\"label\\\"]}'); print(f'Equity:{a[\\\"equity\\\"]:.1f} Avail:{a[\\\"available\\\"]:.1f} Margin:{a[\\\"used_margin\\\"]:.1f}'); print(f'PnL:{d[\\\"pnl_pct\\\"]:+.2f}% Trades:{d[\\\"trades\\\"]} Signals:{d[\\\"signals\\\"]}'); print(f'F&G:{m[\\\"fng\\\"]}({m[\\\"fng_label\\\"]}) Trending:{m[\\\"trending\\\"][:3]}'); print(f'uPnL:{a[\\\"unrealized_pnl\\\"]} Positions:{len(p)}/{d[\\\"max_positions\\\"]}'); [print(f\\\"  {x[\\\"symbol\\\"]} {\\\"做多\\\" if x[\\\"side\\\"]==\\\"LONG\\\" else \\\"做空\\\"} 保证金={x.get(\\\"margin\\\",0):.0f} entry={x[\\\"entry_price\\\"]} mark={x[\\\"mark_price\\\"]} uPnL={x[\\\"unrealized_pnl\\\"]}\\\") for x in p]; print(f'Filters: ADX={d[\\\"filters\\\"][\\\"adx\\\"]} VOL={d[\\\"filters\\\"][\\\"vol\\\"]} BTC={d[\\\"filters\\\"][\\\"btc\\\"]} TF={d[\\\"filters\\\"][\\\"tf\\\"]}')\""
+          }
+        ]
+      },
+      {
+        "matcher": "^/bot-log",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python -c \"import json; lines=open('logs/trades.jsonl',encoding='utf-8').readlines(); [print(f\\\"{json.loads(l).get('event','?'):12s} | {json.dumps(json.loads(l),ensure_ascii=False)[:200]}\\\") for l in lines[-20:]]\""
+          }
+        ]
+      },
+      {
+        "matcher": "^/bot-check-sl",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python -c \"import ccxt,os;from dotenv import load_dotenv;load_dotenv();ex=ccxt.bitget({'apiKey':os.getenv('BITGET_API_KEY'),'secret':os.getenv('BITGET_SECRET'),'password':os.getenv('BITGET_PASSPHRASE'),'options':{'defaultType':'swap'},'enableRateLimit':True});ex.set_sandbox_mode(True);syms=['BTC/USDT:USDT','ETH/USDT:USDT','SOL/USDT:USDT','BNB/USDT:USDT','XRP/USDT:USDT','ADA/USDT:USDT','DOGE/USDT:USDT','DOT/USDT:USDT','LINK/USDT:USDT','LTC/USDT:USDT'];pos=ex.fetch_positions(syms);[(lambda p,c:(print(f'{p[\\\"symbol\\\"]}: {c}ct SL:{len(ex.fetch_open_orders(p[\\\"symbol\\\"],params={\\\"stop\\\":True}))} uPnL:{p.get(\\\"unrealizedPnl\\\",0)}')))(p,float(p.get('contracts',0)or 0)) for p in pos if float(p.get('contracts',0)or 0)!=0]\""
+          }
+        ]
+      },
+      {
+        "matcher": "^/bot-start",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python deepseek_quant_bot.py"
+          }
+        ]
+      },
+      {
+        "matcher": "^/dashboard",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python dashboard.py"
+          }
+        ]
+      },
+      {
+        "matcher": "^/bot-learn",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python -c \"from self_learner import SelfLearner; from dotenv import load_dotenv; import os,json; load_dotenv(); from deepseek_quant_bot import ConfigManager; c=ConfigManager(); l=SelfLearner(c,None); w=l.get_wisdom_context(); print(w if w else 'No wisdom yet.'); print(); print('Review trigger:'); trades=[json.loads(line) for line in open('logs/trades.jsonl',encoding='utf-8') if '\"event\":\\\"TRADE\\\"' in line]; s=l.periodic_review(trades[-50:]) if trades else None; [print(f'  [{i[\\\"category\\\"]}] {i[\\\"insight\\\"]} (conf={i.get(\\\"confidence\\\",0):.0%})') for i in (s or [])]; print(); print('Filter diagnosis:'); d=l.analyze_filter_effectiveness(); print(f'  {d}' if d else '  No diagnosis yet (needs 60%+ zero-signal cycles)'); print(); print('Wisdom file:'); [print(f'  {w[\\\"date\\\"]} [{w[\\\"quality\\\"]}] {w[\\\"insight\\\"]}') for w in json.load(open('trading_wisdom.json',encoding='utf-8')).get('wisdom',[])] if os.path.exists('trading_wisdom.json') else print('  No wisdom entries yet.')\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash e:/BitgetBot/.claude/hooks/lint-check.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "cd e:/BitgetBot && python -c \"import json; d=json.load(open('status.json')); a=d['account']; p=d.get('positions',[]); pos_str='' if len(p)==0 else ' '.join([f'{x[\\\"symbol\\\"]}:{x[\\\"mark_price\\\"]:.0f}' for x in p]); print(f'EQ:{a[\\\"equity\\\"]:.0f} | Day:{d[\\\"pnl_pct\\\"]:+.1f}% All:{d.get(\\\"all_time_pnl_pct\\\",0):+.1f}% | {len(p)}pos {pos_str} | F&G:{d[\\\"market\\\"][\\\"fng\\\"]} | c#{d[\\\"cycle\\\"]}')\" 2>/dev/null || echo 'Bot N/A'",
+    "refreshInterval": 60
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "_comment": "DeepSeekQuantBot 监控币种配置 — 可自由增删, 修改后重启生效",
+  "_directives": "在 .env 中设置 MONITOR_SYMBOLS 覆盖此列表",
+  "_modes": {
+    "fixed": "MONITOR_SYMBOLS=BTC,ETH,SOL (手动指定, 默认)",
+    "all": "MONITOR_SYMBOLS=ALL (获取所有 U本位永续合约)",
+    "top_n": "MONITOR_SYMBOLS=TOP_30 (成交量前 N 名)"
+  },
+
+  "default_tier": "primary",
+  "default_enabled": true,
+
+  "symbols": {
+    "BTC": { "tier": "primary", "enabled": true, "sector": "StoreOfValue" },
+    "ETH": { "tier": "primary", "enabled": true, "sector": "SmartContract" },
+    "SOL": { "tier": "primary", "enabled": true, "sector": "SmartContract" },
+    "BNB": { "tier": "primary", "enabled": true, "sector": "SmartContract" },
+    "XRP": { "tier": "primary", "enabled": true, "sector": "Payments" },
+    "ADA": { "tier": "primary", "enabled": true, "sector": "LegacyL1" },
+    "DOGE": { "tier": "primary", "enabled": true, "sector": "Meme" },
+    "DOT": { "tier": "primary", "enabled": true, "sector": "LegacyL1" },
+    "LINK": { "tier": "primary", "enabled": true, "sector": "Oracle" },
+    "LTC": { "tier": "primary", "enabled": true, "sector": "LegacyL1" },
+
+    "AVAX": { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "MATIC": { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "UNI":  { "tier": "expanded", "enabled": false, "sector": "DeFi" },
+    "ATOM": { "tier": "expanded", "enabled": false, "sector": "LegacyL1" },
+    "ETC":  { "tier": "expanded", "enabled": false, "sector": "LegacyL1" },
+    "NEAR": { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "APT":  { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "ARB":  { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "OP":   { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "INJ":  { "tier": "expanded", "enabled": false, "sector": "DeFi" },
+    "SUI":  { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "TIA":  { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "SEI":  { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "RUNE": { "tier": "expanded", "enabled": false, "sector": "DeFi" },
+    "FIL":  { "tier": "expanded", "enabled": false, "sector": "Storage" },
+    "FET":  { "tier": "expanded", "enabled": false, "sector": "AI" },
+    "RENDER": { "tier": "expanded", "enabled": false, "sector": "AI" },
+    "WIF":  { "tier": "expanded", "enabled": false, "sector": "Meme" },
+    "PEPE": { "tier": "expanded", "enabled": false, "sector": "Meme" },
+    "BONK": { "tier": "expanded", "enabled": false, "sector": "Meme" },
+    "JUP":  { "tier": "expanded", "enabled": false, "sector": "DeFi" },
+    "ENA":  { "tier": "expanded", "enabled": false, "sector": "DeFi" },
+    "STRK": { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "W":    { "tier": "expanded", "enabled": false, "sector": "SmartContract" },
+    "PYTH": { "tier": "expanded", "enabled": false, "sector": "Oracle" }
+  }
+}

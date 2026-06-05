@@ -1,0 +1,32 @@
+# ── 日志 & 交易记录（持续增长，最大 Context 杀手）──
+logs/
+*.jsonl
+
+# ── 回测结果 ──
+backtest_results/
+*.csv
+
+# ── Python 编译缓存 ──
+__pycache__/
+*.pyc
+*.pyo
+
+# ── 运行时状态（机器数据，非源码）──
+grid_state.json
+correlation_cache.json
+status.json
+
+# ── IDE / 环境 ──
+.vscode/
+.idea/
+*.egg-info/
+dist/
+build/
+
+# ── Git ──
+.git/
+
+# ── 临时文件 ──
+*.tmp
+*.swp
+*~
