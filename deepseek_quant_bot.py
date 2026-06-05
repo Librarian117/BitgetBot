@@ -2635,30 +2635,29 @@ class DeepSeekQuantBot:
                 f"ATR={atr:.4f} VolRatio={vol_ratio:.2f}"
             )
 
-            # ── v4.0: CVD 成交量背离检测 ──
-            cvd_signal = {}
-            try:
-                trades = self.exchange.fetch_recent_trades(symbol, limit=100)
-                if trades:
-                    from quant_math import compute_cvd
-                    cvd_signal = compute_cvd(trades, df["close"].values.astype(float))
-                    if cvd_signal.get("divergence"):
-                        bias = cvd_signal["bias"]
-                        logger.info(
-                            f"🔍 {symbol} CVD背离: {bias} "
-                            f"(CVD={cvd_signal.get('cvd',0):.0f}, "
-                            f"ratio={cvd_signal.get('cvd_ratio',0):.3f})"
-                        )
-                        # 背离与信号方向一致 → 加分; 相反 → 减分
-                        if (bias == "bearish" and direction == "SHORT") or \
-                           (bias == "bullish" and direction == "LONG"):
-                            confidence = min(95, confidence + 10)
-                            bonuses.append("CVD确认")
-                        else:
-                            confidence = max(35, confidence - 15)
-                            bonuses.append("CVD背离警告")
-            except Exception:
-                pass  # 获取不到成交数据不影响决策
+            # ── v4.0: CVD 成交量背离检测 (仅实盘, 沙箱 fetch_trades 不可用) ──
+            if not self.config.is_sandbox:
+                try:
+                    trades = self.exchange.fetch_recent_trades(symbol, limit=100)
+                    if trades:
+                        from quant_math import compute_cvd
+                        cvd_signal = compute_cvd(trades, df["close"].values.astype(float))
+                        if cvd_signal.get("divergence"):
+                            bias = cvd_signal["bias"]
+                            logger.info(
+                                f"🔍 {symbol} CVD背离: {bias} "
+                                f"(CVD={cvd_signal.get('cvd',0):.0f}, "
+                                f"ratio={cvd_signal.get('cvd_ratio',0):.3f})"
+                            )
+                            if (bias == "bearish" and direction == "SHORT") or \
+                               (bias == "bullish" and direction == "LONG"):
+                                confidence = min(95, confidence + 10)
+                                bonuses.append("CVD确认")
+                            else:
+                                confidence = max(35, confidence - 15)
+                                bonuses.append("CVD背离警告")
+                except Exception:
+                    pass  # 获取不到成交数据不影响决策
 
             return {
                 "symbol": symbol,
