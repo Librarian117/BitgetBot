@@ -708,3 +708,10 @@ class ExchangeInterface:
             logger.error(f"❌ 独立计划单异常: {e}")
             return False
 
+    def fetch_recent_trades(self, symbol: str, limit: int = 100) -> list:
+        """拉取最近成交记录 (用于 CVD 计算)"""
+        try:
+            return self.exchange.fetch_trades(symbol, limit=limit)
+        except Exception:
+            return []
+

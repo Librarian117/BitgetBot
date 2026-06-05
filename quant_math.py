@@ -247,4 +247,91 @@ def compute_quant_signals(df: pd.DataFrame) -> dict:
         result["vol_cone_percentile"] = cone["atr_percentile"]
         result["vol_cone_regime"] = cone["regime"]
 
+    # 4. CVD (需要交易数据)
+    cvd = result.get("_cvd_data")
+    if cvd is not None:
+        result["cvd_divergence"] = cvd.get("divergence", False)
+        result["cvd_trend"] = cvd.get("trend", "flat")
+
     return result
+
+
+# ════════════════════════════════════════════════════════════
+# 5. CVD — 累积成交量差 (Cumulative Volume Delta)
+# ════════════════════════════════════════════════════════════
+
+def compute_cvd(trades: list, close_prices: np.ndarray) -> dict:
+    """
+    从逐笔成交数据计算 CVD 及背离信号。
+
+    原理:
+      CVD = 累加(主动买量 - 主动卖量)
+      价格创新高 + CVD未创新高 = 量价背离 → 假突破 → 偏空
+      价格创新低 + CVD未创新低 = 量价背离 → 假跌破 → 偏多
+
+    Args:
+        trades: ccxt fetch_trades() 返回的成交列表,
+                每条包含 {"side": "buy"/"sell", "amount": float, "price": float}
+        close_prices: 收盘价序列 (用于判断价格极值)
+
+    Returns:
+        {"cvd": float, "divergence": bool, "bias": "bullish"/"bearish"/"neutral"}
+    """
+    if not trades or len(close_prices) < 10:
+        return {"cvd": 0, "divergence": False, "bias": "neutral"}
+
+    # ── 计算 CVD ──
+    cvd = 0.0
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for t in trades:
+        side = t.get("side", "").lower()
+        amount = float(t.get("amount", 0) or 0)
+        price = float(t.get("price", 0) or 0)
+        vol = amount * price  # notional volume in USDT
+        if side == "buy":
+            cvd += vol
+            buy_vol += vol
+        else:
+            cvd -= vol
+            sell_vol += vol
+
+    total_vol = buy_vol + sell_vol
+    if total_vol == 0:
+        return {"cvd": 0, "divergence": False, "bias": "neutral"}
+
+    # ── CVD 趋势 ──
+    cvd_ratio = cvd / total_vol  # -1.0 ~ +1.0
+    if cvd_ratio > 0.15:
+        cvd_trend = "bullish"
+    elif cvd_ratio < -0.15:
+        cvd_trend = "bearish"
+    else:
+        cvd_trend = "neutral"
+
+    # ── 背离检测 ──
+    recent = close_prices[-20:]
+    price_high = np.max(recent)
+    price_low = np.min(recent)
+    current = close_prices[-1]
+
+    divergence = False
+    bias = "neutral"
+    # 价格接近近期高点 + CVD为负 → 量价背离 (假突破)
+    if current >= price_high * 0.98 and cvd_trend == "bearish":
+        divergence = True
+        bias = "bearish"
+    # 价格接近近期低点 + CVD为正 → 量价背离 (假跌破)
+    elif current <= price_low * 1.02 and cvd_trend == "bullish":
+        divergence = True
+        bias = "bullish"
+
+    return {
+        "cvd": round(cvd, 2),
+        "cvd_ratio": round(cvd_ratio, 3),
+        "buy_vol": round(buy_vol, 2),
+        "sell_vol": round(sell_vol, 2),
+        "cvd_trend": cvd_trend,
+        "divergence": divergence,
+        "bias": bias,
+    }
