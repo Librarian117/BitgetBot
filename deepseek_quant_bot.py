@@ -2189,10 +2189,8 @@ class DeepSeekQuantBot:
 
                 # ── 执行平仓 ──
                 if decision == "CLOSE":
-                    logger.info(f"🔔 AI 建议平仓 {symbol} {side}: {reason}")
+                    logger.info(f"🔔 规则平仓 {symbol} {side}: {reason}")
                     try:
-                        # v3.6 fix: 不先取消 SL/TP (会导致 Bitget 触发止损再拒绝平仓)
-                        # 直接用封装好的市价平仓方法
                         cts = abs(int(contracts))
                         close_side = "buy" if side == "SHORT" else "sell"
                         pos_side = "short" if side == "SHORT" else "long"
@@ -2200,22 +2198,22 @@ class DeepSeekQuantBot:
                             sym_full, cts, close_side, pos_side
                         )
                         if close_o:
-                            logger.info(f"✅ AI 平仓 {symbol} {side}: {close_o.get('id', '?')} | {reason}")
+                            logger.info(f"✅ 规则平仓 {symbol} {side}: {close_o.get('id', '?')} | {reason}")
                             self.tlogger.log_position_close(
                                 symbol=symbol, direction=side, strategy="pullback",
                                 entry_price=entry, exit_price=mark,
                                 pnl=upl, pnl_pct=roi * 100,
-                                close_reason="AI_EXIT", holding_hours=holding_hours,
+                                close_reason="RULE_EXIT", holding_hours=holding_hours,
                             )
                         else:
-                            logger.warning(f"⚠️  AI 平仓 {symbol} 返回空 (可能已平仓)")
+                            logger.warning(f"⚠️  规则平仓 {symbol} 返回空 (可能已平仓)")
                     except Exception as e:
-                        logger.error(f"❌ AI 平仓 {symbol} 失败: {e}")
+                        logger.error(f"❌ 规则平仓 {symbol} 失败: {e}")
                 else:
-                    logger.info(f"🤚 AI 持仓 {symbol} {side}: HOLD | {reason}")
+                    logger.info(f"🤚 持仓 {symbol} {side}: HOLD | {reason or '规则未触发'}")
 
             except Exception as e:
-                logger.warning(f"🔍 AI 持仓审核 {symbol} 异常: {e}")
+                logger.warning(f"🔍 持仓检查 {symbol} 异常: {e}")
                 continue
 
             # 币种间延迟
