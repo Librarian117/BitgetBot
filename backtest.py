@@ -20,10 +20,9 @@ import json
 import logging
 import math
 import os
-import sys
 import time
 from time_utils import now
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import ccxt
 import numpy as np
@@ -650,7 +649,7 @@ def main():
     if args.no_momentum:
         config["momentum_enabled"] = False
 
-    logger.info(f"🚀 DeepSeekQuantBot 回测引擎")
+    logger.info("🚀 DeepSeekQuantBot 回测引擎")
     logger.info(f"📋 币种: {args.symbols}")
     logger.info(f"📅 区间: {args.start} → {args.end}")
     logger.info(f"⏱  周期: {args.timeframe}")
@@ -680,7 +679,7 @@ def main():
             print(f"  最大回撤: {m['max_drawdown']} USDT")
             print(f"  盈亏比: {m['profit_factor']}")
 
-    print(f"\n  ── 逐笔概览 ──")
+    print("\n  ── 逐笔概览 ──")
     print(f"  做多交易: {len(trades_df[trades_df['direction']=='LONG'])}")
     print(f"  做空交易: {len(trades_df[trades_df['direction']=='SHORT'])}")
     print(f"  回调策略: {len(trades_df[trades_df['strategy']=='pullback'])}")

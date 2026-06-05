@@ -353,7 +353,8 @@ class CryptoPanicClient:
                     ticker = cid.upper()
                     for t, c in self.CG_ID_MAP.items():
                         if c == cid:
-                            ticker = t.upper(); break
+                            ticker = t.upper()
+                            break
                     results.append({
                         "title": f"{ticker} 24h{direction}{abs(chg):.1f}%",
                         "source": {"title": "CoinGecko"},

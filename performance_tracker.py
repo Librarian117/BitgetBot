@@ -16,10 +16,9 @@ import json
 import logging
 import math
 import os
-from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from time_utils import now, today_str, now_iso
+from time_utils import today_str, now_iso
 
 logger = logging.getLogger("QuantBot")
 
@@ -121,10 +120,12 @@ class PerformanceTracker:
         cur_wins = cur_losses = 0
         for t in tlist:
             if t["win"]:
-                cur_wins += 1; cur_losses = 0
+                cur_wins += 1
+                cur_losses = 0
                 max_consecutive_wins = max(max_consecutive_wins, cur_wins)
             else:
-                cur_losses += 1; cur_wins = 0
+                cur_losses += 1
+                cur_wins = 0
                 max_consecutive_losses = max(max_consecutive_losses, cur_losses)
 
         return {
@@ -255,14 +256,18 @@ class PerformanceTracker:
     @staticmethod
     def _max_drawdown(pnls: List[float]) -> Tuple[float, float]:
         """返回 (最大回撤绝对值, 回撤百分比)"""
-        cum = 0; peak = -float("inf"); max_dd = 0; max_dd_pct = 0
+        cum = 0
+        peak = -float("inf")
+        max_dd = 0
+        max_dd_pct = 0
         for p in pnls:
             cum += p
             peak = max(peak, cum)
             dd = peak - cum
             dd_pct = (dd / peak * 100) if peak > 0 else 0
             if dd > max_dd:
-                max_dd = dd; max_dd_pct = dd_pct
+                max_dd = dd
+                max_dd_pct = dd_pct
         return max_dd, max_dd_pct
 
     @staticmethod

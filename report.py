@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Bot 10 小时运行报告"""
-import json, os
+import json
+import os
 
 LOG = "/root/BitgetBot/logs/trades_2026-06-03.jsonl"
 if not os.path.exists(LOG):
     LOG = "/root/BitgetBot/logs/trades.jsonl"
 
 with open(LOG) as f:
-    lines = [json.loads(l) for l in f if l.strip()]
+    lines = [json.loads(ln) for ln in f if ln.strip()]
 
-cycles = [l for l in lines if l.get("event") == "CYCLE"]
-closes = [l for l in lines if l.get("event") == "POSITION_CLOSE"]
-ai_exit = [l for l in lines if l.get("event") == "AI_EXIT_DECISION"]
-ai_entry = [l for l in lines if l.get("event") == "AI_DECISION"]
-genetic = [l for l in lines if l.get("risk_type", "") == "GENETIC_EVOLVE"]
-vol_skip = [l for l in lines if l.get("event") == "VOL_SKIP"]
-adx_skip = [l for l in lines if l.get("event") == "ADX_SKIP"]
+cycles = [e for e in lines if e.get("event") == "CYCLE"]
+closes = [e for e in lines if e.get("event") == "POSITION_CLOSE"]
+ai_exit = [e for e in lines if e.get("event") == "AI_EXIT_DECISION"]
+ai_entry = [e for e in lines if e.get("event") == "AI_DECISION"]
+genetic = [e for e in lines if e.get("risk_type", "") == "GENETIC_EVOLVE"]
+vol_skip = [e for e in lines if e.get("event") == "VOL_SKIP"]
+adx_skip = [e for e in lines if e.get("event") == "ADX_SKIP"]
 
 # 只统计今天 00:00 之后
 today = [c for c in cycles if c.get("timestamp", "").startswith("2026-06-03")]
@@ -31,10 +32,10 @@ if cycles:
     print(f"\n💰 账户: 权益={last['equity']:.2f} | 起始={last.get('initial_equity',10000)}")
     eq_delta = last['equity'] - last.get('initial_equity', 10000)
     print(f"   累计PnL: {eq_delta:+.2f} USDT ({eq_delta/last.get('initial_equity',10000)*100:+.2f}%)")
-    print(f"   当前持仓: 0 个 (空仓)")
+    print("   当前持仓: 0 个 (空仓)")
 
 # 周期
-print(f"\n🔄 周期统计:")
+print("\n🔄 周期统计:")
 print(f"   总周期: {len(today)}")
 cand_0 = sum(1 for c in today if c.get("candidates", 0) == 0)
 cand_n = sum(1 for c in today if c.get("candidates", 0) > 0)
@@ -42,7 +43,7 @@ print(f"   有信号: {cand_n} 周期 ({cand_n/max(1,len(today))*100:.0f}%)")
 print(f"   无信号: {cand_0} 周期 ({cand_0/max(1,len(today))*100:.0f}%)")
 
 # 交易
-print(f"\n📈 交易:")
+print("\n📈 交易:")
 print(f"   平仓记录: {len(closes)} 笔")
 real_closes = {}
 for c in closes:
@@ -60,7 +61,7 @@ for c in list(real_closes.values())[-5:]:
           f"入场{c.get('entry_price',0):.4f} 出场{c.get('exit_price',0):.4f}")
 
 # AI
-print(f"\n🤖 AI 决策:")
+print("\n🤖 AI 决策:")
 print(f"   入场审核: {len(ai_entry)} 次")
 if ai_entry:
     confirms = sum(1 for d in ai_entry if d.get("decision") == "CONFIRM")
@@ -77,11 +78,11 @@ if ai_exit:
         print(f"   最近退出理由: {last_r}")
 
 # 过滤器
-print(f"\n🔍 过滤统计:")
+print("\n🔍 过滤统计:")
 print(f"   ADX过滤: {len(adx_skip)} 次")
 print(f"   量比过滤: {len(vol_skip)} 次")
 if len(vol_skip) > 0 and len(today) >= 10:
-    print(f"   ⚠️ 量比过滤活跃 — 沙箱量数据不可靠")
+    print("   ⚠️ 量比过滤活跃 — 沙箱量数据不可靠")
 
 # 遗传进化
 print(f"\n🧬 遗传进化: {len(genetic)} 次")
@@ -91,14 +92,14 @@ if genetic:
         print(f"   {g.get('timestamp','?')[:19]} {detail}")
 
 # 新功能
-print(f"\n🔧 v3.7 新功能状态:")
-print(f"   市场状态识别: ✅ 就绪 (等信号触发)")
-print(f"   情绪量化:     ✅ 就绪 (F&G=11 极端恐惧→反向买入)")
-print(f"   策略权重闭环: ✅ 就绪")
-print(f"   方向自动开关: ✅ 就绪")
-print(f"   紧急回顾:     ✅ 就绪 (连续亏损2笔触发)")
+print("\n🔧 v3.7 新功能状态:")
+print("   市场状态识别: ✅ 就绪 (等信号触发)")
+print("   情绪量化:     ✅ 就绪 (F&G=11 极端恐惧→反向买入)")
+print("   策略权重闭环: ✅ 就绪")
+print("   方向自动开关: ✅ 就绪")
+print("   紧急回顾:     ✅ 就绪 (连续亏损2笔触发)")
 
 print(f"\n{'='*55}")
-print(f"  结论: 10小时0交易，信号过滤过严")
-print(f"  建议: 手动降低ADX阈值/量比，等待沙箱市场波动")
+print("  结论: 10小时0交易，信号过滤过严")
+print("  建议: 手动降低ADX阈值/量比，等待沙箱市场波动")
 print(f"{'='*55}")

@@ -17,11 +17,10 @@ health_monitor.py — 全链路健康检查 v3.6
 import json
 import logging
 import os
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from time_utils import now, now_iso
+from time_utils import now
 
 logger = logging.getLogger("QuantBot")
 
@@ -82,11 +81,15 @@ class HealthMonitor:
             if tp_val <= 0:
                 continue
             if pos_side == "short":
-                if tp_val > entry: has_sl = True    # 做空 SL 在入场价上方
-                if tp_val < entry: has_tp = True    # 做空 TP 在入场价下方
+                if tp_val > entry:
+                    has_sl = True    # 做空 SL 在入场价上方
+                if tp_val < entry:
+                    has_tp = True    # 做空 TP 在入场价下方
             else:
-                if tp_val < entry: has_sl = True    # 做多 SL 在入场价下方
-                if tp_val > entry: has_tp = True    # 做多 TP 在入场价上方
+                if tp_val < entry:
+                    has_sl = True    # 做多 SL 在入场价下方
+                if tp_val > entry:
+                    has_tp = True    # 做多 TP 在入场价上方
         return (has_sl, has_tp, len(orders))
 
     def check(self, cycle: int, candidates: int, trades: int,
@@ -158,8 +161,10 @@ class HealthMonitor:
             if not has_sl or not has_tp:
                 bare_count += 1
                 missing = []
-                if not has_sl: missing.append("SL")
-                if not has_tp: missing.append("TP")
+                if not has_sl:
+                    missing.append("SL")
+                if not has_tp:
+                    missing.append("TP")
                 issues.append(f"{sym} 裸仓！缺少{'/'.join(missing)}保护")
 
             # c) 超额订单检测

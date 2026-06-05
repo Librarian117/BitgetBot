@@ -11,7 +11,10 @@ v3.0 改进:
   6. 无限网格 — 卖单层级无上限，成交后在上方自动补单
 """
 
-import json, logging, math, os, time
+import json
+import logging
+import math
+import os
 from datetime import timedelta
 from time_utils import now, now_iso, datetime_from_iso
 from typing import Any, Dict, List, Optional
@@ -500,7 +503,7 @@ class GridManager:
                 self._save_state()
                 logger.info(f"📋 无限网格 {symbol} 补卖单 @{new_sell_price:.4f} "
                             f"(spacing={spacing_decimal*100:.2f}%, "
-                            f"总卖单层级={sum(1 for l in grid['levels'] if l['side']=='sell')})")
+                            f"总卖单层级={sum(1 for lv in grid['levels'] if lv['side']=='sell')})")
             else:
                 logger.warning(f"⚠️  {symbol} 无限网格补单: 下单返回空 ID")
         except Exception as e:
@@ -730,8 +733,8 @@ class GridManager:
                 current_price = float(ticker.get("last", 0)) if ticker else 0.0
             except Exception:
                 # 退路：从网格层级中估算现价（取买卖单中间价）
-                buy_prices = [l["price"] for l in grid["levels"] if l["side"] == "buy" and l["price"] > 0]
-                sell_prices = [l["price"] for l in grid["levels"] if l["side"] == "sell" and l["price"] > 0]
+                buy_prices = [lv["price"] for lv in grid["levels"] if lv["side"] == "buy" and lv["price"] > 0]
+                sell_prices = [lv["price"] for lv in grid["levels"] if lv["side"] == "sell" and lv["price"] > 0]
                 if buy_prices and sell_prices:
                     current_price = (max(buy_prices) + min(sell_prices)) / 2
 

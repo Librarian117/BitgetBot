@@ -9,7 +9,7 @@ trailing_sl.py — 移动止损管理器 v1.0
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger("QuantBot")
 

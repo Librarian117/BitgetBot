@@ -174,10 +174,12 @@ class StrategyTracker:
                 won = entry["pnl"] > 0
                 if score >= 60:
                     high_total += 1
-                    if won: high_wins += 1
+                    if won:
+                        high_wins += 1
                 elif score <= 40:
                     low_total += 1
-                    if won: low_wins += 1
+                    if won:
+                        low_wins += 1
             high_wr = high_wins / high_total * 100 if high_total >= 2 else None
             low_wr = low_wins / low_total * 100 if low_total >= 2 else None
             spread = round(high_wr - low_wr, 1) if (high_wr is not None and low_wr is not None) else None
@@ -201,7 +203,8 @@ class StrategyTracker:
         """获取胜率 (可指定策略，不指定则全局)"""
         if strategy:
             s = self.strategies.get(strategy)
-            if not s: return 0.0
+            if not s:
+                return 0.0
             total = s["wins"] + s["losses"]
             return s["wins"] / total * 100 if total > 0 else 0.0
         total_w = sum(s["wins"] for s in self.strategies.values())
@@ -268,7 +271,8 @@ class StrategyTracker:
         result = {"strategies": {}, "directions": {}, "symbols": {}, "recent": self.recent_trades[-5:]}
         for name, s in self.strategies.items():
             total = s["wins"] + s["losses"]
-            if total == 0: continue
+            if total == 0:
+                continue
             # 找出最佳和最差币种
             best_sym = max(s["symbols"].items(), key=lambda x: x[1]["pnl"], default=("?", {}))
             worst_sym = min(s["symbols"].items(), key=lambda x: x[1]["pnl"], default=("?", {}))
@@ -282,14 +286,16 @@ class StrategyTracker:
             }
         for name, d in self.directions.items():
             total = d["wins"] + d["losses"]
-            if total == 0: continue
+            if total == 0:
+                continue
             result["directions"][name] = {
                 "trades": total, "wins": d["wins"], "losses": d["losses"],
                 "win_rate": round(d["wins"] / total * 100, 1),
                 "total_pnl": round(d["total_pnl"], 2),
             }
         for name, s in self.symbols.items():
-            if s["total_trades"] == 0: continue
+            if s["total_trades"] == 0:
+                continue
             result["symbols"][name] = {
                 "trades": s["total_trades"], "wins": s["wins"], "losses": s["losses"],
                 "total_pnl": round(s["total_pnl"], 2),
@@ -324,13 +330,17 @@ class StrategyTracker:
                 if is_win:
                     s["wins"] += 1
                     s["avg_win"] = (s["avg_win"] * (s["wins"] - 1) + pnl) / s["wins"]
-                    d["wins"] += 1; sym["wins"] += 1
+                    d["wins"] += 1
+                    sym["wins"] += 1
                 else:
                     s["losses"] += 1
                     s["avg_loss"] = (s["avg_loss"] * (s["losses"] - 1) + pnl) / s["losses"]
-                    d["losses"] += 1; sym["losses"] += 1
-                s["total_pnl"] += pnl; d["total_pnl"] += pnl
-                sym["total_pnl"] += pnl; sym["total_trades"] += 1
+                    d["losses"] += 1
+                    sym["losses"] += 1
+                s["total_pnl"] += pnl
+                d["total_pnl"] += pnl
+                sym["total_pnl"] += pnl
+                sym["total_trades"] += 1
                 s["symbols"][t.get("symbol", "?")]["wins" if is_win else "losses"] += 1
                 s["symbols"][t.get("symbol", "?")]["pnl"] += pnl
                 if t.get("session"):
@@ -406,19 +416,23 @@ class WisdomStore:
         for field in ("market_regime", "regime", "market_context"):
             v = entry.get(field, "").strip().lower()
             if v and v != "unknown":
-                parts.append(("regime", v)); break
+                parts.append(("regime", v))
+                break
         for field in ("symbol",):
             v = entry.get(field, "").strip().lower()
             if v and v != "unknown":
-                parts.append(("sym", v)); break
+                parts.append(("sym", v))
+                break
         for field in ("strategy",):
             v = entry.get(field, "").strip().lower()
             if v and v != "unknown":
-                parts.append(("strat", v)); break
+                parts.append(("strat", v))
+                break
         for field in ("direction",):
             v = entry.get(field, "").strip().lower()
             if v and v != "unknown":
-                parts.append(("dir", v)); break
+                parts.append(("dir", v))
+                break
         if not parts:
             return f"general_{entry.get('date', '')}"
         return "_".join(f"{k}:{v}" for k, v in parts)
@@ -739,9 +753,11 @@ class SelfLearner:
         无数据 → 1.0 (默认)
         """
         s = self.tracker.strategies.get(strategy)
-        if not s: return 1.0
+        if not s:
+            return 1.0
         total = s["wins"] + s["losses"]
-        if total < 3: return 1.0  # 数据不足，默认权重
+        if total < 3:
+            return 1.0  # 数据不足，默认权重
 
         win_rate = s["wins"] / total
         if win_rate >= 0.6 and s["total_pnl"] > 0:

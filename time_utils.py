@@ -109,5 +109,5 @@ if __name__ == "__main__":
     n = now()
     assert n.tzinfo is not None, "FAIL: datetime 无时区信息!"
     assert n.utcoffset() == timedelta(hours=8), f"FAIL: UTC偏移不是 +08:00, 实际 {n.utcoffset()}"
-    assert "+08:00" in now_iso(), f"FAIL: isoformat 不含 +08:00"
+    assert "+08:00" in now_iso(), "FAIL: isoformat 不含 +08:00"
     print("\n[OK] All timezone checks passed")

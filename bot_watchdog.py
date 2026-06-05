@@ -3,7 +3,10 @@
 Bot 巡检守护脚本 — 服务器 crontab 每 3 小时执行
 功能: 检查 bot 存活 / 权益 / 最近交易 / 异常告警
 """
-import subprocess, json, os, sys
+import subprocess
+import json
+import os
+import sys
 from datetime import datetime, timezone, timedelta
 
 BOT_DIR = "/root/BitgetBot"

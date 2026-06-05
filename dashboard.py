@@ -6,7 +6,10 @@ dashboard.py — 实时账户面板
 用法: python dashboard.py        # 一次性快照
       python dashboard.py --loop # 每 30 秒刷新
 """
-import ccxt, os, sys, time
+import ccxt
+import os
+import sys
+import time
 from time_utils import now
 from dotenv import load_dotenv
 
@@ -28,16 +31,20 @@ def print_dashboard(ex):
     bal = ex.fetch_balance()
     total = float(bal.get('total', {}).get('USDT', 0))
     free = float(bal.get('free', {}).get('USDT', 0))
-    used = float(bal.get('used', {}).get('USDT', 0))
+    float(bal.get('used', {}).get('USDT', 0))
 
     positions = ex.fetch_positions()
     pos_list = []
-    total_upl = 0; total_margin = 0; longs = 0; shorts = 0
-    bare = 0; huge_upl = []; worst_loss = []
+    total_upl = 0
+    total_margin = 0
+    longs = 0
+    shorts = 0
+    bare = 0 
 
     for p in positions:
         c = float(p.get('contracts', 0))
-        if c == 0: continue
+        if c == 0:
+            continue
         sym_full = p['symbol']
         base = sym_full.replace('/USDT:USDT', '')
         entry = float(p.get('entryPrice', 0))
@@ -45,9 +52,12 @@ def print_dashboard(ex):
         upl = float(p.get('unrealizedPnl', 0))
         mgn = float(p.get('initialMargin', 0))
         side = p.get('side', '?')
-        total_upl += upl; total_margin += mgn
-        if side == 'long': longs += 1
-        else: shorts += 1
+        total_upl += upl
+        total_margin += mgn
+        if side == 'long':
+            longs += 1
+        else:
+            shorts += 1
 
         # Check SL/TP (v3.6: 优先仓位级别 TPSL)
         has_sl = False
@@ -65,18 +75,23 @@ def print_dashboard(ex):
         if not has_sl or not has_tp:
             try:
                 orders = ex.fetch_open_orders(sym_full, params={'stop': True}) or []
-            except:
+            except Exception:
                 orders = []
             sl_count = max(sl_count, len(orders))
             for o in orders:
                 tp_price = float(o.get('info', {}).get('triggerPrice', 0))
                 if side == 'short':
-                    if tp_price < entry: has_tp = True
-                    if tp_price > entry: has_sl = True
+                    if tp_price < entry:
+                        has_tp = True
+                    if tp_price > entry:
+                        has_sl = True
                 else:
-                    if tp_price > entry: has_tp = True
-                    if tp_price < entry: has_sl = True
-        if not has_sl or not has_tp: bare += 1
+                    if tp_price > entry:
+                        has_tp = True
+                    if tp_price < entry:
+                        has_sl = True
+        if not has_sl or not has_tp:
+            bare += 1
 
         roi = upl / mgn * 100 if mgn > 0 else 0
         pos_list.append({
@@ -107,8 +122,10 @@ def print_dashboard(ex):
 
     for p in sorted(pos_list, key=lambda x: x['upl']):
         sl_status = f"{p['sl_count']}"
-        if not p['has_sl']: sl_status += '!SL'
-        if not p['has_tp']: sl_status += '!TP'
+        if not p['has_sl']:
+            sl_status += '!SL'
+        if not p['has_tp']:
+            sl_status += '!TP'
         print(f"  {p['symbol']:6s} {p['side']:5s} {p['entry']:>10.4f} {p['mark']:>10.4f} {p['upl']:>+8.2f} {p['margin']:>7.0f} {p['roi']:>+6.1f}% {sl_status:>5s}")
 
     print(f"  {'─'*60}")
