@@ -349,7 +349,7 @@ class MarkovRegime:
         if regime_3 == "bull":
             if adx_strong:
                 regime = "strong_bull"
-                recommended = ["momentum"]
+                recommended = ["momentum", "pullback", "ema_cross"]
                 detail = "🐂Markov牛市+ADX强势→强牛"
             else:
                 regime = "bull"
@@ -359,11 +359,11 @@ class MarkovRegime:
         elif regime_3 == "bear":
             if adx_strong:
                 regime = "strong_bear"
-                recommended = ["momentum"]
+                recommended = ["momentum", "pullback", "ema_cross"]
                 detail = "🐻Markov熊市+ADX强势→强熊"
             else:
                 regime = "bear"
-                recommended = ["pullback", "counter_trend"]
+                recommended = ["pullback", "ema_cross"]
                 detail = "📉Markov熊市→回调做空"
             direction = "bearish"
         else:  # sideways

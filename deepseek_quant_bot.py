@@ -513,7 +513,7 @@ class DeepSeekAnalyst:
                 "strong_bull": "🐂强牛市（全周期看涨+高共识，顺势做多胜率高）",
                 "bull": "📈牛市（多数周期看涨，回调做多+EMA交叉）",
                 "range": "📊震荡市（无明确方向，网格/布林/回调双向）",
-                "bear": "📉熊市（多数周期看跌，回调做空+逆势空）",
+                "bear": "📉熊市（多数周期看跌，回调做空+EMA交叉）",
                 "strong_bear": "🐻强熊市（全周期看跌+高共识，顺势做空优先）",
                 "panic": "🚨极端波动（ATR>2.5%，建议观望或仅减仓）",
             }
@@ -1968,11 +1968,11 @@ class DeepSeekQuantBot:
         """v4.0: 6 状态市场分类 — 多维度综合 + Markov 长期偏向。
 
         六状态 → 默认策略映射:
-          strong_bull  → momentum (强趋势追涨)
-          bull         → pullback, ema_cross (回调做多)
+          strong_bull  → momentum, pullback, ema_cross (顺势做多)
+          bull         → pullback, ema_cross (回调做多+EMA交叉)
           range        → grid, bollinger, pullback (震荡双向)
-          bear         → pullback, counter_trend (回调做空/逆势)
-          strong_bear  → momentum (强趋势追空)
+          bear         → pullback, ema_cross (回调做空+EMA交叉)
+          strong_bear  → momentum, pullback, ema_cross (顺势做空)
           panic        → 不推荐开仓 (极端波动, 仅观望/减仓)
 
         输入:
@@ -2048,14 +2048,14 @@ class DeepSeekQuantBot:
         # Strong Bull: 全TF看涨 + ADX强势 + 高共识
         elif direction == "bullish" and consensus >= 1.0 and adx_tier == "strong":
             regime = "strong_bull"
-            recommended = ["momentum"]
-            detail_parts.append("🐂强牛市-动量追涨优先")
+            recommended = ["momentum", "pullback", "ema_cross"]
+            detail_parts.append("🐂强牛市-顺势做多")
 
         # Strong Bear: 全TF看跌 + ADX强势 + 高共识
         elif direction == "bearish" and consensus >= 1.0 and adx_tier == "strong":
             regime = "strong_bear"
-            recommended = ["momentum"]
-            detail_parts.append("🐻强熊市-动量追空优先")
+            recommended = ["momentum", "pullback", "ema_cross"]
+            detail_parts.append("🐻强熊市-顺势做空")
 
         # Bull: 多数TF看涨
         elif direction == "bullish" and consensus >= 0.5:
@@ -2068,10 +2068,10 @@ class DeepSeekQuantBot:
         # Bear: 多数TF看跌
         elif direction == "bearish" and consensus >= 0.5:
             regime = "bear"
-            recommended = ["pullback", "counter_trend"]
+            recommended = ["pullback", "ema_cross"]
             if adx_tier == "strong":
                 recommended.insert(0, "momentum")
-            detail_parts.append("📉熊市-回调做空+逆势")
+            detail_parts.append("📉熊市-回调做空+EMA交叉")
 
         # Range: 无明确方向
         else:
@@ -2619,16 +2619,16 @@ class DeepSeekQuantBot:
                         recommended = []
                     elif adx > 25 and is_bullish_trend:
                         regime_label = "strong_bull"
-                        recommended = ["momentum"]
+                        recommended = ["momentum", "pullback", "ema_cross"]
                     elif adx > 25 and is_bearish_trend:
                         regime_label = "strong_bear"
-                        recommended = ["momentum"]
+                        recommended = ["momentum", "pullback", "ema_cross"]
                     elif is_bullish_trend:
                         regime_label = "bull"
                         recommended = ["pullback", "ema_cross"]
                     elif is_bearish_trend:
                         regime_label = "bear"
-                        recommended = ["pullback", "counter_trend"]
+                        recommended = ["pullback", "ema_cross"]
                     else:
                         regime_label = "range"
                         recommended = ["bollinger", "grid", "pullback"]
