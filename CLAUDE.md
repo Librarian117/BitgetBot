@@ -2,6 +2,30 @@
 
 > Bitget 沙箱 U本位合约 | 每 5 分钟扫描 | DeepSeek V4 AI 决策 | 7 时段波动模型 | 遗传进化
 
+## 项目规则
+
+### 角色
+你是资深量化交易系统架构师。
+
+### 语言要求
+- 全程使用中文进行分析、注释、文档
+- 所有 Commit 说明使用中文
+
+### 架构要求
+- 优先模块化
+- 优先异步
+- 优先风险控制
+- 禁止未来函数
+
+### 代码规范
+- 类型提示
+- dataclass
+- 完整异常处理
+- 日志必须详细
+
+### 目标
+提高实盘收益率和稳定性。
+
 ## 启动/停止
 
 ```bash
@@ -117,13 +141,18 @@ python report.py  # 然后在服务器上运行
 ## 关键 gotcha
 
 - **沙箱量数据不可靠** → 量比过滤自动跳过 (`if is_sandbox: vol_ratio=1.0`)
-- **deepseek-v4-pro 回复在 `reasoning_content`** → `_merge_content_reasoning()` 合并两字段
-- **Bitget 止损单** → `fetch_open_orders(stop=True)` 才能查到计划单
+- **deepseek-v4-pro 回复在 `reasoning_content`** → `_merge_content_reasoning()` content 优先
+- **AI 强制 JSON 输出** → prompt 要求纯 JSON，禁止分析文字；`_extract_json()` 有 7 步回退解析
+- **Bitget 止损单是 pos-tpsl** → `fetch_positions().info.stopLoss` 读取，**不是**独立计划单
+- **`fetch_open_orders(stop=True)` 数不到 pos-tpsl 止损** → 用 `_has_position_tpsl()` 双重检测
 - **Hedge 模式** → 不能用 `reduceOnly`/`holdSide`，用 `close_position(symbol, posSide)`
 - **place-pos-tpsl** → 一次调用设 SL+TP，自动替换旧单
 - **Server UTC+8** → `time_utils.now()` 统一时区，ISO 带 `+08:00`
 - **沙箱 OI 可用** → `fetch_open_interest()` 正常返回；L/S 多空比沙箱不可用 (实盘可用)
 - **AI 解析回退** → 入口默认 REJECT (宁可错过)，出口默认 HOLD (保持现状)
+- **出场优先规则引擎** → ROI>40%止盈 / ROI<-25%超1h止损 / 持仓>6h+|ROI|<3%僵尸仓
+- **ADX 自适应** → floor=6, 极端干旱(10轮0信号)→直降到底
+- **日亏损锁** → 读 `.env MAX_DAILY_LOSS_PCT`，默认 3%
 
 ## 关键 .env 配置
 
@@ -139,23 +168,25 @@ DEEPSEEK_API_KEY=
 DEEPSEEK_MODEL=deepseek-v4-pro
 
 # 策略核心
-ADX_THRESHOLD=16
-VOL_RATIO_THRESHOLD=1.5
+ADX_THRESHOLD=16              # v4.0: 自动调参 floor=6, 极端干旱直降
+VOL_RATIO_THRESHOLD=1.5       # 沙箱自动跳过
 MAX_CONCURRENT_POSITIONS=8
 RSI_OVERSOLD=40               # 遗传进化自动调
 RSI_OVERBOUGHT=60             # 遗传进化自动调
 
-# 风控
-MAX_DAILY_LOSS_PCT=0.05
+# 风控 (v4.0 更新)
+MAX_DAILY_LOSS_PCT=0.03       # 日内亏损硬锁 (默认3%, 从 .env 读取)
 STALE_EXIT_HOURS=4.0          # 僵尸仓退出
 STALE_ROI_LIMIT=0.02          # |ROI|<2% 触发
 AUTO_SL_ENABLED=true
 AUTO_SL_ROI_THRESHOLD=-0.30
 
-# v3.7 新功能
+# v4.0 新功能
 AI_POSITION_REVIEW_ENABLED=true
 SELF_LEARNER_ENABLED=true
 TRAILING_SL_ENABLED=true
+AI_POSITION_REVIEW_MIN_ROI=0.05  # 最低ROI才触发AI审核
+AI_POSITION_REVIEW_INTERVAL=3    # 每N轮触发一次
 ```
 
 ## 依赖
