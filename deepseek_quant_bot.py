@@ -2097,7 +2097,7 @@ class DeepSeekQuantBot:
         每 N 轮执行一次（默认 N=3，即每15分钟）。
         仅审查 ROI > ai_position_review_min_roi 的仓位。
         """
-        logger.info(f"🔍 AI 持仓审核: 审查 {len(positions_detail)} 个持仓 …")
+        logger.info(f"🔍 持仓检查 (规则引擎+AI解释): {len(positions_detail)} 个持仓 …")
 
         for pos_d in positions_detail:
             symbol = pos_d.get("symbol", "")
@@ -2151,44 +2151,37 @@ class DeepSeekQuantBot:
                 except Exception:
                     logger.debug("⚠️  静默异常", exc_info=True)
 
-                # ── 调用 AI 审核 ──
-                decision, reason = self.analyst.review_position(
-                    symbol=sym_full,
-                    direction=side,
-                    entry_price=entry,
-                    current_price=mark,
-                    unrealized_pnl=upl,
-                    roi=roi,
-                    holding_hours=holding_hours,
-                    ema=ema,
-                    rsi=rsi,
-                    atr=atr,
-                    adx=adx,
-                    recent_closes=recent_closes,
-                    market_regime=market_regime,
-                    tf_context=tf_context,
-                    funding_rate=funding_rate,
-                )
+                # ── v4.0: 规则引擎优先 — 不依赖 AI 做出场决策 ──
+                decision, reason = "HOLD", ""
+                if roi > 0.40:
+                    decision, reason = "CLOSE", f"止盈规则-盈利{roi*100:.0f}%"
+                elif roi < -0.25 and holding_hours > 1.0:
+                    decision, reason = "CLOSE", f"止损规则-亏损{roi*100:.0f}%超1h"
+                elif holding_hours > 6.0 and abs(roi) < 0.03:
+                    decision, reason = "CLOSE", f"僵尸仓规则-持仓{holding_hours:.0f}h"
+
+                # ── v4.0: AI 仅作研究解释 (非阻塞, 异步记录) ──
+                ai_note = ""
+                try:
+                    ai_dec, ai_reason = self.analyst.review_position(
+                        symbol=sym_full, direction=side, entry_price=entry,
+                        current_price=mark, unrealized_pnl=upl, roi=roi,
+                        holding_hours=holding_hours, ema=ema, rsi=rsi, atr=atr,
+                        adx=adx, recent_closes=recent_closes,
+                        market_regime=market_regime, tf_context=tf_context,
+                        funding_rate=funding_rate,
+                    )
+                    ai_note = f"AI:{ai_dec}/{ai_reason[:40]}"
+                except Exception:
+                    pass  # AI 不可用也不影响决策
 
                 # ── 记录决策 ──
                 self.tlogger.log_ai_exit_decision(
                     symbol=symbol, direction=side,
-                    decision=decision, reason=reason,
+                    decision=decision, reason=reason if not ai_note else f"{reason} | {ai_note}",
                     entry_price=entry, current_price=mark,
                     roi=roi, holding_hours=holding_hours,
                 )
-
-                # v4.0: AI 解析失败 → 规则接管 (不再盲目 HOLD)
-                if "失败" in str(reason) or "默认" in str(reason):
-                    if roi > 0.40:
-                        decision, reason = "CLOSE", f"规则接管-盈利{roi*100:.0f}%"
-                        logger.info(f"📋 规则接管: {symbol} 盈利{roi*100:.0f}%→平仓")
-                    elif roi < -0.25 and holding_hours > 1.0:
-                        decision, reason = "CLOSE", f"规则接管-亏损{roi*100:.0f}%超1h"
-                        logger.info(f"📋 规则接管: {symbol} 亏损{roi*100:.0f}%→止损")
-                    elif holding_hours > 6.0 and abs(roi) < 0.03:
-                        decision, reason = "CLOSE", f"规则接管-僵尸仓{holding_hours:.0f}h"
-                        logger.info(f"📋 规则接管: {symbol} 僵尸仓→平仓")
 
                 # ── 执行平仓 ──
                 if decision == "CLOSE":
@@ -3375,11 +3368,8 @@ class DeepSeekQuantBot:
             symbol    = sig["symbol"]
             direction = sig["direction"]
             price     = sig["price"]
-            ema       = sig["ema"]
-            rsi       = sig["rsi"]
             atr       = sig["atr"]
             adx       = sig["adx"]
-            closes    = sig["recent_closes"]
             strategy  = sig.get("strategy", "pullback")
 
             # ── v2: 多时间周期分析 + v3.7 增强市场状态识别 ──
@@ -3597,24 +3587,9 @@ class DeepSeekQuantBot:
                 decision, reason = "CONFIRM", f"评分{sig['confidence']}>70-自动通过"
                 logger.info(f"⚡ {symbol} AUTO决策: {reason}")
             else:
-                # ── v2: AI 审核（含多TF + 市场情绪 + 资金费率上下文） ──
-                decision, reason = self.analyst.review_signal(
-                symbol=symbol,
-                direction=direction,
-                price=price,
-                ema=ema,
-                rsi=rsi,
-                atr=atr,
-                recent_closes=closes,
-                adx=adx,
-                market_regime=market_regime,
-                tf_context=tf_context,
-                funding_rate=funding_rate,
-                vol_ratio=vol_ratio_val,
-                strategy=strategy,
-                confidence=sig.get("confidence", 50),
-                bonuses=sig.get("bonuses", []),
-            )
+                # v4.0: AI 降级为研究层 — 信号评分达标直接开仓, AI 不拦路
+                decision, reason = "CONFIRM", f"量化信号{tier}-直通"
+                logger.info(f"⚡ {symbol} 量化直通: 评分{sig.get('confidence',50)} — 跳过AI审核")
 
             # ── 记录 AI 决策 ──
             self.tlogger.log_ai_decision(symbol, direction, decision, reason)
