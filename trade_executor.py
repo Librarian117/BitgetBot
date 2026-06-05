@@ -42,11 +42,13 @@ class TradeExecutor:
                 atr: float, adx: float = 25.0,
                 strategy: str = "pullback",
                 position_multiplier: float = 1.0,
-                market_regime: str = "unknown") -> Dict[str, Any]:
+                market_regime: str = "unknown",
+                vol_cone_sl_mult: float = 1.0) -> Dict[str, Any]:
         """
         执行完整交易流程 (v4.0: 状态驱动仓位/SL/TP)。
 
         v4.0: market_regime - 市场状态标签，控制仓位乘数和 SL/TP 宽度
+        v4.0: vol_cone_sl_mult - 波动率锥动态SL倍率
         v2.0: position_multiplier - 组合排名仓位系数
         """
         result = {
@@ -277,6 +279,8 @@ class TradeExecutor:
             sl_dist = self.config.sl_atr_mult * session["sl_mult"] * atr
         # v4.0: 市场状态 SL 宽度调整
         sl_dist *= regime_sl_mult
+        # v4.0: 波动率锥动态SL — 极端波动收紧, 低波动放宽
+        sl_dist *= vol_cone_sl_mult
         # v4.0: SL 宽度硬上限 (防止多乘数叠加后 SL 过宽, 如 4.29x ATR)
         max_sl_dist = price * 0.15  # 最大 15% 价格
         min_sl_dist = price * 0.005  # 最小 0.5% (防止过于紧)

@@ -44,6 +44,7 @@ import requests
 
 from config_manager import ConfigManager
 from exchange_interface import ExchangeInterface
+from quant_math import compute_quant_signals
 from session_manager import SessionManager
 from trade_executor import TradeExecutor
 
@@ -2241,6 +2242,9 @@ class DeepSeekQuantBot:
 
             df = self.indicator.compute_all(df)
 
+            # ── v4.0: 量化信号增强 (卡尔曼+Hurst+波动率锥) ──
+            quant = compute_quant_signals(df)
+
             latest = df.iloc[-1]
             close = float(latest["close"])
             ema   = float(latest["ema"])
@@ -2304,6 +2308,21 @@ class DeepSeekQuantBot:
                 if drought_cycles % 20 == 0:
                     logger.info(f"🌵 干旱自适应: RSI阈值放宽±{drought_relax} "
                                 f"(超卖{effective_oversold}/超买{effective_overbought})")
+
+            # ── v4.0: 卡尔曼滤波趋势共识 — EMA+Kalman双确认, 减少假方向死锁 ──
+            kalman_dir = quant.get("kalman_direction", "flat")
+            kalman_score = quant.get("kalman_score", 0)
+            ema_kalman_conflict = (
+                (is_bearish_trend and kalman_dir == "up")
+                or (is_bullish_trend and kalman_dir == "down")
+            )
+            if ema_kalman_conflict and abs(kalman_score) > 0.3:
+                # 卡尔曼强信号与EMA冲突 → 信任卡尔曼(无滞后), 重置趋势判断
+                logger.info(f"🔧 {symbol} EMA-Kalman冲突 → Kalman={kalman_dir}({kalman_score})")
+                if kalman_dir == "up":
+                    is_bearish_trend, is_bullish_trend = False, True
+                elif kalman_dir == "down":
+                    is_bearish_trend, is_bullish_trend = True, False
 
             # v4.0: 大趋势偏向 — 熊市不产LONG信号(必被过滤), 牛市不产SHORT
             bearish_bias = is_bearish_trend
@@ -2635,6 +2654,11 @@ class DeepSeekQuantBot:
                 "confidence": confidence,
                 "tier": tier,
                 "bonuses": bonuses,
+                # v4.0: 量化信号
+                "_hurst": quant.get("hurst", 0.5),
+                "_hurst_regime": quant.get("hurst_regime", "random_walk"),
+                "_kalman_score": quant.get("kalman_score", 0),
+                "_vol_cone_sl_mult": quant.get("vol_cone_sl_mult", 1.0),
             }
 
         except Exception as e:
@@ -3376,6 +3400,15 @@ class DeepSeekQuantBot:
                 f"推荐策略:{regime_info.get('recommended',[])}"
             )
 
+            # ── v4.0: Hurst 策略路由 —— 数量化决定趋势 vs 回归 ──
+            sig_hurst = sig.get("_hurst", 0.5)
+            if sig_hurst > 0.55 and strategy in ("bollinger", "grid"):
+                logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 趋势市→跳过{strategy}回归策略")
+                continue
+            elif sig_hurst < 0.45 and strategy in ("momentum", "ema_cross"):
+                logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 回归市→跳过{strategy}趋势策略")
+                continue
+
             # ── v3.7: 策略路由 —— 根据市场状态过滤不匹配策略 ──
             # v4.0: bollinger/counter_trend 是均值回归/反转策略, 不受趋势约束
             recommended = regime_info.get("recommended", [])
@@ -3622,7 +3655,8 @@ class DeepSeekQuantBot:
                     logger.info(f"  📊 排名#{rank}/{total_cands} 总仓位系数 {pos_mult:.2f}x")
                 result = self.executor.execute(symbol, direction, price, atr, adx, strategy,
                                                position_multiplier=pos_mult,
-                                               market_regime=market_regime)
+                                               market_regime=market_regime,
+                                               vol_cone_sl_mult=sig.get("_vol_cone_sl_mult", 1.0))
                 if result["success"]:
                     self.total_trades += 1
                     trades_this_cycle += 1
