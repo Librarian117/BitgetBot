@@ -97,12 +97,10 @@ def print_dashboard(ex):
             shorts += 1
 
         info = p.get("info", {})
-        # v4.0 fix: 重用 bot 的双重 SL 检测 (fetch_positions + fetch_open_orders)
-        try:
-            has_sl, has_tp = ex._has_position_tpsl(sym_full, entry, side)
-        except Exception:
-            has_sl = bool(info.get("stopLoss", "") or info.get("stopLossPrice", ""))
-            has_tp = bool(info.get("takeProfit", "") or info.get("takeProfitPrice", ""))
+        # v4.0 fix: Bitget place-pos-tpsl 把 SL/TP 挂在持仓 info 上
+        # fetch_positions 返回 info.stopLoss / info.takeProfit (不是 stopLossPrice)
+        has_sl = bool(info.get("stopLoss", "") or info.get("stopLossPrice", ""))
+        has_tp = bool(info.get("takeProfit", "") or info.get("takeProfitPrice", ""))
         if not has_sl or not has_tp:
             bare += 1
 
@@ -149,11 +147,14 @@ def print_dashboard(ex):
 
         # Rows
         for p in sorted(pos_list, key=lambda x: x["upl"]):
-            protect = ""
-            if not p["has_sl"]:
-                protect += "!"
-            if not p["has_tp"]:
-                protect += "$"
+            if not p["has_sl"] and not p["has_tp"]:
+                protect = "🔴裸仓"
+            elif not p["has_sl"]:
+                protect = "⚠️缺SL"
+            elif not p["has_tp"]:
+                protect = "⚠️缺TP"
+            else:
+                protect = "🛡️已保护"
             vals = [
                 _pad(p["symbol"], COLS[0], ALIGNS[0]),
                 _pad(p["side"], COLS[1], ALIGNS[1]),
