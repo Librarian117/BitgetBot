@@ -104,11 +104,14 @@ def print_dashboard(ex):
         if not has_sl or not has_tp:
             bare += 1
 
+        sl_val = info.get("stopLoss", "") or info.get("stopLossPrice", "")
+        tp_val = info.get("takeProfit", "") or info.get("takeProfitPrice", "")
         roi = upl / mgn * 100 if mgn > 0 else 0
         pos_list.append({
             "symbol": base, "side": side, "entry": entry, "mark": mark,
             "upl": upl, "margin": mgn, "roi": roi,
             "has_sl": has_sl, "has_tp": has_tp,
+            "sl": sl_val, "tp": tp_val,
         })
 
     equity = total
@@ -146,6 +149,7 @@ def print_dashboard(ex):
         print("  " + _hline(COLS, "─┼─"))
 
         # Rows
+        detail_lines = []
         for p in sorted(pos_list, key=lambda x: x["upl"]):
             if not p["has_sl"] and not p["has_tp"]:
                 protect = "🔴裸仓"
@@ -154,7 +158,7 @@ def print_dashboard(ex):
             elif not p["has_tp"]:
                 protect = "⚠️缺TP"
             else:
-                protect = "🛡️已保护"
+                protect = "🛡️"
             vals = [
                 _pad(p["symbol"], COLS[0], ALIGNS[0]),
                 _pad(p["side"], COLS[1], ALIGNS[1]),
@@ -166,6 +170,11 @@ def print_dashboard(ex):
                 _pad(protect, COLS[7], "<"),
             ]
             print("  " + " │ ".join(vals))
+            # v4.0: 显示具体 SL/TP 价格
+            if p["sl"] or p["tp"]:
+                sl_str = f"SL:{float(p['sl']):.4f}" if p["sl"] else "SL:—"
+                tp_str = f"TP:{float(p['tp']):.4f}" if p["tp"] else "TP:—"
+                print("  " + " " * 14 + f"{sl_str}  {tp_str}")
 
         print("  " + _hline(COLS, "─┴─"))
         print(f"  总浮盈: {total_upl:+.2f} USDT    |  做多{longs} 做空{shorts}")
