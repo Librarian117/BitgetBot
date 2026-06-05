@@ -83,7 +83,7 @@ class TradeExecutor:
                 # 通过 config 的 kelly_multiplier 属性获取 (由 learner 更新)
                 kelly_mult = getattr(self.config, 'kelly_multiplier', 1.0)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
         # v4.0: 市场状态仓位/SL 调整
         regime_cfg = self.REGIME_MULTIPLIERS.get(market_regime, {"pos": 1.0, "sl": 1.0, "tp": 1.0})
         regime_pos_mult = regime_cfg.get("pos", 1.0)
@@ -141,7 +141,7 @@ class TradeExecutor:
                     f"→ 缩减至{margin:.0f}U"
                 )
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # v4.0: 先用默认杠杆，后续验证后可能修正
         effective_leverage = self.config.leverage
@@ -268,7 +268,7 @@ class TradeExecutor:
                     f"contracts={amount_contracts} lev={effective_leverage}x"
                 )
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── 5. 止损 & 部分止盈计算 ──
         if strategy == "momentum":

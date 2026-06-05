@@ -119,7 +119,7 @@ class PortfolioManager:
                     df = self.exchange.fetch_ohlcv_tf(sym, "1h", limit=self.config.correlation_window_hours + 1)
                     returns_cache[base] = df["close"].pct_change().dropna()
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
                 continue
 
             try:
@@ -148,7 +148,7 @@ class PortfolioManager:
                             self.cross_correlations[(b1, b2)] = round(corr, 3)
                             self.cross_correlations[(b2, b1)] = round(corr, 3)
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
 
         self._last_correlation_update = time.time()
         self._save_cache()

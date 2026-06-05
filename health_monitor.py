@@ -127,7 +127,7 @@ class HealthMonitor:
         try:
             raw_positions = self.exchange.get_open_positions()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         for p in positions:
             sym = p.get("symbol", "?")
@@ -156,7 +156,7 @@ class HealthMonitor:
                 has_sl = has_sl or plan_sl
                 has_tp = has_tp or plan_tp
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
             if not has_sl or not has_tp:
                 bare_count += 1
@@ -211,7 +211,7 @@ class HealthMonitor:
                 if margin_ratio > self.MARGIN_RATIO_WARN:
                     warnings.append(f"保证金占比 {margin_ratio*100:.0f}%，可用余额偏低")
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── 6. 风险指标 ──
         try:
@@ -222,7 +222,7 @@ class HealthMonitor:
             if risk.get("blocked"):
                 issues.append("日内风控已锁仓，暂停交易")
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── 7. 错误率 ──
         if self._error_count > 20:
@@ -252,7 +252,7 @@ class HealthMonitor:
                 json.dump(status, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self._health_path)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # 告警入日志
         for issue in issues:

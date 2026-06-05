@@ -353,7 +353,7 @@ class MarketContextManager:
                         result["name"] = top.get("name")
                         result["market_cap_rank"] = top.get("market_cap_rank")
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # 2. 是否在热门榜单中
         if base.upper() in [t.upper() for t in self.trending_cache]:
@@ -419,7 +419,7 @@ class DeepSeekAnalyst:
         try:
             self.session.close()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
     def review_signal(
         self,
@@ -1112,7 +1112,7 @@ ATR: {atr:.4f}
                 msg = body["choices"][0]["message"]
                 return self._merge_content_reasoning(msg)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
         return ""
 
 
@@ -2148,7 +2148,7 @@ class DeepSeekQuantBot:
                 try:
                     funding_rate = self.exchange.fetch_funding_rate(sym_full)
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
 
                 # ── 调用 AI 审核 ──
                 decision, reason = self.analyst.review_position(
@@ -2550,14 +2550,14 @@ class DeepSeekQuantBot:
                         flow_signal = self.flow_monitor.get_flow_signal(
                             f"{symbol}/USDT:USDT", close)
                     except Exception:
-                        pass
+                        logger.debug("⚠️  静默异常", exc_info=True)
                 markov_result = None
                 if self.markov_regime:
                     try:
                         markov_result = self.markov_regime.detect(
                             df["close"].tail(100).tolist(), symbol)
                     except Exception:
-                        pass
+                        logger.debug("⚠️  静默异常", exc_info=True)
 
                 # 构建简化的 regime_info (单TF近似，供评分器使用)
                 # 后续 run_once 中的多TF分析会做更精确的判断
@@ -2579,7 +2579,7 @@ class DeepSeekQuantBot:
                         "detail": f"单TF{regime_label} ADX={adx:.1f} ATR%={atr_pct*100:.2f}",
                     }
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
 
                 score_result = self.scorer.score(
                     sig={"direction": direction, "strategy": strategy,
@@ -2735,7 +2735,7 @@ class DeepSeekQuantBot:
         try:
             self.market_ctx.ensure_fresh()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v2.7: 用预取数据刷新风控，避免重复 API 调用 ──
         self.riskmon._refresh_with_data(acct)
@@ -2793,16 +2793,16 @@ class DeepSeekQuantBot:
                                                 existing_tp = tp_val
                                                 break
                                 except Exception:
-                                    pass
+                                    logger.debug("⚠️  静默异常", exc_info=True)
                                 # 取消旧 SL/TP，重新挂载，保留现有 TP
                                 self.exchange.set_position_sl_tp(
                                     sym_full, "buy" if side == "LONG" else "sell",
                                     new_sl, existing_tp
                                 )
                         except Exception:
-                            pass
+                            logger.debug("⚠️  静默异常", exc_info=True)
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.3: 盈利锁仓 —— 浮盈超过 2x ATR 后移动 TP 锁定利润 ──
         if acct.get("positions_detail"):
@@ -2847,7 +2847,7 @@ class DeepSeekQuantBot:
                 if pos_insight:
                     logger.info(f"🧠 持仓分析:\n{pos_insight}")
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.6: 浮亏自动止损 —— ROI < AUTO_SL_ROI_THRESHOLD 且持仓 > AUTO_SL_MIN_HOURS ──
         if self.config.auto_sl_enabled and acct.get("positions_detail"):
@@ -2995,7 +2995,7 @@ class DeepSeekQuantBot:
                         except Exception as e:
                             logger.warning(f"⚡ {sym} 波动熔断更新SL失败: {e}")
                 except Exception:
-                    pass  # OI/ATR 获取失败不影响主循环
+                    logger.debug("⚠️  静默异常", exc_info=True)  # OI/ATR 获取失败不影响主循环
 
         # ── v3.6: AI 持仓审核 —— 定期审查已持仓是否需要提前退出 ──
         if self.config.ai_position_review_enabled and acct.get("positions_detail"):
@@ -3038,7 +3038,7 @@ class DeepSeekQuantBot:
                     for o in reduce_orders[:-2]:
                         self.exchange.cancel_order(str(o.get('id','')), sym_full)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.6: 每3轮检查仓位 TPSL 保护 (从 position info 读取，兼容 place-pos-tpsl) ──
         if self.total_scans > 0 and self.total_scans % 3 == 0:
@@ -3279,7 +3279,7 @@ class DeepSeekQuantBot:
                         self.analyst.news_context = (
                             (self.analyst.news_context or "") + "\n" + flow_summary)
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
         else:
             self.analyst.news_context = ""
 
@@ -3733,7 +3733,7 @@ class DeepSeekQuantBot:
                         if self.exchange._is_reduce_only(o):
                             self.exchange.cancel_order(str(o.get('id','')), sym)
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
                 # v4.0: 风险监控追踪连续亏损
                 self.riskmon.record_closed_trade(pnl, base)
                 # v4.0: 接线 PerformanceTracker
@@ -3790,7 +3790,7 @@ class DeepSeekQuantBot:
                 }, f, ensure_ascii=False)
             os.replace(tmp, "positions_state.json")
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.1: 周期性自我回顾 + v3.7: 紧急回顾 ──
         _review_trades = None
@@ -3806,7 +3806,7 @@ class DeepSeekQuantBot:
                             elif evt.get("event") == "TRADE" and evt.get("success"):
                                 _review_trades.append(evt)
                         except Exception:
-                            pass
+                            logger.debug("⚠️  静默异常", exc_info=True)
             except Exception:
                 _review_trades = None
 
@@ -3835,7 +3835,7 @@ class DeepSeekQuantBot:
                 if diagnosis:
                     logger.info(f"🧠 过滤器诊断: {diagnosis}")
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.6: ② 退出质量优化 (每 REVIEW_INTERVAL_HOURS 触发) ──
         if self.learner and self.learner.should_review():
@@ -3844,7 +3844,7 @@ class DeepSeekQuantBot:
                 if exit_opt:
                     self.tlogger.log_risk("EXIT_OPTIMIZE", exit_opt)
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.6: ③ Kelly 仓位更新 ──
         if self.learner:
@@ -3855,7 +3855,7 @@ class DeepSeekQuantBot:
                 kelly = self.learner.get_kelly_multiplier("pullback", dominant_dir)
                 self.config.kelly_multiplier = kelly
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.7: ④ 遗传进化器 (每 2 小时，需 >= 10 笔交易) ──
         if self.evolver and self.learner:
@@ -3935,7 +3935,7 @@ class DeepSeekQuantBot:
                 if tune_result:
                     self.tlogger.log_risk("ADAPTIVE_TUNE", tune_result)
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── v3.2: 健康检查 ──
         if self.health:
@@ -3946,7 +3946,7 @@ class DeepSeekQuantBot:
                     errors=(1 if self.analyst.circuit_breaker_open() else 0)
                 )
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         # ── 周期日志 (v2.7: 复用预取 acct，不再重复调用 API) ──
         # 从 TF 缓存中取任意已分析币种的 market_regime
@@ -3981,13 +3981,13 @@ class DeepSeekQuantBot:
             try:
                 self.news_client.close()
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
         # ── v3.1: 关闭学习引擎 ──
         if self.learner:
             try:
                 self.learner.close()
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
         try:
             self._update_status_file()
             self.tlogger.log_risk("SHUTDOWN", "bot stopped gracefully")
@@ -3997,7 +3997,7 @@ class DeepSeekQuantBot:
         try:
             self.analyst.close()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
         logger.info("👋 DeepSeekQuantBot v3.0 已停止")
 
     def _detect_startup_closes(self):
@@ -4037,7 +4037,7 @@ class DeepSeekQuantBot:
                                 market_regime=getattr(self, '_current_regime', 'unknown'),
                             )
                         except Exception:
-                            pass
+                            logger.debug("⚠️  静默异常", exc_info=True)
         except Exception as e:
             logger.warning(f"⚠️  启动平仓检测异常: {e}")
 
@@ -4142,7 +4142,7 @@ class DeepSeekQuantBot:
             signal.signal(signal.SIGTERM, _handle_signal)
             signal.signal(signal.SIGINT, _handle_signal)
         except Exception:
-            pass  # 某些平台不支持 signal
+            logger.debug("⚠️  静默异常", exc_info=True)  # 某些平台不支持 signal
 
         while True:
             try:
@@ -4163,7 +4163,7 @@ class DeepSeekQuantBot:
                 try:
                     self.config.save_runtime_params()
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
                 logger.info(
                     f"⏰ 本轮耗时 {elapsed:.1f}s，休眠 {sleep_seconds:.0f}s "
                     f"至下一轮 {now() + timedelta(seconds=sleep_seconds):%H:%M:%S}"

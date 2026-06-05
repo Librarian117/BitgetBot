@@ -770,4 +770,4 @@ class GeneticEvolver:
         try:
             self._session.close()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)

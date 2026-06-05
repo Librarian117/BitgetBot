@@ -182,7 +182,7 @@ class MarkovRegime:
                 json.dump(state, f, ensure_ascii=False)
             os.replace(tmp, self.STATE_FILE)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
     def load_state(self, symbol: str = "") -> Optional[Dict]:
         """加载持久化的马尔可夫状态。超过 24h 视为过期。"""

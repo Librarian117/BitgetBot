@@ -220,7 +220,7 @@ class ExchangeInterface:
                     if pos and float(pos.get("contracts", 0) or 0) != 0:
                         positions[sym] = pos
                 except Exception:
-                    pass  # 沙箱环境可能不支持
+                    logger.debug("⚠️  静默异常", exc_info=True)  # 沙箱环境可能不支持
 
         if positions:
             logger.info(f"📊 当前持仓: {list(positions.keys())}")
@@ -254,7 +254,7 @@ class ExchangeInterface:
             if market_id in self._trading_fees:
                 return self._trading_fees[market_id]
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
         return 0.0006  # 默认 0.06%
 
     def create_market_order_with_partial_tp(
@@ -479,7 +479,7 @@ class ExchangeInterface:
                 if tp_val and str(tp_val) not in ("0", "", "None"):
                     has_tp = True
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
         # 方法2: 独立计划单 (兜底，用于非 pos-tpsl 方式设定的 SL/TP)
         if not has_sl or not has_tp:
@@ -501,7 +501,7 @@ class ExchangeInterface:
                         if trigger < entry_price:
                             has_tp = True
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
         return (has_sl, has_tp)
 
@@ -515,7 +515,7 @@ class ExchangeInterface:
                     self.exchange.cancel_order(o.get("id", ""), symbol)
                     count += 1
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
             return count
         except Exception:
             return 0
@@ -622,7 +622,7 @@ class ExchangeInterface:
                         tp_str = self.exchange.price_to_precision(symbol, mark * 0.98)
                         logger.warning(f"⚠️  TP方向修正: SHORT TP必须<mark({mark}), 设为{mark*0.98:.4f}")
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
             raw_symbol = symbol.split(":")[0].replace("/", "")
             params = {
@@ -665,7 +665,7 @@ class ExchangeInterface:
                     if self._is_reduce_only(o):
                         self.exchange.cancel_order(str(o.get('id', '')), symbol)
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
 
             # 下止损单 (pos_loss)
             sl_params = {

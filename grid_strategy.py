@@ -587,7 +587,7 @@ class GridManager:
                     level["status"] = "cancelled"
                     cancelled_count += 1
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
         logger.info(f"📋 {symbol} 重校准: 已取消 {cancelled_count} 个旧订单")
 
         # 生成新层级

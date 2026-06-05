@@ -1453,7 +1453,7 @@ class SelfLearner:
                     elif evt.get("event") in filter_stats:
                         filter_stats[evt["event"]] += 1
                 except Exception:
-                    pass
+                    logger.debug("⚠️  静默异常", exc_info=True)
         except Exception:
             return None
 
@@ -1718,7 +1718,7 @@ class SelfLearner:
                 json.dump(self.tracker.to_dict(), f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.tracker_path)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
     def _load_tracker(self):
         if not os.path.exists(self.tracker_path):
@@ -1729,24 +1729,24 @@ class SelfLearner:
             self.tracker.load_from(data)
             logger.info(f"🧠 已加载策略绩效: {len(self.tracker.recent_trades)} 笔历史交易")
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
 
     @staticmethod
     def _parse_json(raw: str) -> Any:
         try:
             return json.loads(raw)
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
         for m in re.finditer(r'```(?:json)?\s*\n?(.*?)```', raw, re.DOTALL):
             try:
                 return json.loads(m.group(1).strip())
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
         for m in re.finditer(r'(\[.*\]|\{.*\})', raw, re.DOTALL):
             try:
                 return json.loads(m.group(0))
             except Exception:
-                pass
+                logger.debug("⚠️  静默异常", exc_info=True)
         return {}
 
     # ════════════════════════════════════════════
@@ -1975,4 +1975,4 @@ class SelfLearner:
         try:
             self._session.close()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)

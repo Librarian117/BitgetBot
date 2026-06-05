@@ -197,7 +197,7 @@ class CryptoPanicClient:
                     avg_chg = sum(changes) / len(changes)
                     price_bias = max(-1.0, min(1.0, avg_chg / 10.0))
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
         price_score = 50 + price_bias * 40
 
         score = fng_val * 0.60 + news_score * 0.25 + price_score * 0.15
@@ -408,4 +408,4 @@ class CryptoPanicClient:
         try:
             self._session.close()
         except Exception:
-            pass
+            logger.debug("⚠️  静默异常", exc_info=True)
