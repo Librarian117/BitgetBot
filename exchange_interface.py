@@ -439,7 +439,6 @@ class ExchangeInterface:
             return False
 
     @staticmethod
-    @staticmethod
     def _is_reduce_only(order: Dict) -> bool:
         """判断是否为减仓/止损止盈单 (兼容 ccxt + Bitget info 字段)"""
         if order.get("reduceOnly"):
@@ -451,7 +450,6 @@ class ExchangeInterface:
             return True
         return False
 
-    @staticmethod
     def _has_position_tpsl(self, symbol: str, entry_price: float, side: str) -> Tuple[bool, bool]:
         """
         检测持仓是否有 SL/TP 保护。
