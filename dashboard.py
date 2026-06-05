@@ -115,8 +115,8 @@ def print_dashboard(ex):
     margin_pct = total_margin / equity * 100 if equity > 0 else 0
 
     # ── Column widths (display columns, not chars) ──
-    COLS = [6, 6, 11, 11, 9, 8, 8, 8]  # symbol, side, entry, mark, upl, margin, roi, protect
-    HEADERS = ["币种", "方向", "入场", "现价", "浮盈", "保证金", "收益率", "保护"]
+    COLS = [6, 6, 8, 11, 11, 9, 8, 8]  # symbol, side, margin, entry, mark, upl, roi, protect
+    HEADERS = ["币种", "方向", "保证金", "入场", "现价", "浮盈", "收益率", "保护"]
     ALIGNS = ["<", "<", ">", ">", ">", ">", ">", "<"]
 
     # ── Print ──
@@ -153,10 +153,10 @@ def print_dashboard(ex):
             vals = [
                 _pad(p["symbol"], COLS[0], ALIGNS[0]),
                 _pad(p["side"], COLS[1], ALIGNS[1]),
-                _pad(f"{p['entry']:.4f}", COLS[2], ">"),
-                _pad(f"{p['mark']:.4f}", COLS[3], ">"),
-                _pad(f"{p['upl']:+.2f}", COLS[4], ">"),
-                _pad(f"{p['margin']:.0f}", COLS[5], ">"),
+                _pad(f"{p['margin']:.0f}", COLS[2], ">"),
+                _pad(f"{p['entry']:.4f}", COLS[3], ">"),
+                _pad(f"{p['mark']:.4f}", COLS[4], ">"),
+                _pad(f"{p['upl']:+.2f}", COLS[5], ">"),
                 _pad(f"{p['roi']:+.1f}%", COLS[6], ">"),
                 _pad(protect, COLS[7], "<"),
             ]
