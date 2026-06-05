@@ -34,3 +34,5 @@ Thumbs.db
 *.tmp
 *.swp
 *.bak
+correlation_cache.json
+scheduled_tasks.lock
