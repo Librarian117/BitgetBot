@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """trade_executor.py — 仓位计算 → 杠杆设置 → 止盈止损计算 → 下单"""
 
+from __future__ import annotations
+
 import logging
 import math
 from typing import Any, Dict, TYPE_CHECKING
