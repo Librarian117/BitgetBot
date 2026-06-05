@@ -10,28 +10,65 @@ import ccxt
 import os
 import sys
 import time
+import unicodedata
 from time_utils import now
 from dotenv import load_dotenv
 
+# Windows 终端 UTF-8 修复
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 load_dotenv()
+
 
 def get_exchange():
     ex = ccxt.bitget({
-        'apiKey': os.getenv('BITGET_API_KEY'),
-        'secret': os.getenv('BITGET_SECRET'),
-        'password': os.getenv('BITGET_PASSPHRASE'),
-        'options': {'defaultType': 'swap'},
-        'enableRateLimit': True,
+        "apiKey": os.getenv("BITGET_API_KEY"),
+        "secret": os.getenv("BITGET_SECRET"),
+        "password": os.getenv("BITGET_PASSPHRASE"),
+        "options": {"defaultType": "swap"},
+        "enableRateLimit": True,
     })
     ex.set_sandbox_mode(True)
     ex.load_markets()
     return ex
 
+
+def _disp_width(s: str) -> int:
+    """计算字符串的终端显示宽度（CJK 字符占 2 列）"""
+    w = 0
+    for ch in s:
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ("W", "F") else 1
+    return w
+
+
+def _pad(s: str, width: int, align: str = "<") -> str:
+    """按显示宽度对齐填充字符串"""
+    dw = _disp_width(s)
+    pad = max(0, width - dw)
+    if align == ">":
+        return " " * pad + s
+    elif align == "^":
+        left = pad // 2
+        right = pad - left
+        return " " * left + s + " " * right
+    return s + " " * pad
+
+
+def _hline(widths: list, sep: str = "┼") -> str:
+    """画表格线，CJK 字符 ─ 占两列"""
+    parts = []
+    for w in widths:
+        parts.append("─" * w)
+    return sep.join(parts)
+
+
 def print_dashboard(ex):
     bal = ex.fetch_balance()
-    total = float(bal.get('total', {}).get('USDT', 0))
-    free = float(bal.get('free', {}).get('USDT', 0))
-    float(bal.get('used', {}).get('USDT', 0))
+    total = float(bal.get("total", {}).get("USDT", 0))
+    free = float(bal.get("free", {}).get("USDT", 0))
 
     positions = ex.fetch_positions()
     pos_list = []
@@ -39,114 +76,109 @@ def print_dashboard(ex):
     total_margin = 0
     longs = 0
     shorts = 0
-    bare = 0 
+    bare = 0
 
     for p in positions:
-        c = float(p.get('contracts', 0))
+        c = float(p.get("contracts", 0))
         if c == 0:
             continue
-        sym_full = p['symbol']
-        base = sym_full.replace('/USDT:USDT', '')
-        entry = float(p.get('entryPrice', 0))
-        mark = float(p.get('markPrice', 0))
-        upl = float(p.get('unrealizedPnl', 0))
-        mgn = float(p.get('initialMargin', 0))
-        side = p.get('side', '?')
+        sym_full = p["symbol"]
+        base = sym_full.replace("/USDT:USDT", "")
+        entry = float(p.get("entryPrice", 0))
+        mark = float(p.get("markPrice", 0))
+        upl = float(p.get("unrealizedPnl", 0))
+        mgn = float(p.get("initialMargin", 0))
+        side = p.get("side", "?")
         total_upl += upl
         total_margin += mgn
-        if side == 'long':
+        if side == "long":
             longs += 1
         else:
             shorts += 1
 
-        # Check SL/TP (v3.6: 优先仓位级别 TPSL)
-        has_sl = False
-        has_tp = False
-        sl_count = 0
-        # v3.6: 先查仓位 level 的 TPSL (place-pos-tpsl API 设置)
         info = p.get("info", {})
-        if info.get("stopLoss", "") or info.get("stopLossPrice", ""):
-            has_sl = True
-            sl_count += 1
-        if info.get("takeProfit", "") or info.get("takeProfitPrice", ""):
-            has_tp = True
-            sl_count += 1
-        # 回退: 查独立 plan order
-        if not has_sl or not has_tp:
-            try:
-                orders = ex.fetch_open_orders(sym_full, params={'stop': True}) or []
-            except Exception:
-                orders = []
-            sl_count = max(sl_count, len(orders))
-            for o in orders:
-                tp_price = float(o.get('info', {}).get('triggerPrice', 0))
-                if side == 'short':
-                    if tp_price < entry:
-                        has_tp = True
-                    if tp_price > entry:
-                        has_sl = True
-                else:
-                    if tp_price > entry:
-                        has_tp = True
-                    if tp_price < entry:
-                        has_sl = True
+        has_sl = bool(info.get("stopLoss", "") or info.get("stopLossPrice", ""))
+        has_tp = bool(info.get("takeProfit", "") or info.get("takeProfitPrice", ""))
         if not has_sl or not has_tp:
             bare += 1
 
         roi = upl / mgn * 100 if mgn > 0 else 0
         pos_list.append({
-            'symbol': base, 'side': side, 'entry': entry, 'mark': mark,
-            'upl': upl, 'margin': mgn, 'roi': roi,
-            'sl_count': sl_count, 'has_tp': has_tp, 'has_sl': has_sl,
-            'contracts': c,
+            "symbol": base, "side": side, "entry": entry, "mark": mark,
+            "upl": upl, "margin": mgn, "roi": roi,
+            "has_sl": has_sl, "has_tp": has_tp,
         })
 
-    equity = total  # ccxt total already includes unrealized PnL
-    initial = float(os.getenv('INITIAL_EQUITY', '10000'))
+    equity = total
+    initial = float(os.getenv("INITIAL_EQUITY", "10000"))
     all_time = (equity / initial - 1) * 100
     margin_pct = total_margin / equity * 100 if equity > 0 else 0
 
-    # ── Print Dashboard ──
-    print(f"\n{'='*60}")
-    print(f"  DeepSeekQuantBot 实时面板  |  {now().strftime('%H:%M:%S')}")
-    print(f"{'='*60}")
-    print(f"  权益:  {equity:>10.2f} USDT    累计: {all_time:+.2f}%")
-    print(f"  余额:  {total:>10.2f} USDT    浮盈: {total_upl:+.2f}")
-    print(f"  可用:  {free:>10.2f} USDT    保证金: {total_margin:.0f} ({margin_pct:.1f}%)")
-    print(f"  初始:  {initial:>10.0f} USDT    持仓: {len(pos_list)}/8  做多:{longs} 做空:{shorts}")
+    # ── Column widths (display columns, not chars) ──
+    COLS = [6, 6, 11, 11, 9, 8, 8, 8]  # symbol, side, entry, mark, upl, margin, roi, protect
+    HEADERS = ["币种", "方向", "入场", "现价", "浮盈", "保证金", "收益率", "保护"]
+    ALIGNS = ["<", "<", ">", ">", ">", ">", ">", "<"]
+
+    # ── Print ──
+    print(f"\n╔{'═'*58}╗")
+    print(f"║  DeepSeekQuantBot 实时面板  |  {now().strftime('%H:%M:%S')}  ║")
+    print(f"╠{'═'*58}╣")
+    print(f"║  权益:  {equity:>10.2f} USDT    累计: {all_time:+.2f}%  ║")
+    print(f"║  余额:  {total:>10.2f} USDT    浮盈: {total_upl:+.2f}  ║")
+    print(f"║  可用:  {free:>10.2f} USDT    保证金: {total_margin:.0f} ({margin_pct:.1f}%)  ║")
+    print(f"║  初始:  {initial:>10.0f} USDT    持仓: {len(pos_list)}/8  做多:{longs} 做空:{shorts}  ║")
+
+    alerts = []
     if bare > 0:
-        print(f"  ⚠️ 裸仓: {bare} 个!")
-    print(f"{'='*60}")
-    print(f"  {'币种':6s} {'方向':5s} {'入场':>10s} {'现价':>10s} {'浮盈':>8s} {'保证金':>7s} {'收益率':>7s} {'SL/TP':>5s}")
-    print(f"  {'─'*68}")
+        alerts.append(f"⚠裸仓:{bare}")
+    print(f"╚{'═'*58}╝")
+    if alerts:
+        print("  " + " | ".join(alerts))
 
-    for p in sorted(pos_list, key=lambda x: x['upl']):
-        sl_status = f"{p['sl_count']}"
-        if not p['has_sl']:
-            sl_status += '!SL'
-        if not p['has_tp']:
-            sl_status += '!TP'
-        print(f"  {p['symbol']:6s} {p['side']:5s} {p['entry']:>10.4f} {p['mark']:>10.4f} {p['upl']:>+8.2f} {p['margin']:>7.0f} {p['roi']:>+6.1f}% {sl_status:>5s}")
+    if pos_list:
+        # Header
+        header_parts = []
+        for h, w, a in zip(HEADERS, COLS, ALIGNS):
+            header_parts.append(_pad(h, w, a))
+        print("  " + " │ ".join(header_parts))
+        print("  " + _hline(COLS, "─┼─"))
 
-    print(f"  {'─'*60}")
-    print(f"  总浮盈: {total_upl:+.2f} USDT    |  做多{longs} 做空{shorts}")
+        # Rows
+        for p in sorted(pos_list, key=lambda x: x["upl"]):
+            protect = ""
+            if not p["has_sl"]:
+                protect += "!"
+            if not p["has_tp"]:
+                protect += "$"
+            vals = [
+                _pad(p["symbol"], COLS[0], ALIGNS[0]),
+                _pad(p["side"], COLS[1], ALIGNS[1]),
+                _pad(f"{p['entry']:.4f}", COLS[2], ">"),
+                _pad(f"{p['mark']:.4f}", COLS[3], ">"),
+                _pad(f"{p['upl']:+.2f}", COLS[4], ">"),
+                _pad(f"{p['margin']:.0f}", COLS[5], ">"),
+                _pad(f"{p['roi']:+.1f}%", COLS[6], ">"),
+                _pad(protect, COLS[7], "<"),
+            ]
+            print("  " + " │ ".join(vals))
+
+        print("  " + _hline(COLS, "─┴─"))
+        print(f"  总浮盈: {total_upl:+.2f} USDT    |  做多{longs} 做空{shorts}")
 
     # Alerts
-    if bare > 0:
-        bare_names = [p['symbol'] for p in pos_list if p['sl_count'] == 0]
-        print(f"  🚨 裸仓告警: {', '.join(bare_names)}")
-    worst = min(pos_list, key=lambda x: x['upl'], default=None)
-    if worst and worst['upl'] < -30:
+    worst = min(pos_list, key=lambda x: x["upl"], default=None)
+    if worst and worst["upl"] < -30:
         print(f"  ⚠️  最大浮亏: {worst['symbol']} {worst['upl']:+.2f}")
-    best = max(pos_list, key=lambda x: x['upl'], default=None)
-    if best and best['upl'] > 50 and best['roi'] > 20:
+    best = max(pos_list, key=lambda x: x["upl"], default=None)
+    if best and best["upl"] > 50 and best["roi"] > 20:
         print(f"  💡 可锁仓: {best['symbol']} 浮盈{best['upl']:+.2f} (ROI {best['roi']:.0f}%)")
-    if abs(longs - shorts) > len(pos_list) * 0.7:
+    if abs(longs - shorts) > len(pos_list) * 0.7 and len(pos_list) >= 2:
         print(f"  ⚠️  方向失衡: 做多{longs} 做空{shorts} (单向占比过高)")
-    print(f"{'='*60}\n")
+    print(f"{'─'*60}\n")
 
-if __name__ == '__main__':
-    loop = '--loop' in sys.argv or '-l' in sys.argv
+
+if __name__ == "__main__":
+    loop = "--loop" in sys.argv or "-l" in sys.argv
     ex = get_exchange()
     print_dashboard(ex)
     if loop:
@@ -155,4 +187,4 @@ if __name__ == '__main__':
                 time.sleep(30)
                 print_dashboard(ex)
         except KeyboardInterrupt:
-            print('\n退出.')
+            print("\n退出.")
