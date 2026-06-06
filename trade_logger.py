@@ -253,3 +253,15 @@ class TradeLogger:
             "pnl_pct": round(pnl_pct, 1),
             "strategy": strategy,
         })
+
+    def log_filter_reject(self, symbol: str, reason: str, detail: str = "",
+                          direction: str = "", strategy: str = ""):
+        """v4.1: 统一过滤器拒绝日志，用于统计各过滤器拦截次数"""
+        self._write({
+            "event": "FILTER_REJECT",
+            "symbol": symbol,
+            "reason": reason,  # KALMAN_CONFLICT / ADX_TOO_LOW / COOLDOWN / DIRECTION_BLOCK / HURST / STRATEGY_ROUTE / TF_MISMATCH
+            "detail": detail,
+            "direction": direction,
+            "strategy": strategy,
+        })

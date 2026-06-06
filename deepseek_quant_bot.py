@@ -817,6 +817,8 @@ class DeepSeekQuantBot:
                     f"({session['label']}阈值, 基础={self.config.adx_threshold})，跳过"
                 )
                 self.tlogger.log_adx_skip(symbol, adx)
+                self.tlogger.log_filter_reject(symbol, "ADX_TOO_LOW",
+                    f"ADX={adx:.2f}<{effective_adx}", direction="")
                 self.stats["adx_skips"] += 1
                 return None
 
@@ -834,6 +836,8 @@ class DeepSeekQuantBot:
                         f"({session['label']})，跳过"
                     )
                     self.tlogger.log_vol_skip(symbol, vol_ratio)
+                    self.tlogger.log_filter_reject(symbol, "VOL_TOO_LOW",
+                        f"VolRatio={vol_ratio:.2f}<{session['vol_ratio']}")
                     return None
             else:
                 vol_ratio = 1.0  # 沙箱默认通过
@@ -867,6 +871,8 @@ class DeepSeekQuantBot:
             if ema_kalman_conflict and abs(kalman_score) > 0.3:
                 # v4.1 fix: 卡尔曼短窗口(50bar≈4h)不可覆盖EMA200长期趋势
                 # 冲突时记录日志，保持EMA原判 (避免小时级反弹误翻方向)
+                self.tlogger.log_filter_reject(symbol, "EMA_KALMAN_CONFLICT",
+                    f"Kalman={kalman_dir}({kalman_score}) vs EMA", direction="")
                 logger.info(f"🔧 {symbol} EMA-Kalman冲突 → Kalman={kalman_dir}({kalman_score}) 保持EMA趋势")
 
             # v4.0: 大趋势偏向 — 熊市不产LONG信号(必被过滤), 牛市不产SHORT
@@ -967,6 +973,9 @@ class DeepSeekQuantBot:
                     or (direction == "LONG" and kalman_dir == "down")
                 )
                 if kalman_conflict and abs(kalman_score) > 0.15:
+                    self.tlogger.log_filter_reject(symbol, "KALMAN_CONFLICT",
+                        f"信号{direction} vs Kalman={kalman_dir}({kalman_score:.2f})",
+                        direction=direction, strategy=strategy)
                     logger.info(
                         f"🔧 {symbol} {direction} 信号与 Kalman 冲突 "
                         f"(Kalman={kalman_dir} score={kalman_score:.2f})，拒绝"
@@ -986,6 +995,8 @@ class DeepSeekQuantBot:
             if sym_key in sym_cool:
                 remaining = (sym_cool[sym_key] - time.time()) / 60
                 if remaining > 0:
+                    self.tlogger.log_filter_reject(symbol, "COOLDOWN",
+                        f"止损冷却剩余{remaining:.0f}min", direction=direction)
                     logger.info(
                         f"⏳ {symbol} 止损冷却中 (剩余 {remaining:.0f}min)，跳过"
                     )
@@ -1000,6 +1011,9 @@ class DeepSeekQuantBot:
             if direction == "LONG" and strategy == "pullback":
                 if is_bearish_trend:
                     if rsi > effective_oversold * 0.7:
+                        self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
+                            f"熊市禁LONG RSI={rsi:.1f}>{effective_oversold*0.7:.0f}",
+                            direction="LONG", strategy="pullback")
                         logger.debug(
                             f"⛔ {symbol} LONG-pullback 被拦截: 下跌趋势(EMA50<EMA200) "
                             f"且RSI={rsi:.1f}不够超卖(需<{effective_oversold:.0f})"
@@ -1012,6 +1026,9 @@ class DeepSeekQuantBot:
             elif direction == "SHORT" and strategy == "pullback":
                 if is_bullish_trend:
                     if rsi < effective_overbought * 1.2:
+                        self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
+                            f"牛市禁SHORT RSI={rsi:.1f}<{effective_overbought*1.2:.0f}",
+                            direction="SHORT", strategy="pullback")
                         logger.debug(
                             f"⛔ {symbol} SHORT-pullback 被拦截: 上涨趋势(EMA50>EMA200) "
                             f"且RSI={rsi:.1f}不够超买(需>{effective_overbought:.0f})"
@@ -1025,9 +1042,13 @@ class DeepSeekQuantBot:
             # v4.0: 大趋势方向偏向 — counter_trend 除外
             # v4.1 fix: counter_trend 已在上面通过趋势校验，此处放行
             if direction == "LONG" and block_long and strategy != "counter_trend":
+                self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
+                    "熊市禁LONG", direction="LONG", strategy=strategy)
                 logger.debug(f"{symbol} LONG信号在熊市被阻止(必被多TF过滤)")
                 return None
             if direction == "SHORT" and block_short and strategy != "counter_trend":
+                self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
+                    "牛市禁SHORT", direction="SHORT", strategy=strategy)
                 logger.debug(f"{symbol} SHORT信号在牛市被阻止(必被多TF过滤)")
                 return None
 
@@ -1781,9 +1802,13 @@ class DeepSeekQuantBot:
             # ── v4.0: Hurst 策略路由 —— 数量化决定趋势 vs 回归 ──
             sig_hurst = sig.get("_hurst", 0.5)
             if sig_hurst > 0.55 and strategy in ("bollinger", "grid"):
+                self.tlogger.log_filter_reject(symbol, "HURST",
+                    f"Hurst={sig_hurst:.3f}>0.55趋-跳过{strategy}", direction=direction, strategy=strategy)
                 logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 趋势市→跳过{strategy}回归策略")
                 continue
             elif sig_hurst < 0.45 and strategy in ("momentum", "ema_cross"):
+                self.tlogger.log_filter_reject(symbol, "HURST",
+                    f"Hurst={sig_hurst:.3f}<0.45回-跳过{strategy}", direction=direction, strategy=strategy)
                 logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 回归市→跳过{strategy}趋势策略")
                 continue
 
@@ -1797,6 +1822,9 @@ class DeepSeekQuantBot:
                         f"(市场: {market_regime})，放行"
                     )
                 else:
+                    self.tlogger.log_filter_reject(symbol, "STRATEGY_ROUTE",
+                        f"{strategy}不在推荐{recommended}(市场:{market_regime})",
+                        direction=direction, strategy=strategy)
                     logger.info(
                         f"🔄 {symbol} 策略路由: {strategy} 不在推荐列表 "
                         f"{recommended} (市场: {market_regime})，跳过"
@@ -1811,6 +1839,8 @@ class DeepSeekQuantBot:
                     and tf_context.get(tf, {}).get("regime", "unknown") != "ranging"
                 ]
                 if len(opposing_tfs) >= 1:
+                    self.tlogger.log_filter_reject(symbol, "TF_MISMATCH",
+                        f"多TF不一致:{alignment_reason}", direction=direction, strategy=strategy)
                     logger.warning(
                         f"⛔ {symbol} {direction} 信号与大趋势不一致，过滤 "
                         f"({alignment_reason})"
