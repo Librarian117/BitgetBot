@@ -179,6 +179,12 @@ class GeneticEvolver:
 
                 variant[param_name] = new_value
 
+            # v4.1 fix: 交叉校验 — adx_margin_min ≤ adx_margin_max
+            if variant.get("adx_margin_min", 0) > variant.get("adx_margin_max", 0):
+                avg = (variant["adx_margin_min"] + variant["adx_margin_max"]) / 2
+                variant["adx_margin_min"] = round(avg * 0.85, 4)
+                variant["adx_margin_max"] = round(avg * 1.15, 4)
+
             variants.append(variant)
 
         return variants

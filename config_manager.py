@@ -416,8 +416,16 @@ class ConfigManager:
             errors.append(f"MARGIN_RATIO={self.margin_ratio} 超出范围 [0.01, 0.5]")
         if not (0.01 <= self.daily_loss_limit <= 0.5):
             errors.append(f"DAILY_LOSS_LIMIT={self.daily_loss_limit} 超出范围 [0.01, 0.5]")
+        # v4.1 fix: 遗传进化可能产生 MIN > MAX, 自动修正而非崩溃
         if self.adx_margin_min > self.adx_margin_max:
-            errors.append(f"ADX_MARGIN_MIN({self.adx_margin_min}) > ADX_MARGIN_MAX({self.adx_margin_max})")
+            avg = (self.adx_margin_min + self.adx_margin_max) / 2
+            old_min, old_max = self.adx_margin_min, self.adx_margin_max
+            self.adx_margin_min = round(avg * 0.85, 4)
+            self.adx_margin_max = round(avg * 1.15, 4)
+            logging.warning(
+                f"⚠️  自动修正 ADX_MARGIN: MIN({old_min}) > MAX({old_max}) "
+                f"→ MIN={self.adx_margin_min:.4f} MAX={self.adx_margin_max:.4f}"
+            )
         if not (1 <= self.adx_threshold <= 60):
             errors.append(f"ADX_THRESHOLD={self.adx_threshold} 超出范围 [1, 60]")
 
