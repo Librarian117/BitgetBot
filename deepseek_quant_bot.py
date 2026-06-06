@@ -1549,6 +1549,7 @@ class DeepSeekQuantBot:
                         "bot_closed_pnl_total": round(self._bot_closed_pnl_total, 4),
                         "bot_closed_trade_count": self._bot_closed_trade_count,
                         "cumulative_fees": round(self.riskmon.cumulative_fees, 4),
+                        "drought_cycles": getattr(self, '_drought_cycles', 0),
                     },
                 }, f, ensure_ascii=False)
             os.replace(tmp, "positions_state.json")
@@ -2857,6 +2858,11 @@ class DeepSeekQuantBot:
                         f"📋 审计状态恢复: PnL累计={saved_pnl:+.2f} "
                         f"({saved_count}笔) 手续费={saved_fees:.2f}"
                     )
+                # v4.1: 恢复干旱计数器，避免重启后 ADX 阈值回弹
+                saved_drought = audit_state.get("drought_cycles", 0)
+                if saved_drought > 0:
+                    self._drought_cycles = saved_drought
+                    logger.info(f"🌵 干旱计数器恢复: {saved_drought} 轮")
             prev_positions = prev.get("positions", {})
             if not prev_positions:
                 return
