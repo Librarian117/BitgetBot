@@ -2428,7 +2428,7 @@ class DeepSeekQuantBot:
                                     logger.debug("⚠️  静默异常", exc_info=True)
                                 # 取消旧 SL/TP，重新挂载，保留现有 TP
                                 self.exchange.set_position_sl_tp(
-                                    sym_full, "buy" if side == "LONG" else "sell",
+                                    sym_full, side.lower(),
                                     new_sl, existing_tp
                                 )
                         except Exception:
@@ -2465,8 +2465,7 @@ class DeepSeekQuantBot:
                             lock_sl = round(entry - (entry - mark) * 0.1, 4) if mark < entry else round(mark * 0.995, 4)
                         if lock_tp > 0 and lock_sl > 0 and lock_tp != lock_sl:
                             logger.info(f"🔒 {pos_d['symbol']} 盈利锁仓: ROI={roi*100:.0f}% → TP={lock_tp} SL={lock_sl}")
-                            close_side = "buy" if side == "SHORT" else "sell"
-                            self.exchange.set_position_sl_tp(sym_full, close_side, lock_sl, lock_tp)
+                            self.exchange.set_position_sl_tp(sym_full, side.lower(), lock_sl, lock_tp)
                     except Exception as e:
                         logger.debug(f"🔒 锁仓 {pos_d['symbol']} 失败: {e}")
 
@@ -2621,7 +2620,7 @@ class DeepSeekQuantBot:
                             tp_price = (entry + atr_val * 2.0 if side == "LONG"
                                         else entry - atr_val * 2.0)
                             self.exchange.set_position_sl_tp(
-                                sym_full, "buy" if side == "LONG" else "sell",
+                                sym_full, side.lower(),
                                 tight_sl, tp_price)
                             self.tlogger.log_risk(
                                 "VOL_SPIKE", f"{sym} ATR {spike_ratio:.1f}x → SL收紧")
@@ -2703,7 +2702,7 @@ class DeepSeekQuantBot:
                         if not has_tp:
                             missing.append("TP")
                         logger.warning(f"🛡️  {p['symbol']} 缺少{'/'.join(missing)}，补挂 SL={sl_p:.4f} TP={tp_p:.4f}")
-                        self.exchange.set_position_sl_tp(sym_full, close_side, round(sl_p,4), round(tp_p,4))
+                        self.exchange.set_position_sl_tp(sym_full, side.lower(), round(sl_p,4), round(tp_p,4))
                 if bare == 0 and acct.get("positions_detail"):
                     logger.debug("🛡️  SL健康检查: 全部持仓已保护")
             except Exception as e:
@@ -2920,7 +2919,7 @@ class DeepSeekQuantBot:
                     continue
                 # 判断方向 (优先 ccxt 标准化字段, info.holdSide 为回退)
                 pos_side_raw = pos.get("side") or pos.get("info", {}).get("holdSide", "")
-                side = "buy" if str(pos_side_raw).lower() in ("long", "buy") else "sell"
+                side = "long" if str(pos_side_raw).lower() in ("long", "buy") else "short"
                 # v4.0 fix: 用新的 _has_position_tpsl 检测 (查计划单 + pos-tpsl API)
                 side_str = "LONG" if str(pos_side_raw).lower() in ("long", "buy") else "SHORT"
                 has_sl, has_tp = self.exchange._has_position_tpsl(sym, entry, side_str)
@@ -2949,8 +2948,8 @@ class DeepSeekQuantBot:
                     atr = float(df["atr"].iloc[-1]) if "atr" in df.columns and not pd.isna(df["atr"].iloc[-1]) else entry * 0.01
                 except Exception:
                     atr = entry * 0.01
-                sl_price = entry + 1.5 * atr if side == "sell" else entry - 1.5 * atr
-                tp_price = entry - 2.0 * atr if side == "sell" else entry + 2.0 * atr
+                sl_price = entry + 1.5 * atr if side == "short" else entry - 1.5 * atr
+                tp_price = entry - 2.0 * atr if side == "short" else entry + 2.0 * atr
                 sl_price = round(sl_price, 4)
                 tp_price = round(tp_price, 4)
                 if sl_price <= 0 or tp_price <= 0:

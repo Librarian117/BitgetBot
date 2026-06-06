@@ -573,14 +573,16 @@ class ExchangeInterface:
         彻底解决重复计划单累积问题。
         """
         try:
-            # 兼容 "buy"/"sell" 和 "LONG"/"SHORT" 两种传参
-            side_upper = side.upper() if isinstance(side, str) else ""
-            if side_upper in ("BUY", "LONG"):
-                hold_side = "long"
-            elif side_upper in ("SELL", "SHORT"):
+            # side 统一为持仓方向: "long"/"short"
+            side_lower = side.lower() if isinstance(side, str) else ""
+            if side_lower in ("long", "short"):
+                hold_side = side_lower
+            elif side_lower in ("buy",):      # 兼容旧调用: buy=平空仓=hold short
                 hold_side = "short"
+            elif side_lower in ("sell",):     # 兼容旧调用: sell=平多仓=hold long
+                hold_side = "long"
             else:
-                hold_side = "long" if side.lower() == "buy" else "short"
+                hold_side = "long"  # fallback
 
             # 获取价格精度 (使用 ccxt 的价格格式化)
             try:
