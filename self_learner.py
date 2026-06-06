@@ -191,27 +191,6 @@ class StrategyTracker:
             }
         return attribution
 
-    def get_best_strategy(self) -> Optional[str]:
-        """返回当前最优策略名"""
-        best, best_pnl = None, float("-inf")
-        for name, s in self.strategies.items():
-            if s["total_pnl"] > best_pnl and (s["wins"] + s["losses"]) >= 2:
-                best, best_pnl = name, s["total_pnl"]
-        return best
-
-    def get_win_rate(self, strategy: str = None) -> float:
-        """获取胜率 (可指定策略，不指定则全局)"""
-        if strategy:
-            s = self.strategies.get(strategy)
-            if not s:
-                return 0.0
-            total = s["wins"] + s["losses"]
-            return s["wins"] / total * 100 if total > 0 else 0.0
-        total_w = sum(s["wins"] for s in self.strategies.values())
-        total_l = sum(s["losses"] for s in self.strategies.values())
-        total = total_w + total_l
-        return total_w / total * 100 if total > 0 else 0.0
-
     def get_regime_strategy_weight(self, market_regime: str, strategy: str,
                                    direction: str) -> float:
         """
@@ -233,38 +212,6 @@ class StrategyTracker:
         if win_rate < 0.4:
             return 0.6
         return 1.0
-
-    def get_regime_summary(self, market_regime: str) -> Dict:
-        """
-        返回给定市场环境下所有策略+方向组合的绩效统计。
-
-        Returns:
-            {"combos": {...}, "regime": "...", "total_trades": N, "total_pnl": float}
-        """
-        combos = {}
-        total_trades = 0
-        total_pnl = 0.0
-        prefix = f"{market_regime}_"
-        for key, r in self.regime_performance.items():
-            if key.startswith(prefix):
-                combo_key = key[len(prefix):]  # "strategy_direction"
-                t = r["wins"] + r["losses"]
-                wr = round(r["wins"] / t * 100, 1) if t > 0 else 0.0
-                combos[combo_key] = {
-                    "wins": r["wins"], "losses": r["losses"],
-                    "total_pnl": round(r["total_pnl"], 2),
-                    "avg_win": round(r["avg_win"], 2),
-                    "avg_loss": round(r["avg_loss"], 2),
-                    "win_rate": wr,
-                }
-                total_trades += t
-                total_pnl += r["total_pnl"]
-        return {
-            "regime": market_regime,
-            "total_trades": total_trades,
-            "total_pnl": round(total_pnl, 2),
-            "combos": combos,
-        }
 
     def get_summary(self) -> Dict:
         """返回策略绩效摘要"""
@@ -455,7 +402,7 @@ class WisdomStore:
             for part in k.lower().split("_"):
                 tokens.add(part)
                 if ":" in part:
-                    prefix, val = part.split(":", 1)
+                    prefix, _ = part.split(":", 1)
                     tokens.add(prefix)  # 只匹配前缀也算部分相关
             return tokens
         t1 = extract_tokens(key1)
@@ -574,7 +521,6 @@ class SelfLearner:
 
     WISDOM_FILE = "trading_wisdom.json"
     TRACKER_FILE = "strategy_performance.json"
-    MAX_WISDOM_ENTRIES = 30
     REVIEW_INTERVAL_HOURS = 4  # 每 4 小时做一次宏观回顾
     EMERGENCY_REVIEW_LOSSES = 2  # v3.7: 连续亏损 N 笔 → 紧急回顾
     EMERGENCY_COOLDOWN_MINUTES = 30  # v3.7: 紧急回顾冷却时间
@@ -855,8 +801,9 @@ class SelfLearner:
             return None
 
         insights = []
+        if session_label:
+            insights.append(f"⏰ {session_label}")
         longs = [p for p in positions if p.get("side") == "LONG"]
-        [p for p in positions if p.get("side") == "SHORT"]
 
         # 1. 方向比例检查
         total = len(positions)
@@ -908,6 +855,9 @@ class SelfLearner:
         三路并行调用 DeepSeek，使用 ThreadPoolExecutor 并发，
         任一 Agent 失败不影响其他。
         """
+        # v4.1: 配置守卫
+        if not getattr(self.config, 'deepseek_reflection_enabled', True):
+            return []
         if not self.config.deepseek_api_key:
             return []
 
@@ -1085,6 +1035,9 @@ class SelfLearner:
           increase_sl=true      收紧止损
           tighten_tp=true       收紧止盈
         """
+        # v4.1: 配置守卫
+        if not getattr(self.config, 'deepseek_rule_generation_enabled', True):
+            return ""
         if not trade_data or not self.config.deepseek_api_key:
             return ""
 
@@ -1242,6 +1195,7 @@ class SelfLearner:
 - 入场: {entry_price:.4f}  出场: {exit_price:.4f}
 - 盈亏: {pnl:+.4f} USDT ({pnl_pct:+.2f}%)  持仓: {holding_hours:.1f}小时
 - AI审核: {ai_decision}
+- 平仓原因: {reason or '未知'}
 
 {perf_ctx}
 
@@ -1313,6 +1267,9 @@ class SelfLearner:
         周期性宏观回顾。
         v2.0: 附带策略追踪数据，让 DeepSeek 做精准诊断。
         """
+        # v4.1: 配置守卫
+        if not getattr(self.config, 'deepseek_periodic_review_enabled', True):
+            return None
         if not trades_data or not self.config.deepseek_api_key:
             return None
 
@@ -1525,6 +1482,9 @@ class SelfLearner:
             return diagnosis
 
         # ── AI 深度诊断 (仅在中等程度干旱时调用) ──
+        # v4.1: 配置守卫
+        if not getattr(self.config, 'deepseek_filter_analysis_enabled', True):
+            return None
         if not self.config.deepseek_api_key:
             return None
 
@@ -1634,16 +1594,6 @@ class SelfLearner:
         strategy = self.get_strategy_context()
         parts = [p for p in [wisdom, strategy] if p]
         return "\n".join(parts)
-
-    def get_top_actions(self, n: int = 3) -> List[str]:
-        """返回最 actionable 的建议"""
-        actions = []
-        for w in reversed(self._wisdom_store.entries):
-            if w.get("action") and w.get("action") not in actions:
-                actions.append(w["action"])
-            if len(actions) >= n:
-                break
-        return actions
 
     # ════════════════════════════════════════════
     # 智慧管理 (v2.0: 增强去重)
@@ -1863,55 +1813,6 @@ class SelfLearner:
             logger.info(f"🧠 [自适应] {msg}")
             return msg
         return None
-
-    # ════════════════════════════════════════════
-    # v3.6: ② 退出质量分析 (反事实回测)
-    # ════════════════════════════════════════════
-
-    def analyze_exit_quality(self, trade: dict) -> dict:
-        """
-        对一笔已完成的交易做反事实分析。
-        返回: {tp_optimal: float, sl_optimal: float, gain_if_better_tp: float, ...}
-        """
-        entry = trade.get("entry_price", 0)
-        exit_p = trade.get("exit_price", 0)
-        direction = trade.get("direction", "SHORT")
-        pnl = trade.get("pnl", 0)
-
-        if entry <= 0 or exit_p <= 0:
-            return {}
-
-        move_pct = abs(exit_p - entry) / entry
-        is_win = pnl > 0
-
-        result = {
-            "is_win": is_win,
-            "move_pct": round(move_pct * 100, 2),
-            "direction": direction,
-        }
-
-        # 盈利交易: 是否止盈太早？
-        if is_win:
-            # 估算: 如果方向对，move 越大说明可能可以拿更多
-            # SHORT 盈利 = entry > exit，move = (entry-exit)/entry
-            profit_move = (entry - exit_p) / entry if direction == "SHORT" else (exit_p - entry) / entry
-            result["profit_move_pct"] = round(profit_move * 100, 2)
-            result["assessment"] = (
-                "止盈偏早" if profit_move < 0.02 else
-                "止盈适中" if profit_move < 0.05 else
-                "止盈良好"
-            )
-        else:
-            # 亏损交易: SL 是否太宽？
-            loss_move = (exit_p - entry) / entry if direction == "SHORT" else (entry - exit_p) / entry
-            result["loss_move_pct"] = round(loss_move * 100, 2)
-            result["assessment"] = (
-                "止损过宽" if loss_move > 0.05 else
-                "止损偏宽" if loss_move > 0.03 else
-                "止损合理"
-            )
-
-        return result
 
     def periodic_exit_optimization(self):
         """

@@ -25,8 +25,6 @@ from zoneinfo import ZoneInfo
 # ── 项目统一时区 ──
 TZ = ZoneInfo("Asia/Shanghai")
 TZ_NAME = "Asia/Shanghai"
-UTC_OFFSET = "+08:00"
-
 # ═══════════════════════════════════════════════
 # 核心函数 (推荐使用)
 # ═══════════════════════════════════════════════
@@ -85,11 +83,6 @@ def datetime_from_iso(iso_string: str) -> datetime:
     else:
         dt = dt.astimezone(TZ)
     return dt
-
-
-def ts_to_datetime(timestamp: float) -> datetime:
-    """将 epoch 时间戳转为 Asia/Shanghai aware datetime。"""
-    return datetime.fromtimestamp(timestamp, tz=TZ)
 
 
 # ═══════════════════════════════════════════════

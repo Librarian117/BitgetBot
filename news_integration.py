@@ -121,10 +121,6 @@ class CryptoPanicClient:
 
         return "\n".join(lines) if lines else ""
 
-    def get_fear_greed(self) -> Optional[Dict]:
-        """获取 Fear & Greed 指数 (带缓存)"""
-        return self._fetch_fng()
-
     # ════════════════════════════════════════════
     # v3.7: 情绪量化输出
     # ════════════════════════════════════════════
@@ -203,18 +199,18 @@ class CryptoPanicClient:
         score = fng_val * 0.60 + news_score * 0.25 + price_score * 0.15
         result["score"] = round(min(100, max(0, score)))
 
-        # ── 4. 信号判定 ──
+        # ── 4. 信号判定 (v4.1: 去掉反转逻辑, 改为趋势感知描述) ──
         s = result["score"]
         if s <= 15:
             result["signal"] = "extreme_fear"
-            result["market_action"] = "contrarian_buy"
+            result["market_action"] = "panic_selling"
             result["confidence"] = 85
-            result["detail"] = f"极度恐惧(F&G={fng_val})-反向买入信号"
+            result["detail"] = f"极度恐惧(F&G={fng_val})-恐慌抛售中"
         elif s <= 35:
             result["signal"] = "fear"
-            result["market_action"] = "contrarian_buy"
+            result["market_action"] = "fear_trend"
             result["confidence"] = 65
-            result["detail"] = f"恐惧(F&G={fng_val})-逢低布局"
+            result["detail"] = f"恐惧(F&G={fng_val})-市场偏空"
         elif s <= 65:
             result["signal"] = "neutral"
             result["market_action"] = "neutral"
@@ -222,14 +218,14 @@ class CryptoPanicClient:
             result["detail"] = f"情绪中性(F&G={fng_val})-正常交易"
         elif s <= 85:
             result["signal"] = "greed"
-            result["market_action"] = "reduce_risk"
+            result["market_action"] = "greed_trend"
             result["confidence"] = 65
-            result["detail"] = f"贪婪(F&G={fng_val})-注意风控"
+            result["detail"] = f"贪婪(F&G={fng_val})-市场偏多"
         else:
             result["signal"] = "extreme_greed"
-            result["market_action"] = "reduce_risk"
+            result["market_action"] = "fomo_buying"
             result["confidence"] = 85
-            result["detail"] = f"极度贪婪(F&G={fng_val})-减仓信号"
+            result["detail"] = f"极度贪婪(F&G={fng_val})-FOMO追涨中"
 
         # ── 5. 追踪情绪趋势 (v3.7) ──
         if not hasattr(self, '_sentiment_history'):

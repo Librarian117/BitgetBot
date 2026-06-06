@@ -35,7 +35,6 @@ class HealthMonitor:
     STALE_HOURS_WARN = 24           # 持仓过久警告
     SIGNAL_DRY_HOURS_WARN = 12      # 长时间无信号警告
     MARGIN_RATIO_WARN = 0.8         # 保证金超 80% 余额告警
-    BALANCE_MIN_RATIO = 0.15        # 可用余额低于 15% 告警
 
     def __init__(self, config, exchange, analyst, riskmon, tlogger):
         self.config = config

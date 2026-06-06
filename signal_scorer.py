@@ -31,15 +31,17 @@ class SignalScorer:
     """统一加权评分引擎"""
 
     # 权重配置 (可调, sum MUST = 1.0)
+    # v4.1: 新增 quant 维度 (Kalman+Hurst+VolCone)
     WEIGHTS = {
-        "technical":    0.28,   # 技术面 (MACD/RSI/布林/趋势)
-        "regime":       0.14,   # 市场状态 (趋势强度+波动率)
-        "sentiment":    0.14,   # 情绪量化 (F&G+新闻)
+        "technical":    0.25,   # 技术面 (MACD/RSI/布林/趋势)
+        "regime":       0.11,   # 市场状态 (趋势强度+波动率)
+        "sentiment":    0.11,   # 情绪量化 (F&G+新闻)
         "oi_flow":      0.10,   # 订单流 (OI背离)
         "markov":       0.10,   # 马可夫状态
         "strategy":     0.09,   # 策略权重 (历史表现)
         "direction":    0.09,   # 方向开关 (历史胜率)
         "portfolio":    0.06,   # v2.0: 组合排名
+        "quant":        0.09,   # v4.1: 量化特征 (Kalman+Hurst+VolCone)
     }
 
     # 决策阈值
@@ -92,8 +94,8 @@ class SignalScorer:
         }
         total += regime_score * self.WEIGHTS["regime"]
 
-        # ── 3. 情绪量化 (14%) ──
-        sent_score = self._score_sentiment(sentiment, direction)
+        # ── 3. 情绪量化 (14%) — v4.1: 趋势感知 ──
+        sent_score = self._score_sentiment(sentiment, direction, regime_info)
         breakdown["sentiment"] = {
             "score": sent_score,
             "detail": sentiment.get("detail", "") if sentiment else "无数据",
@@ -140,6 +142,14 @@ class SignalScorer:
             "detail": f"排名#{portfolio_rank}/{portfolio_total}",
         }
         total += port_score * self.WEIGHTS["portfolio"]
+
+        # ── 9. 量化特征 (9%) v4.1: Kalman + Hurst + VolCone ──
+        quant_score = self._score_quant(sig)
+        breakdown["quant"] = {
+            "score": quant_score,
+            "detail": f"Kalman={sig.get('_kalman_dir','?')} Hurst={sig.get('_hurst_regime','?')}",
+        }
+        total += quant_score * self.WEIGHTS["quant"]
 
         # ── 最终分数 ──
         final_score = int(round(total))
@@ -192,23 +202,64 @@ class SignalScorer:
         return max(20, regime_conf - 25)  # 不推荐 → 扣分
 
     @staticmethod
-    def _score_sentiment(sentiment: Optional[Dict], direction: str) -> int:
-        """情绪量化: F&G 极端值的影响"""
+    def _score_sentiment(sentiment: Optional[Dict], direction: str,
+                         regime_info: Optional[Dict] = None) -> int:
+        """v4.1: 趋势感知情绪评分 — 情绪跟随趋势，而非对抗。
+
+        核心逻辑:
+          - Fear + 熊市 → 恐慌抛售加速趋势 → 奖励做空
+          - Greed + 牛市 → FOMO追涨加速趋势 → 奖励做多
+          - 情绪与趋势背离 → 潜在反转风险 → 中性扣分（不奖励任何方向）
+          - 中性 → 50 基线，不影响
+
+        之前 v3.7 问题: Fear → "contrarian_buy" → 惩罚做空，在熊市中帮倒忙。
+        """
         if not sentiment:
             return 50
-        action = sentiment.get("market_action", "neutral")
-        conf = sentiment.get("confidence", 50)
-        if action == "contrarian_buy":
-            return 80 if direction == "LONG" else 30  # 偏多
-        if action == "reduce_risk":
-            return 30 if direction == "LONG" else 80  # 偏空
-        # 情绪趋势影响
-        score_val = sentiment.get("score", 50)
-        if score_val < 35:  # 恐惧 → 偏多
-            return 70 if direction == "LONG" else 35
-        if score_val > 65:  # 贪婪 → 偏空
-            return 35 if direction == "LONG" else 70
-        return conf
+
+        fng_val = sentiment.get("fng_value", 50)
+        regime = regime_info.get("regime", "unknown") if regime_info else "unknown"
+        is_bearish = regime in ("bear", "strong_bear", "panic")
+        is_bullish = regime in ("bull", "strong_bull")
+
+        # ── 极度恐惧 (<25) ──
+        if fng_val < 25:
+            if is_bearish:
+                return 80 if direction == "SHORT" else 25
+            elif is_bullish:
+                return 40
+            else:
+                return 55 if direction == "LONG" else 45
+
+        # ── 恐惧 (25-35) ──
+        if fng_val < 35:
+            if is_bearish:
+                return 70 if direction == "SHORT" else 35
+            elif is_bullish:
+                return 43
+            else:
+                return 53 if direction == "LONG" else 47
+
+        # ── 极度贪婪 (>75) — 必须在 >65 之前检查 ──
+        if fng_val > 75:
+            if is_bullish:
+                return 80 if direction == "LONG" else 25
+            elif is_bearish:
+                return 40
+            else:
+                return 55 if direction == "SHORT" else 45
+
+        # ── 贪婪 (65-75) ──
+        if fng_val > 65:
+            if is_bullish:
+                return 70 if direction == "LONG" else 35
+            elif is_bearish:
+                return 43
+            else:
+                return 53 if direction == "SHORT" else 47
+
+        # ── 中性 (35-65): 不影响方向 ──
+        return 50
 
     @staticmethod
     def _score_oi_flow(flow: Optional[Dict], direction: str) -> int:
@@ -309,3 +360,43 @@ class SignalScorer:
             return 30
         else:
             return 15
+
+    @staticmethod
+    def _score_quant(sig: Dict[str, Any]) -> int:
+        """v4.1: 量化特征评分 — Kalman + Hurst + VolCone"""
+        score = 50
+        direction = sig.get("direction", "LONG")
+        strategy = sig.get("strategy", "pullback")
+
+        # Kalman 方向确认 (±25)
+        kalman_dir = sig.get("_kalman_dir", "flat")
+        kalman_score = sig.get("_kalman_score", 0)
+        if kalman_dir != "flat":
+            aligned = (direction == "LONG" and kalman_dir == "up") or \
+                      (direction == "SHORT" and kalman_dir == "down")
+            if aligned:
+                score += min(25, int(abs(kalman_score) * 30))
+            elif abs(kalman_score) > 0.3:
+                score -= 25
+            else:
+                score -= 10
+
+        # Hurst 策略匹配 (±15)
+        hurst_regime = sig.get("_hurst_regime", "random_walk")
+        trend_strategies = ("pullback", "momentum", "ema_cross")
+        mean_rev_strategies = ("bollinger", "counter_trend")
+        if strategy in trend_strategies and hurst_regime == "trending":
+            score += 15
+        elif strategy in mean_rev_strategies and hurst_regime == "mean_reverting":
+            score += 15
+        elif strategy in trend_strategies and hurst_regime == "mean_reverting":
+            score -= 10
+
+        # 波动率锥 (±10)
+        vol_percentile = sig.get("_vol_cone_percentile", 50)
+        if vol_percentile > 85:
+            score -= 10
+        elif vol_percentile < 15:
+            score += 5
+
+        return max(0, min(100, score))

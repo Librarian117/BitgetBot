@@ -149,7 +149,6 @@ def print_dashboard(ex):
         print("  " + _hline(COLS, "─┼─"))
 
         # Rows
-        detail_lines = []
         for p in sorted(pos_list, key=lambda x: x["upl"]):
             if not p["has_sl"] and not p["has_tp"]:
                 protect = "🔴裸仓"

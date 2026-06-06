@@ -296,9 +296,19 @@ class GeneticEvolver:
             std_pnl = 1e-9
         sharpe = mean_pnl / std_pnl if std_pnl != 0 else 0.0
 
+        # v4.1: 估计 Sortino = 均值 / 下行标准差（仅惩罚下行波动）
+        downside = [p for p in hypothetical_pnls if p < 0]
+        if len(downside) >= 2:
+            d_variance = sum((p - mean_pnl) ** 2 for p in downside) / (len(downside) - 1)
+            d_std = math.sqrt(d_variance) if d_variance > 0 else 1e-9
+            sortino = mean_pnl / d_std if d_std != 0 else 0.0
+        else:
+            sortino = sharpe  # 无下行时回退到 Sharpe
+
         return {
             "variant": dict(variant),
             "estimated_sharpe": round(sharpe, 3),
+            "estimated_sortino": round(sortino, 3),
             "estimated_total_pnl": round(total_pnl, 2),
             "win_rate": round(win_rate, 1),
         }
@@ -309,12 +319,12 @@ class GeneticEvolver:
 
     def evolve(self, trades_data: List[Dict]) -> Optional[Dict]:
         """
-        执行完整进化周期:
+        v4.1: 纯量化进化周期 (不依赖 AI 决策):
           1. 快照当前 config 参数
           2. 生成 5 个参数变体
-          3. 用历史交易评估每个变体
-          4. DeepSeek AI 排名选择最优
-          5. 回退: DeepSeek 失败则用估计 Sharpe 最高者
+          3. 用历史交易评估每个变体 (Sharpe + Sortino + PnL)
+          4. 综合评分选择最优 (50% Sharpe + 30% Sortino + 20% PnL)
+          5. 可选: DeepSeek 提供参数意见参考 (不驱动决策)
 
         Args:
             trades_data: 历史交易列表（来自 JSONL 日志 或 StrategyTracker.recent_trades）
@@ -326,10 +336,6 @@ class GeneticEvolver:
         # ── 前置检查 ──
         if not trades_data or len(trades_data) < 10:
             logger.info(f"🧬 遗传进化跳过: 交易数据不足 ({len(trades_data) if trades_data else 0}/10 笔)")
-            return None
-
-        if not self.deepseek_api_key:
-            logger.warning("🧬 遗传进化跳过: 未配置 DeepSeek API Key")
             return None
 
         # ── 第0步: 计算基线 (进化前快照) ──
@@ -356,20 +362,13 @@ class GeneticEvolver:
                 f"PnL={ev['estimated_total_pnl']:+.2f} 胜率={ev['win_rate']:.0f}%"
             )
 
-        # ── 第4步: DeepSeek AI 排名 ──
-        best = self._ask_deepseek_rank(evaluations, base_params)
-        if best is None:
-            # 回退: 选估计 Sharpe 最高的变体
-            best_eval = max(evaluations, key=lambda e: e["estimated_sharpe"])
-            logger.warning("🧬 DeepSeek 排名失败，回退选择 Sharpe 最高变体")
-            best = {
-                "best_variant": best_eval["variant"],
-                "reasoning": (
-                    f"回退选择: 估计 Sharpe={best_eval['estimated_sharpe']:.3f}, "
-                    f"PnL={best_eval['estimated_total_pnl']:+.2f}, "
-                    f"胜率={best_eval['win_rate']:.0f}%"
-                ),
-            }
+        # ── 第4步: v4.1 纯量化选择（不再依赖 DeepSeek AI 决策） ──
+        best = self._select_best_quantitative(evaluations)
+        # v4.1: 可选 — 记录 AI 参数意见（不驱动决策）
+        if getattr(self.config, 'deepseek_genetic_opinion_enabled', True):
+            ai_opinion = self._ask_deepseek_rank(evaluations, base_params)
+            if ai_opinion and ai_opinion.get("reasoning"):
+                best["reasoning"] += f" | AI意见: {ai_opinion['reasoning'][:80]}"
 
         # ── 第5步: 记录进化历史 ──
         self._history.append({
@@ -543,16 +542,79 @@ class GeneticEvolver:
         }
 
     # ════════════════════════════════════════════
-    # DeepSeek AI 排名
+    # v4.1: 纯量化变体选择
+    # ════════════════════════════════════════════
+
+    @staticmethod
+    def _select_best_quantitative(evaluations: List[Dict]) -> Dict:
+        """
+        v4.1: 纯量化综合评分选择最优变体。
+        权重: Sharpe 50%, Sortino 30%, PnL 20%
+
+        Args:
+            evaluations: evaluate_variant() 返回的列表
+
+        Returns:
+            {"best_variant": {...}, "reasoning": "..."}
+        """
+        if not evaluations:
+            return {"best_variant": {}, "reasoning": "无变体可评估"}
+
+        # 提取各指标
+        sharpes = [e["estimated_sharpe"] for e in evaluations]
+        sortinos = [e.get("estimated_sortino", e["estimated_sharpe"]) for e in evaluations]
+        pnls = [e["estimated_total_pnl"] for e in evaluations]
+
+        # Min-Max 归一化到 [0, 1]（处理全零情况）
+        def _normalize(values):
+            vmin, vmax = min(values), max(values)
+            if vmax == vmin:
+                return [0.5] * len(values)
+            return [(v - vmin) / (vmax - vmin) for v in values]
+
+        n_sharpes = _normalize(sharpes)
+        n_sortinos = _normalize(sortinos)
+        n_pnls = _normalize(pnls)
+
+        # 综合评分
+        best_idx = 0
+        best_score = -999
+        for i in range(len(evaluations)):
+            score = 0.5 * n_sharpes[i] + 0.3 * n_sortinos[i] + 0.2 * n_pnls[i]
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        best_eval = evaluations[best_idx]
+        logger.info(
+            f"🧬 量化选择: 变体{best_idx+1} (综合={best_score:.3f} "
+            f"Sharpe={best_eval['estimated_sharpe']:.3f} "
+            f"Sortino={best_eval.get('estimated_sortino', 0):.3f} "
+            f"PnL={best_eval['estimated_total_pnl']:+.2f})"
+        )
+        return {
+            "best_variant": best_eval["variant"],
+            "reasoning": (
+                f"量化综合评分={best_score:.3f}: "
+                f"Sharpe={best_eval['estimated_sharpe']:.3f}, "
+                f"Sortino={best_eval.get('estimated_sortino', best_eval['estimated_sharpe']):.3f}, "
+                f"PnL={best_eval['estimated_total_pnl']:+.2f}, "
+                f"胜率={best_eval['win_rate']:.0f}%"
+            ),
+        }
+
+    # ════════════════════════════════════════════
+    # v4.1 deprecated: DeepSeek AI 排名（已降级为可选研究意见）
     # ════════════════════════════════════════════
 
     def _ask_deepseek_rank(self, evaluations: List[Dict],
                            base_params: Dict) -> Optional[Dict]:
         """
-        将 5 个变体的评估结果发送给 DeepSeek，由 AI 综合评判选出最优。
+        ⚠️ DEPRECATED v4.1: AI 不再选择实盘参数。
+        此方法仅作为可选研究意见保留（受 deepseek_genetic_opinion_enabled 控制）。
+        参数选择已改为纯量化 _select_best_quantitative()。
 
-        发送内容: 基准参数 + 5 组变体参数 + 各自的 Sharpe/PnL/胜率
-        期望返回: JSON {"best_variant": {...}, "reasoning": "选择理由"}
+        将 5 个变体的评估结果发送给 DeepSeek，由 AI 综合评判给出意见。
 
         Returns:
             解析成功的 dict 或 None（网络错误、JSON解析失败等）
@@ -750,16 +812,6 @@ class GeneticEvolver:
         return {}
 
     # ════════════════════════════════════════════
-    # 进化历史查询
-    # ════════════════════════════════════════════
-
-    def get_history(self) -> List[Dict]:
-        """返回最近 N 轮进化记录。"""
-        return list(self._history)
-
-    def get_last_evolution(self) -> Optional[Dict]:
-        """返回最近一轮进化结果。"""
-        return self._history[-1] if self._history else None
 
     # ════════════════════════════════════════════
     # 资源管理

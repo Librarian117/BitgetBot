@@ -216,36 +216,9 @@ class FlowMonitor:
 
         return 1.0
 
-    def get_oi_exit_context(self, symbol: str) -> str:
-        """v2.0: OI 数据注入退出审核 prompt"""
-        hist = self._oi_history.get(symbol, [])
-        if len(hist) < self._min_trend_points:
-            return ""
-
-        sig = self.get_flow_signal(symbol, hist[-1][2] if hist else 0)
-        if sig["signal"] == "neutral":
-            return ""
-
-        lines = [f"OI订单流 ({symbol.split('/')[0]}): {sig['detail']}"]
-        lines.append(f"  OI趋势={sig['oi_trend']} 变化={sig['oi_change_pct']:.1f}%")
-        if sig["divergence"]:
-            lines.append("  ⚠️ OI-价格背离 → 趋势可能衰竭")
-        if sig["extreme"]:
-            lines.append("  🚨 极端背离 → 强烈建议减仓/平仓")
-        return "\n".join(lines)
-
     # ════════════════════════════════════════════
     # 批量 & 摘要
     # ════════════════════════════════════════════
-
-    def fetch_all(self, symbols: List[str], prices: Dict[str, float] = None) -> Dict[str, Dict]:
-        prices = prices or {}
-        results = {}
-        for sym in symbols:
-            price = prices.get(sym, 0)
-            self.fetch_oi(sym, price)
-            results[sym] = self.get_flow_signal(sym, price)
-        return results
 
     def get_summary(self, symbols: List[str]) -> str:
         """v2.0: OI 摘要 (正确标签为"订单流"而非"新闻")"""

@@ -204,9 +204,12 @@ class ExchangeInterface:
                 return cached
 
         positions: Dict[str, Any] = {}
+        api_ok = False  # v4.1: 标记 API 是否成功
+
         # ── v2.7: 优先批量查询所有币种 (1 次 API)，失败则逐币种降级 ──
         try:
             all_positions = self.exchange.fetch_positions(self.config.SYMBOLS)
+            api_ok = True
             if all_positions:
                 for p in all_positions:
                     sym = p.get("symbol", "")
@@ -217,14 +220,17 @@ class ExchangeInterface:
             for sym in self.config.SYMBOLS:
                 try:
                     pos = self.exchange.fetch_position(sym)
+                    api_ok = True
                     if pos and float(pos.get("contracts", 0) or 0) != 0:
                         positions[sym] = pos
                 except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)  # 沙箱环境可能不支持
+                    logger.debug("⚠️  静默异常", exc_info=True)
 
         if positions:
             logger.info(f"📊 当前持仓: {list(positions.keys())}")
-        self._cache_set(cache_key, positions)
+        # v4.1 fix: 仅 API 成功时缓存 (防止空结果污染30秒缓存)
+        if api_ok:
+            self._cache_set(cache_key, positions)
         return positions
 
     def count_open_positions(self) -> int:
@@ -502,21 +508,6 @@ class ExchangeInterface:
                 logger.debug("⚠️  静默异常", exc_info=True)
 
         return (has_sl, has_tp)
-
-    def cancel_all_orders(self, symbol: str) -> int:
-        """取消某币种所有挂单，返回取消数量"""
-        try:
-            orders = self.exchange.fetch_open_orders(symbol)
-            count = 0
-            for o in orders:
-                try:
-                    self.exchange.cancel_order(o.get("id", ""), symbol)
-                    count += 1
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
-            return count
-        except Exception:
-            return 0
 
     def create_limit_order(
         self, symbol: str, side: str, amount: float, price: float,

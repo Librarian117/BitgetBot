@@ -181,14 +181,6 @@ class PortfolioManager:
         base = symbol.replace("/USDT:USDT", "")
         return self.correlations.get(base, {}).get("BTC", 0.7)
 
-    def get_pair_correlation(self, sym1: str, sym2: str) -> float:
-        """v2.0: 返回两个币种之间的相关性"""
-        b1 = sym1.replace("/USDT:USDT", "")
-        b2 = sym2.replace("/USDT:USDT", "")
-        if b1 == b2:
-            return 1.0
-        return self.cross_correlations.get((b1, b2), 0.5)
-
     # ════════════════════════════════════════════
     # 信号排名 (v2.0: 方向感知动量)
     # ════════════════════════════════════════════

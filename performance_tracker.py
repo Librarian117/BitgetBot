@@ -187,62 +187,6 @@ class PerformanceTracker:
         return self.get_metrics(subset)
 
     # ════════════════════════════════════════════
-    # 输出
-    # ════════════════════════════════════════════
-
-    def get_full_report(self) -> Dict[str, Any]:
-        """完整报告 (JSON 友好)"""
-        return {
-            "updated_at": now_iso(),
-            "overall": self.get_metrics(),
-            "rolling_20": self.get_rolling_metrics(20),
-            "today": self.get_today_metrics(),
-            "by_strategy": self.get_strategy_metrics(),
-            "by_direction": self.get_direction_metrics(),
-            "by_symbol": self.get_symbol_metrics(),
-        }
-
-    def get_summary_text(self) -> str:
-        """一行绩效摘要"""
-        m = self.get_metrics()
-        r = self.get_rolling_metrics(20)
-        if m["total_trades"] == 0:
-            return "No trades yet"
-        parts = [
-            f"{m['total_trades']}trades",
-            f"WR={m['win_rate']:.0f}%",
-            f"PF={m['profit_factor']:.2f}",
-            f"Sharpe={m['sharpe_ratio']:.2f}",
-            f"PnL={m['total_pnl']:+.1f}",
-        ]
-        if r["total_trades"] > 0:
-            parts.append(f"[20]WR={r['win_rate']:.0f}%")
-        return " | ".join(parts)
-
-    def get_detailed_summary(self) -> str:
-        """详细摘要"""
-        m = self.get_metrics()
-        r = self.get_rolling_metrics(20)
-        d = self.get_direction_metrics()
-        lines = [
-            f"总交易: {m['total_trades']} | 胜率: {m['win_rate']:.0f}% | "
-            f"PF: {m['profit_factor']:.2f} | Sharpe: {m['sharpe_ratio']:.2f}",
-            f"Sortino: {m['sortino_ratio']:.2f} | Calmar: {m['calmar_ratio']:.2f} | "
-            f"MaxDD: {m['max_drawdown']:.1f} ({m['max_drawdown_pct']:.1f}%)",
-            f"连胜: {m['max_consecutive_wins']} | 连败: {m['max_consecutive_losses']} | "
-            f"总PnL: {m['total_pnl']:+.1f}",
-            f"[20]: WR={r['win_rate']:.0f}% PnL={r['total_pnl']:+.1f} "
-            f"PF={r['profit_factor']:.2f}",
-        ]
-        for direction, dm in d.items():
-            if dm["total_trades"] > 0:
-                lines.append(
-                    f"  {direction}: {dm['total_trades']}笔 "
-                    f"WR={dm['win_rate']:.0f}% PnL={dm['total_pnl']:+.1f}"
-                )
-        return "\n".join(lines)
-
-    # ════════════════════════════════════════════
     # 工具
     # ════════════════════════════════════════════
 

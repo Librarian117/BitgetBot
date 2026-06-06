@@ -26,17 +26,11 @@ logger = logging.getLogger("QuantBot")
 class SafetyManager:
     """实盘交易安全层 v3.6"""
 
-    # v3.6: 内部熔断
-    MAX_CONSECUTIVE_API_ERRORS = 5
-    MAX_TOTAL_EXPOSURE_RATIO = 0.8  # 总保证金不超过权益 80%
-
     def __init__(self, config, exchange, tlogger):
         self.config = config
         self.exchange = exchange
         self.tlogger = tlogger
         self._is_sandbox = self._detect_sandbox()
-        self._consecutive_api_errors = 0
-        self._api_circuit_open = False
 
         mode = "沙箱" if self._is_sandbox else "实盘"
         logger.info(f"🛡️  安全层已加载 ({mode}模式)")
@@ -81,46 +75,6 @@ class SafetyManager:
 
     # ════════════════════════════════════════════
     # v3.6: 风控检查 (新增)
-    # ════════════════════════════════════════════
-
-    def check_total_exposure(
-        self, positions_detail: List[Dict], equity: float
-    ) -> Tuple[bool, str]:
-        """总风险敞口 = 所有仓位保证金 / 权益，不超过 80%"""
-        if not positions_detail or equity <= 0:
-            return True, ""
-        total_margin = sum(abs(p.get("margin", 0) or 0) for p in positions_detail)
-        ratio = total_margin / equity
-        if ratio > self.MAX_TOTAL_EXPOSURE_RATIO:
-            return False, f"总保证金 {total_margin:.0f}/{equity:.0f} = {ratio*100:.0f}% > {self.MAX_TOTAL_EXPOSURE_RATIO*100:.0f}%"
-        return True, ""
-
-    def check_max_positions(self, current_count: int) -> Tuple[bool, str]:
-        """防止超过最大并发持仓"""
-        max_pos = self.config.max_concurrent_positions
-        if current_count > max_pos:
-            return False, f"持仓数 {current_count} > 上限 {max_pos}"
-        return True, ""
-
-    def record_api_error(self):
-        """v3.6: 记录一次 API 错误，连续 N 次则熔断"""
-        self._consecutive_api_errors += 1
-        if self._consecutive_api_errors >= self.MAX_CONSECUTIVE_API_ERRORS:
-            self._api_circuit_open = True
-            logger.error(f"🛡️ API 连续 {self._consecutive_api_errors} 次错误，安全熔断!")
-            self.tlogger.log_risk("SAFETY_CIRCUIT", "API 连续错误触发安全熔断")
-
-    def record_api_success(self):
-        """重置 API 错误计数器"""
-        if self._consecutive_api_errors > 0:
-            self._consecutive_api_errors = 0
-            if self._api_circuit_open:
-                self._api_circuit_open = False
-                logger.info("🛡️ API 恢复，安全熔断解除")
-
-    def is_circuit_open(self) -> bool:
-        return self._api_circuit_open
-
     # ════════════════════════════════════════════
     # 订单执行
     # ════════════════════════════════════════════

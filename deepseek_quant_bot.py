@@ -43,6 +43,7 @@ import pandas as pd
 import requests
 
 from config_manager import ConfigManager
+from equity_auditor import EquityAuditor
 from exchange_interface import ExchangeInterface
 from quant_math import compute_quant_signals
 from session_manager import SessionManager
@@ -405,6 +406,8 @@ class DeepSeekAnalyst:
         self.news_context: str = ""
         # ── v3.1: 交易智慧上下文 ──
         self.wisdom_context: str = ""
+        # ── v4.1: 最后一次 AI 原始回复（用于解析失败时诊断） ──
+        self.last_raw_info: Dict[str, Any] = {}
 
     def circuit_breaker_reset(self):
         """每周期初重置断路器"""
@@ -422,448 +425,30 @@ class DeepSeekAnalyst:
         except Exception:
             logger.debug("⚠️  静默异常", exc_info=True)
 
-    def review_signal(
-        self,
-        symbol: str,
-        direction: str,
-        price: float,
-        ema: float,
-        rsi: float,
-        atr: float,
-        recent_closes: List[float],
-        adx: float = 0.0,
-        market_regime: Optional[str] = None,
-        tf_context: Optional[Dict[str, Any]] = None,
-        funding_rate: Optional[float] = None,
-        vol_ratio: float = 1.0,
-        strategy: str = "pullback",
-        confidence: int = 50,
-        bonuses: Optional[list] = None,
-    ) -> Tuple[str, str]:
-        """
-        将候选信号打包成 Prompt 发给 DeepSeek。
-        返回: (decision, reason)
-          decision ∈ {"CONFIRM", "REJECT"}
-        """
-        # ── 构造 System Prompt（含市场环境上下文） ──
-        base_currency = symbol.split("/")[0]
-
-        system_prompt = (
-            "【必须使用中文回复，禁止使用英文】\n"
-            "你是一名顶级加密货币首席量化分析师。你需要审核由量化策略生成的交易信号。\n\n"
-            "## 信号规则回顾 (默认阈值，实际可能因市场偏向自动调整)\n"
-            "- 回调做多: 价格 > EMA200（上涨趋势），且 RSI 超卖（默认<40，牛市中可放宽到55）\n"
-            "- 回调做空: 价格 < EMA200（下跌趋势），且 RSI 超买（默认>60，熊市中可放宽到45）\n"
-            "- 动量追多: 价格突破近期高点 + ADX>25 + RSI在55-78动量区（强势不回调）\n"
-            "- 动量策略止损更宽仓位更小，适合捕捉单边趋势\n\n"
-            "## 额外参考指标\n"
-            "- 成交量比率 (VolRatio): 当前K线量 / 近20根均量\n"
-            "- 资金费率: 正值=多头拥挤(做多谨慎)，负值=空头拥挤(做空谨慎)\n"
-            "- 交易时段: 波动性因时段而异，周末/凌晨信号需更谨慎评估\n\n"
-            "## 你的任务\n"
-            "1. 结合价格位置、动量指标、多时间周期趋势、成交量、资金费率和宏观市场情绪，判断信号胜率\n"
-            "2. 如果有明显的反向风险、震荡市特征、或宏观环境不利，请 REJECT\n"
-            "3. 成交量不足、资金费率极端不利时更应谨慎\n"
-            "4. 如果大趋势支持且宏观环境有利，可以更积极 CONFIRM\n"
-            "5. 快速做出判断，不要过度分析\n\n"
-            "## 【必须遵守】输出规则 — 违反将导致严重错误\n"
-            "你的回复必须且只能是一个 JSON 对象，不要输出任何分析、推理、解释文字。\n"
-            "直接输出: {\"decision\": \"CONFIRM\"|\"REJECT\", \"reason\": \"一句话原因\"}\n"
-            "禁止输出: 任何非 JSON 内容、markdown 代码块、前缀或后缀文字。"
-        )
-
-        # ── v3.0: 注入新闻上下文 ──
-        if self.news_context:
-            system_prompt += f"\n\n## 最新加密货币新闻\n{self.news_context}\n"
-            system_prompt += "请综合考虑以上新闻信息来辅助判断信号风险。\n"
-
-        # ── v3.1: 注入交易智慧 ──
-        if self.wisdom_context:
-            system_prompt += f"\n{self.wisdom_context}\n"
-            system_prompt += "请参考以上历史交易教训来辅助判断。\n"
-
-        # ── 注入市场宏观环境 ──
-        if self.market_ctx:
-            market_text = self.market_ctx.get_system_context()
-            if market_text:
-                system_prompt += f"\n\n## 当前市场宏观环境\n{market_text}\n"
-                system_prompt += (
-                    "\n请综合考虑以上宏观环境信息来辅助判断。"
-                    "极度恐惧时对做多信号可以更宽松，极度贪婪时对做多信号要更谨慎。"
-                )
-
-        # ── 构造 User Prompt ──
-        recent_str = ", ".join(f"{c:.4f}" for c in recent_closes[-5:])
-
-        # 多时间周期上下文
-        tf_section = ""
-        if tf_context:
-            for tf_name, ctx in tf_context.items():
-                if ctx and ctx.get("trend") != "unknown":
-                    tf_section += (
-                        f"\n{tf_name}趋势: {ctx['trend']} | "
-                        f"{tf_name}EMA{self.config.higher_tf_ema_period}: {ctx.get('ema50', 'N/A')} | "
-                        f"{tf_name}ADX: {ctx.get('adx', 'N/A')} | "
-                        f"{tf_name}状态: {ctx.get('regime', 'unknown')}"
-                    )
-        if market_regime:
-            regime_labels = {
-                "strong_bull": "🐂强牛市（全周期看涨+高共识，顺势做多胜率高）",
-                "bull": "📈牛市（多数周期看涨，回调做多+EMA交叉）",
-                "range": "📊震荡市（无明确方向，网格/布林/回调双向）",
-                "bear": "📉熊市（多数周期看跌，回调做空+EMA交叉）",
-                "strong_bear": "🐻强熊市（全周期看跌+高共识，顺势做空优先）",
-                "panic": "🚨极端波动（ATR>2.5%，建议观望或仅减仓）",
-            }
-            tf_section += (
-                f"\n综合市场状态: {regime_labels.get(market_regime, market_regime)}"
-            )
-
-        # 资金费率 + 交易时段上下文 (v2.1 + v2.3)
-        session = SessionManager.get_session(
-            self.config.adx_threshold, self.config.vol_ratio_threshold)
-        funding_section = ""
-        if funding_rate is not None:
-            funding_pct = funding_rate * 100
-            if funding_rate > self.config.funding_warn_long:
-                funding_note = "⚠️ 多头拥挤，做多需谨慎"
-            elif funding_rate < self.config.funding_warn_short:
-                funding_note = "⚠️ 空头拥挤，做空需谨慎"
-            else:
-                funding_note = "正常"
-            funding_section = (
-                f"\n资金费率: {funding_pct:+.4f}% ({funding_note})"
-            )
-        session_section = (
-            f"\n当前交易时段: {session['label']} — {session['advice']}"
-        )
-
-        user_prompt = f"""当前时间: {now_str()}
-
-交易对: {symbol}
-信号策略: {strategy}  (pullback=回调抄底, momentum=追涨突破)
-信号方向: {direction}
-量化和AI置信度: {confidence}/100 {' | 加成: ' + ', '.join(bonuses) if bonuses else ''}
-当前价格: {price:.4f}
-EMA({self.config.ema_period}): {ema:.4f}
-RSI({self.config.rsi_period}): {rsi:.2f}
-ADX({self.config.adx_period}): {adx:.2f}
-ATR({self.config.atr_period}): {atr:.4f}
-成交量比率(当前/均量): {vol_ratio:.2f}
-最近5根K线收盘价: [{recent_str}]
-{tf_section}{funding_section}{session_section}
-
-请审核以上信号。你的回复必须以 JSON 结尾，不要只输出分析。"""
-
-        # 追加: 强制 JSON 结尾提醒
-        user_prompt += '\n\n⚠️ 只输出JSON，不要任何分析: {"decision":"CONFIRM"|"REJECT","reason":"原因"}'
-
-        # v4.0: 告知 AI 当前实际阈值（熊市/牛市偏向已自动调整）
-        if strategy == "pullback":
-            if direction == "SHORT":
-                user_prompt += f'\n📌 当前做空回调阈值: RSI>{self.config.rsi_overbought}（可能因市场偏向已自动降至最低45）'
-            else:
-                user_prompt += f'\n📌 当前做多回调阈值: RSI<{self.config.rsi_oversold}（可能因市场偏向已自动升至最高55）'
-        user_prompt += '\n📌 请以实际RSI值判断，而非死守默认阈值。如果多周期趋势一致且资金费率支持，RSI接近阈值即可通过。'
-
-        try:
-            # 构建请求体
-            request_body = {
-                "model": self.config.deepseek_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": self.config.deepseek_temp,
-                "max_tokens": 800,
-                # v4.0: 移除 response_format — DeepSeek 推理模型不完全支持,
-                # _extract_json 已能处理自由文本中的 JSON
-            }
-
-            # 可选: 添加 Function Call 工具
-            if self.config.deepseek_enable_tools:
-                request_body["tools"] = self.TOOLS
-                request_body["tool_choice"] = "auto"
-
-            resp = self.session.post(
-                self.config.deepseek_url,
-                json=request_body,
-                timeout=self.config.deepseek_timeout,
-            )
-
-            if resp.status_code != 200:
-                logger.error(f"❌ DeepSeek HTTP {resp.status_code}: {resp.text[:200]}")
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= self._circuit_threshold:
-                    self._circuit_open = True
-                    logger.error(f"🔌 DeepSeek 断路器熔断! 连续 {self._consecutive_failures} 次失败")
-                return "REJECT", f"API错误 {resp.status_code}"
-
-            body = resp.json()
-            msg = body["choices"][0]["message"]
-
-            # ── 处理 Function Calls ──
-            tool_calls = msg.get("tool_calls")
-            if tool_calls and self.market_ctx:
-                logger.info(f"🔧 DeepSeek 请求了 {len(tool_calls)} 个 tool call(s)")
-                # 执行 function calls
-                tool_results = []
-                for tc in tool_calls:
-                    func_name = tc["function"]["name"]
-                    if func_name == "get_crypto_sentiment":
-                        try:
-                            args = json.loads(tc["function"]["arguments"])
-                            asset = args.get("asset", base_currency)
-                            sentiment_data = self.market_ctx.get_sentiment_for_symbol(
-                                f"{asset}/USDT"
-                            )
-                            tool_results.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": sentiment_data,
-                            })
-                            logger.info(f"📊 获取 {asset} 情绪数据完成")
-                        except Exception as e:
-                            logger.warning(f"⚠️  Tool call 执行失败: {e}")
-                            tool_results.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": json.dumps({"error": str(e)}),
-                            })
-
-                if tool_results:
-                    # 二次调用: 带 tool 结果继续
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                        msg,
-                        *tool_results,
-                    ]
-                    resp2 = self.session.post(
-                        self.config.deepseek_url,
-                        json={
-                            "model": self.config.deepseek_model,
-                            "messages": messages,
-                            "temperature": self.config.deepseek_temp,
-                            "max_tokens": 800,  # v4.0: 增加空间，确保分析后有空间输出JSON
-                            "response_format": {"type": "json_object"},
-                            "tool_choice": "none",
-                        },
-                        timeout=self.config.deepseek_timeout,
-                    )
-                    if resp2.status_code == 200:
-                        body = resp2.json()
-                        msg = body["choices"][0]["message"]
-
-            # ── 提取最终决策 ──
-            # v3.7 fix: 始终合并 content + reasoning_content
-            raw = self._merge_content_reasoning(msg)
-            logger.info(f"📩 DeepSeek 原始回复: {raw[:200]}")
-
-            decision_json = self._extract_json(raw, context="entry_review")
-            decision = decision_json.get("decision", "REJECT").upper().strip()
-            reason = decision_json.get("reason", "无")
-
-            if decision not in ("CONFIRM", "REJECT"):
-                logger.warning(f"⚠️  DeepSeek 返回未知 decision={decision}，视为 REJECT")
-                decision = "REJECT"
-
-            logger.info(f"📋 DeepSeek 决策: {decision} | {reason}")
-            return decision, reason
-
-        except requests.Timeout:
-            logger.error("❌ DeepSeek 超时")
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self._circuit_threshold:
-                self._circuit_open = True
-                logger.error(f"🔌 DeepSeek 断路器熔断! 连续 {self._consecutive_failures} 次失败")
-            return "REJECT", "请求超时"
-        except Exception as e:
-            logger.error(f"❌ DeepSeek 异常: {e}")
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self._circuit_threshold:
-                self._circuit_open = True
-                logger.error(f"🔌 DeepSeek 断路器熔断! 连续 {self._consecutive_failures} 次失败")
-            return "REJECT", str(e)
-
-    def review_position(
-        self,
-        symbol: str,
-        direction: str,
-        entry_price: float,
-        current_price: float,
-        unrealized_pnl: float,
-        roi: float,
-        holding_hours: float,
-        ema: float,
-        rsi: float,
-        atr: float,
-        adx: float,
-        recent_closes: List[float],
-        market_regime: str = "",
-        tf_context: Optional[Dict[str, Any]] = None,
-        funding_rate: Optional[float] = None,
-    ) -> Tuple[str, str]:
-        """
-        v3.6: AI 持仓审核 — 审查已持有仓位是否应该提前退出。
-        返回: (decision, reason)
-          decision ∈ {"HOLD", "CLOSE"}
-        """
-        # ── 构造 System Prompt ──
-        system_prompt = (
-            "【必须使用中文回复，禁止使用英文】\n"
-            "你是一名顶级加密货币交易员，正在管理一个**已持有的仓位**。\n"
-            "你的任务：判断是继续持有 (HOLD) 还是立即平仓 (CLOSE)。\n\n"
-            "## 平仓信号规则\n"
-            "- 趋势反转: 价格突破 EMA 且 RSI 确认（做多跌破EMA+RSI<45 → CLOSE; 做空升破EMA+RSI>55 → CLOSE）\n"
-            "- 动量衰竭: ADX 显著下降（比开仓时下降 >10 点）→ 趋势减弱，考虑 CLOSE\n"
-            "- 浮盈回撤风险: 价格在高位/低位徘徊但 RSI 从极端区回到中性 → 可能反转，考虑 CLOSE\n"
-            "- 时间风险: 持仓过久（>6小时）但盈利未继续扩大 → 效率降低，考虑 CLOSE\n"
-            "- 宏观不利: 多周期 TF 方向不一致 → 信号可靠性下降\n\n"
-            "## 持仓规则\n"
-            "- 趋势仍在延续 + 多TF一致 + 浮盈在扩大 → HOLD\n"
-            "- 浮盈可观（ROI>20%）但趋势有转弱迹象 → 优先 CLOSE 锁定利润\n"
-            "- 浮亏但趋势未反转 → 可 HOLD（让 SL 处理）\n"
-            "- 浮亏且趋势已反转 → CLOSE 止损（比 SL 更快）\n\n"
-            "## 【必须遵守】输出规则 — 违反将导致严重错误\n"
-            "你的回复必须且只能是一个 JSON 对象，不要输出任何分析、推理、解释文字。\n"
-            "直接输出: {\"decision\": \"HOLD\"|\"CLOSE\", \"reason\": \"一句话原因\"}\n"
-            "禁止输出: 任何非 JSON 内容、markdown 代码块、前缀或后缀文字。"
-        )
-        if self.wisdom_context:
-            system_prompt += f"\n{self.wisdom_context}\n"
-            system_prompt += "请参考以上历史交易教训来辅助判断。\n"
-
-        # ── 构造 User Prompt ──
-        recent_str = ", ".join(f"{c:.4f}" for c in recent_closes[-5:])
-
-        # 多时间周期
-        tf_section = ""
-        if tf_context:
-            for tf_name, ctx in tf_context.items():
-                if ctx and ctx.get("trend") != "unknown":
-                    tf_section += (
-                        f"\n{tf_name}趋势: {ctx['trend']} | "
-                        f"{tf_name}EMA: {ctx.get('ema50', 'N/A')} | "
-                        f"{tf_name}ADX: {ctx.get('adx', 'N/A')} | "
-                        f"{tf_name}状态: {ctx.get('regime', 'unknown')}"
-                    )
-        if market_regime:
-            regime_labels = {
-                "strong_bull": "🐂强牛市（顺势做多）",
-                "bull": "📈牛市（偏多）",
-                "range": "📊震荡市（双向）",
-                "bear": "📉熊市（偏空）",
-                "strong_bear": "🐻强熊市（顺势做空）",
-                "panic": "🚨极端波动（危险）",
-            }
-            tf_section += (
-                f"\n综合市场状态: {regime_labels.get(market_regime, market_regime)}"
-            )
-
-        # 资金费率
-        funding_section = ""
-        if funding_rate is not None:
-            funding_pct = funding_rate * 100
-            if funding_rate > self.config.funding_warn_long:
-                funding_note = "⚠️ 多头拥挤"
-            elif funding_rate < self.config.funding_warn_short:
-                funding_note = "⚠️ 空头拥挤"
-            else:
-                funding_note = "正常"
-            funding_section = f"\n资金费率: {funding_pct:+.4f}% ({funding_note})"
-
-        pnl_sign = "+" if unrealized_pnl >= 0 else ""
-        user_prompt = f"""当前时间: {now_str()}
-
-交易对: {symbol}
-持仓方向: {direction}
-入场价格: {entry_price:.4f}
-当前价格: {current_price:.4f}
-浮盈: {pnl_sign}{unrealized_pnl:.2f} USDT (ROI: {roi*100:.1f}%)
-已持仓: {holding_hours:.1f} 小时
-EMA: {ema:.4f}
-RSI: {rsi:.2f}
-ADX: {adx:.2f}
-ATR: {atr:.4f}
-最近5根K线收盘价: [{recent_str}]
-{tf_section}{funding_section}
-
-请判断应该 HOLD 还是 CLOSE。你的回复必须以 JSON 结尾，不要只输出分析。"""
-
-        # 追加: 强制 JSON 结尾提醒
-        user_prompt += '\n\n⚠️ 只输出JSON，不要任何分析: {"decision":"HOLD"|"CLOSE","reason":"原因"}'
-
-        logger.info(f"🔍 正在请求 DeepSeek 审核持仓 {symbol} {direction} (ROI={roi*100:.1f}%)…")
-
-        try:
-            request_body = {
-                "model": self.config.deepseek_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": self.config.deepseek_temp,
-                "max_tokens": 800,
-                # v4.0: 移除 response_format — DeepSeek 推理模型不完全支持
-            }
-
-            resp = self.session.post(
-                self.config.deepseek_url,
-                json=request_body,
-                timeout=self.config.deepseek_timeout,
-            )
-
-            if resp.status_code != 200:
-                logger.error(f"❌ DeepSeek 持仓审核 HTTP {resp.status_code}: {resp.text[:200]}")
-                self._consecutive_failures += 1
-                if self._consecutive_failures >= self._circuit_threshold:
-                    self._circuit_open = True
-                    logger.error("🔌 DeepSeek 断路器熔断!")
-                return "HOLD", f"API错误 {resp.status_code}"
-
-            body = resp.json()
-            msg = body["choices"][0]["message"]
-            # v3.7 fix: 始终合并 content + reasoning_content
-            raw = self._merge_content_reasoning(msg)
-            logger.info(f"📩 DeepSeek 持仓审核回复: {raw[:200]}")
-
-            decision_json = self._extract_json(raw, context="position_review")
-            decision = decision_json.get("decision", "HOLD").upper().strip()
-            reason = decision_json.get("reason", "无")
-
-            if decision not in ("HOLD", "CLOSE"):
-                logger.warning(f"⚠️  DeepSeek 持仓审核返回未知 decision={decision}，视为 HOLD")
-                decision = "HOLD"
-
-            logger.info(f"📋 DeepSeek 持仓审核: {symbol} {direction} → {decision} | {reason}")
-            return decision, reason
-
-        except requests.Timeout:
-            logger.error("❌ DeepSeek 持仓审核超时")
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self._circuit_threshold:
-                self._circuit_open = True
-            return "HOLD", "请求超时"
-        except Exception as e:
-            logger.error(f"❌ DeepSeek 持仓审核异常: {e}")
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self._circuit_threshold:
-                self._circuit_open = True
-            return "HOLD", str(e)
-
     @staticmethod
     def _merge_content_reasoning(msg: Dict[str, Any]) -> str:
-        """v4.0: 智能合并 DeepSeek 推理模型的 content + reasoning_content。
+        """v4.1: 智能合并 DeepSeek 推理模型的 content + reasoning_content。
 
-        策略变更: content 优先放在前面（含关键 JSON），reasoning 补充在后面。
-        v3.7 的问题是 reasoning 放前面，其分析文本会混淆 JSON 解析器。
+        策略: 优先使用 content（最终答案，通常含 JSON），
+        仅在 content 无 JSON 时才合并 reasoning_content。
+        避免 reasoning 中的分析文本污染 JSON 解析器。
+
+        返回: (merged_text, source_flag)
+          source_flag: "content" | "reasoning" | "merged" | "empty"
         """
         c = (msg.get("content") or "").strip()
         r = (msg.get("reasoning_content") or "").strip()
-        # content 优先 → JSON 决策在最前面，解析器直接命中
+
+        # 1. content 中有 JSON → 只用 content（reasoning 是噪音）
+        if c and '{' in c:
+            return c
+        # 2. content 为空但 reasoning 有 JSON → 用 reasoning
+        if r and '{' in r:
+            return r
+        # 3. 都有但 content 无 JSON → 合并（reasoning 可能在文本中含 JSON）
         if c and r:
             return f"{c}\n{r}"
+        # 4. 只有其中一个
         return c or r
 
     @staticmethod
@@ -884,19 +469,32 @@ ATR: {atr:.4f}
         for m in re.finditer(r'```(?:json)?\s*\n?(.*?)```', raw, re.DOTALL):
             candidates.append(m.group(1).strip())
 
-        # 2. 如果没有代码块，尝试正则匹配 JSON 对象 (v3.7: 支持嵌套)
+        # 2. v4.1: 尾部优先 — AI 被告知"JSON 结尾"，从末尾提取最可靠
+        #    从最后 2000→1000→500→200 字符逐步收缩窗口查找完整 JSON
+        if not candidates:
+            for window in (2000, 1000, 500, 200):
+                tail = raw[-window:] if len(raw) > window else raw
+                # 在尾部找所有 { } 对，从最长的开始尝试
+                for m in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', tail, re.DOTALL):
+                    cand = m.group(0)
+                    if '"decision"' in cand:
+                        candidates.append(cand)
+                if candidates:
+                    break  # 找到就停，优先用大窗口的结果
+
+        # 3. 如果没有从尾部找到，尝试正则匹配 JSON 对象 (v3.7: 支持嵌套)
         if not candidates:
             for m in re.finditer(r'\{[^{}]*"decision"[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL):
                 candidates.append(m.group(0))
 
-        # 3. 尝试每个候选
+        # 4. 尝试每个候选（尾部优先的排在前面）
         for cand in candidates:
             try:
                 return json.loads(cand)
             except json.JSONDecodeError:
                 continue
 
-        # 4. 直接解析全文本
+        # 5. 直接解析全文本
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -1021,9 +619,15 @@ ATR: {atr:.4f}
         logger.warning(f"⚠️  完全无法解析 DeepSeek 回复 (context={context}): raw[:300]={raw[:300]}")
 
         # v3.7: context 感知的默认值
+        # v4.1: 保留旧决策层 context 兼容，新增研究层 context
         defaults = {
+            # v4.1 deprecated — 保留兼容
             "entry_review": {"decision": "REJECT", "reason": "解析失败-默认拒绝"},
             "position_review": {"decision": "HOLD", "reason": "解析失败-默认持有"},
+            # v4.1 new — 研究层 context，不输出决策
+            "signal_explanation": {"signal_explanation": "解析失败", "risk_factors": [], "quality": "unknown"},
+            "position_explanation": {"trend_status": "无法分析", "risk_score": 5, "key_observations": []},
+            # 其他
             "market_anomaly": {},
             "genetic_evolve": {},
         }
@@ -1332,25 +936,13 @@ class TradeLogger:
             "positions": positions,  # [{symbol, side, entry, mark, upl, margin}]
         })
 
-    def log_sl_tp_trigger(self, symbol: str, order_type: str,
-                          trigger_price: float, fill_price: float):
-        """记录 SL/TP 触发（复盘止损止盈效果）"""
-        self._write({
-            "event": "SL_TP_TRIGGER",
-            "symbol": symbol,
-            "order_type": order_type,  # "SL" or "TP"
-            "trigger_price": round(trigger_price, 4),
-            "fill_price": round(fill_price, 4),
-            "slippage": round(abs(fill_price - trigger_price) / trigger_price * 100, 4),
-        })
-
-    def log_ai_exit_decision(self, symbol: str, direction: str,
+    def log_rule_exit_review(self, symbol: str, direction: str,
                              decision: str, reason: str,
                              entry_price: float, current_price: float,
                              roi: float, holding_hours: float):
-        """v3.6: 记录 AI 持仓审核决策"""
+        """v4.1: 记录规则引擎持仓审查决策 (替代旧AI_EXIT_DECISION)"""
         self._write({
-            "event": "AI_EXIT_DECISION",
+            "event": "RULE_EXIT_REVIEW",
             "symbol": symbol,
             "direction": direction,
             "decision": decision,  # HOLD or CLOSE
@@ -1359,6 +951,20 @@ class TradeLogger:
             "current_price": round(current_price, 4),
             "roi": round(roi * 100, 1),
             "holding_hours": round(holding_hours, 1),
+        })
+
+    def log_sl_attribution(self, symbol: str, direction: str,
+                           exit_price: float, pnl: float, pnl_pct: float,
+                           strategy: str = "pullback"):
+        """v4.1: Stop Loss Attribution — 记录止损出场信息, 供后续分析"""
+        self._write({
+            "event": "SL_ATTRIBUTION",
+            "symbol": symbol,
+            "direction": direction,
+            "exit_price": round(exit_price, 4),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 1),
+            "strategy": strategy,
         })
 
 
@@ -1377,10 +983,11 @@ class RiskMonitor:
     """
 
     # v4.0: 基础阈值 (10 币种)
-    BASE_STREAK_WARN = 3      # 连续亏损此次数 → 暂停
-    BASE_STREAK_HARD = 5      # 连续亏损此次数 → 长暂停
-    BASE_COOLDOWN_WARN_H = 4  # 暂停小时
-    BASE_COOLDOWN_HARD_H = 24 # 长暂停小时
+    # v4.1 fix: 10币种从3→5, 减少误触发 (正常波动不应锁死4小时)
+    BASE_STREAK_WARN = 5      # 连续亏损此次数 → 暂停
+    BASE_STREAK_HARD = 8      # 连续亏损此次数 → 长暂停
+    BASE_COOLDOWN_WARN_H = 2  # 暂停小时 (从4h降到2h, 够冷静但不过度)
+    BASE_COOLDOWN_HARD_H = 12 # 长暂停小时 (从24h降到12h)
 
     def __init__(self, config: ConfigManager, exchange: ExchangeInterface):
         self.config = config
@@ -1593,6 +1200,21 @@ class DeepSeekQuantBot:
         self.tlogger   = TradeLogger()
         self.riskmon   = RiskMonitor(self.config, self.exchange)
         self.executor  = TradeExecutor(self.config, self.exchange, self.tlogger)
+
+        # ── v4.1: 币种仓位微调 (保守, 基于统计阈值) ──
+        # ETH: 去重后20%胜率, 仅降仓15%非拉黑
+        self._coin_position_cap = {"ETH": 0.85}
+
+        # ── v4.1: 独立 PnL 累计器 (用于资金审计对账) ──
+        # 累计所有 POSITION_CLOSE 的 PnL, 与交易所权益对比
+        self._bot_closed_pnl_total: float = 0.0
+        self._bot_closed_trade_count: int = 0
+
+        # ── v4.1: 独立资金审计器 —— 账户净值是唯一真相 ──
+        self.equity_auditor = EquityAuditor(
+            initial_equity=self.config.initial_equity or 10000.0,
+            alarm_threshold=50.0,
+        )
 
         logger.info(f"📋 配置: {self.config}")
         logger.info(f"📋 监控币种: {self.config.SYMBOLS}")
@@ -1900,7 +1522,10 @@ class DeepSeekQuantBot:
                     df, self.config.higher_tf_ema_period
                 )
 
-                latest = df.iloc[-1]
+                # v4.1: 1h/4h 用 iloc[-2] (最后一根已闭合K线)
+                # iloc[-1] 是形成中的K线, close/high/low 不可靠
+                idx = -2 if len(df) >= 2 else -1
+                latest = df.iloc[idx]
                 close = float(latest["close"])
                 ema = float(latest["ema"])
                 atr = float(latest["atr"])
@@ -1956,6 +1581,37 @@ class DeepSeekQuantBot:
                 aligned = False
 
         return aligned, "; ".join(reasons) if reasons else "无TF数据"
+
+    def _audit_snapshot(self, acct: Dict[str, Any]):
+        """v4.1: 独立资金审计快照 (在所有返回路径都调用)
+
+        偏差 = 交易所权益 - (初始资金 + bot日志累计PnL - 手续费)
+        偏差 > alarm_threshold → 报警 (说明日志统计不可信)
+        """
+        try:
+            self.equity_auditor.snapshot(
+                exchange_equity=acct["equity"],
+                exchange_balance=acct.get("balance", acct["equity"]),
+                exchange_margin=acct.get("used_margin", 0),
+                exchange_upl=acct.get("unrealized_pnl", 0),
+                bot_realized_pnl=self._bot_closed_pnl_total,  # 日志累计 PnL
+                bot_fees=self.riskmon.cumulative_fees,
+                open_positions=len(acct.get("positions_detail", [])),
+                extra={
+                    "bot_trade_count": self._bot_closed_trade_count,
+                    "riskmon_equity": self.riskmon.current_equity,
+                },
+            )
+            result = self.equity_auditor.check()
+            if result["status"] == "ALARM":
+                logger.error(
+                    f"🚨 资金审计报警! 偏差={result['deviation']:+.2f} USDT "
+                    f"(交易所={result['exchange_equity']:.2f} "
+                    f"bot预期={result['expected_equity']:.2f}) "
+                    f"累计报警{result['total_alarms']}次"
+                )
+        except Exception:
+            pass  # 审计失败不影响交易
 
     def _detect_market_regime(self, tf_context: Dict[str, Any],
                               atr: float = 0, close: float = 0,
@@ -2155,65 +1811,28 @@ class DeepSeekQuantBot:
                 continue
 
             try:
-                # ── 拉取 K 线 + 计算指标 ──
-                df = self.exchange.fetch_ohlcv(sym_full)
-                if len(df) < 50:
-                    logger.debug(f"🔍 {symbol} K线不足，跳过审核")
-                    continue
-                df = self.indicator.compute_all(df)
-                latest = df.iloc[-1]
-                ema = float(latest.get("ema", entry))
-                rsi = float(latest.get("rsi", 50))
-                atr = float(latest.get("atr", entry * 0.01))
-                adx = float(latest.get("adx", 20))
-                recent_closes = [float(c) for c in df["close"].tail(10).tolist()]
-
-                # ── 多 TF 分析 ──
-                tf_context = self._analyze_tf_context(sym_full)
-                regime_info = self._detect_market_regime(tf_context)
-                market_regime = regime_info.get("regime", "unknown")
-
                 # ── 估算持有时长 ──
                 holding_hours = 0.5  # 默认 0.5 小时（至少已过一轮）
                 open_ts = getattr(self, '_position_open_times', {}).get(sym_full)
                 if open_ts:
                     holding_hours = (time.time() - open_ts) / 3600.0
 
-                # ── 资金费率 ──
-                funding_rate = None
-                try:
-                    funding_rate = self.exchange.fetch_funding_rate(sym_full)
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
-
                 # ── v4.0: 规则引擎优先 — 不依赖 AI 做出场决策 ──
+                # v4.1: 即时亏损熔断 + 异常检测/市场评论已开启
                 decision, reason = "HOLD", ""
                 if roi > 0.40:
                     decision, reason = "CLOSE", f"止盈规则-盈利{roi*100:.0f}%"
+                elif roi < -0.50:
+                    decision, reason = "CLOSE", f"紧急熔断-亏损{roi*100:.0f}%"
                 elif roi < -0.25 and holding_hours > 1.0:
                     decision, reason = "CLOSE", f"止损规则-亏损{roi*100:.0f}%超1h"
                 elif holding_hours > 6.0 and abs(roi) < 0.03:
                     decision, reason = "CLOSE", f"僵尸仓规则-持仓{holding_hours:.0f}h"
 
-                # ── v4.0: AI 仅作研究解释 (非阻塞, 异步记录) ──
-                ai_note = ""
-                try:
-                    ai_dec, ai_reason = self.analyst.review_position(
-                        symbol=sym_full, direction=side, entry_price=entry,
-                        current_price=mark, unrealized_pnl=upl, roi=roi,
-                        holding_hours=holding_hours, ema=ema, rsi=rsi, atr=atr,
-                        adx=adx, recent_closes=recent_closes,
-                        market_regime=market_regime, tf_context=tf_context,
-                        funding_rate=funding_rate,
-                    )
-                    ai_note = f"AI:{ai_dec}/{ai_reason[:40]}"
-                except Exception:
-                    pass  # AI 不可用也不影响决策
-
-                # ── 记录决策 ──
-                self.tlogger.log_ai_exit_decision(
+                # ── v4.1: 规则引擎决策 (AI 出场审核已移除 —— 全部解析失败) ──
+                self.tlogger.log_rule_exit_review(
                     symbol=symbol, direction=side,
-                    decision=decision, reason=reason if not ai_note else f"{reason} | {ai_note}",
+                    decision=decision, reason=reason,
                     entry_price=entry, current_price=mark,
                     roi=roi, holding_hours=holding_hours,
                 )
@@ -2289,6 +1908,14 @@ class DeepSeekQuantBot:
             effective_adx = session["adx_threshold"]
             if self.config.is_sandbox:
                 effective_adx = max(6, effective_adx - 4)  # 沙箱模式放宽但不全跳
+            # v4.1: ADX干旱自适应 — 连续无信号时逐步降低ADX门槛
+            drought = getattr(self, '_drought_cycles', 0)
+            if drought >= 10:
+                adx_relax = min(6, (drought - 10) // 5)  # 每5轮降1, 最多降6
+                effective_adx = max(6, effective_adx - adx_relax)
+                if drought % 10 == 0:
+                    logger.info(f"🌵 ADX干旱自适应: 阈值-{adx_relax} → {effective_adx} "
+                                f"(干旱{drought}轮, 基础={session['adx_threshold']})")
             if adx < effective_adx:
                 logger.debug(
                     f"{symbol} ADX={adx:.2f} < {effective_adx} "
@@ -2432,14 +2059,6 @@ class DeepSeekQuantBot:
                         direction = "SHORT"
                         strategy = "bollinger"
 
-            # v4.0: 大趋势方向偏向 — 熊市阻止LONG, 牛市阻止SHORT (必被过滤, 不如不生)
-            if direction == "LONG" and block_long:
-                logger.debug(f"{symbol} LONG信号在熊市被阻止(必被多TF过滤)")
-                return None
-            if direction == "SHORT" and block_short:
-                logger.debug(f"{symbol} SHORT信号在牛市被阻止(必被多TF过滤)")
-                return None
-
             if direction is None:
                 logger.debug(
                     f"{symbol} 无信号 | price={close:.4f} "
@@ -2447,17 +2066,45 @@ class DeepSeekQuantBot:
                 )
                 return None
 
-            # ── v3.7: 方向自动开关 —— 滚动胜率过低时暂停该方向 (v4.0: 死锁逃生门) ──
-            if self.learner:
-                force = getattr(self, '_force_allow_direction', False)
-                viable, skip_reason = self.learner.is_direction_viable(
-                    direction, force_allow=force, symbol=symbol)
-                if not viable:
-                    logger.info(f"🚫 {symbol} {direction} 方向已暂停: {skip_reason}")
-                    self.tlogger.log_direction_skip(symbol, direction, skip_reason)
+            # ── v4.1: Kalman 方向确认 —— 信号方向与 Kalman 趋势冲突时拒绝 ──
+            # Kalman 滤波器零滞后，能提前捕捉趋势反转。当 EMA 说"熊市做空"
+            # 但 Kalman 说"反弹中"时，拒绝 SHORT 信号，避免在反弹中被止损。
+            if kalman_dir != "flat":
+                kalman_conflict = (
+                    (direction == "SHORT" and kalman_dir == "up")
+                    or (direction == "LONG" and kalman_dir == "down")
+                )
+                if kalman_conflict and abs(kalman_score) > 0.15:
+                    logger.info(
+                        f"🔧 {symbol} {direction} 信号与 Kalman 冲突 "
+                        f"(Kalman={kalman_dir} score={kalman_score:.2f})，拒绝"
+                    )
                     return None
+                elif kalman_conflict:
+                    # Kalman 弱信号冲突 → 降级为 counter_trend (降低仓位)
+                    logger.info(
+                        f"🔧 {symbol} {direction} 信号与 Kalman 弱冲突 "
+                        f"(Kalman={kalman_dir} score={kalman_score:.2f}) → counter_trend"
+                    )
+                    strategy = "counter_trend"
 
-            # ── v3.6: 趋势方向校验 —— 逆势信号降级或拦截 (v3.7: 使用自适应阈值) ──
+            # ── v4.1: 币种止损冷却 —— 同币种止损后 30 分钟内禁止重新开仓 ──
+            sym_cool = getattr(self, '_symbol_cooldowns', {})
+            sym_key = symbol
+            if sym_key in sym_cool:
+                remaining = (sym_cool[sym_key] - time.time()) / 60
+                if remaining > 0:
+                    logger.info(
+                        f"⏳ {symbol} 止损冷却中 (剩余 {remaining:.0f}min)，跳过"
+                    )
+                    return None
+                else:
+                    del sym_cool[sym_key]  # 冷却过期, 清除
+
+            # ── v4.1: 趋势方向校验先于方向阻止 — counter_trend 允许逆势通过 ──
+            # 原来 block_long/block_short 在这里直接 return None，导致 counter_trend
+            # 逃生逻辑(原 line 2681)永远走不到。现在把趋势校验提到 block 之前，
+            # 深度超卖/超买的逆势信号标记为 counter_trend 并放行。
             if direction == "LONG" and strategy == "pullback":
                 if is_bearish_trend:
                     if rsi > effective_oversold * 0.7:
@@ -2468,7 +2115,7 @@ class DeepSeekQuantBot:
                         self.stats["adx_skips"] += 1
                         return None
                     else:
-                        logger.info(f"⚠️  {symbol} LONG-pullback 逆势通过 (RSI={rsi:.1f}深度超卖)")
+                        logger.info(f"⚠️  {symbol} LONG-counter_trend 逆势通过 (RSI={rsi:.1f}深度超卖)")
                         strategy = "counter_trend"
             elif direction == "SHORT" and strategy == "pullback":
                 if is_bullish_trend:
@@ -2480,8 +2127,27 @@ class DeepSeekQuantBot:
                         self.stats["adx_skips"] += 1
                         return None
                     else:
-                        logger.info(f"⚠️  {symbol} SHORT-pullback 逆势通过 (RSI={rsi:.1f}深度超买)")
+                        logger.info(f"⚠️  {symbol} SHORT-counter_trend 逆势通过 (RSI={rsi:.1f}深度超买)")
                         strategy = "counter_trend"
+
+            # v4.0: 大趋势方向偏向 — counter_trend 除外
+            # v4.1 fix: counter_trend 已在上面通过趋势校验，此处放行
+            if direction == "LONG" and block_long and strategy != "counter_trend":
+                logger.debug(f"{symbol} LONG信号在熊市被阻止(必被多TF过滤)")
+                return None
+            if direction == "SHORT" and block_short and strategy != "counter_trend":
+                logger.debug(f"{symbol} SHORT信号在牛市被阻止(必被多TF过滤)")
+                return None
+
+            # ── v3.7: 方向自动开关 —— 滚动胜率过低时暂停该方向 (v4.0: 死锁逃生门) ──
+            if self.learner:
+                force = getattr(self, '_force_allow_direction', False)
+                viable, skip_reason = self.learner.is_direction_viable(
+                    direction, force_allow=force, symbol=symbol)
+                if not viable:
+                    logger.info(f"🚫 {symbol} {direction} 方向已暂停: {skip_reason}")
+                    self.tlogger.log_direction_skip(symbol, direction, skip_reason)
+                    return None
 
             # ── v3.2: 高胜率加成 ──
             confidence = 50  # 基础分
@@ -2703,6 +2369,16 @@ class DeepSeekQuantBot:
                                 bonuses.append("CVD背离警告")
                 except Exception:
                     pass  # 获取不到成交数据不影响决策
+
+            # ── v4.1: 最低置信度过滤 —— 弱信号不开仓 ──
+            # counter_trend 作为逆势机会可稍低, 趋势策略需更高置信度
+            min_conf = 45 if strategy == "counter_trend" else 55
+            if confidence < min_conf:
+                logger.info(
+                    f"🔇 {symbol} {direction} {strategy} 置信度{confidence}<{min_conf}，"
+                    f"拒绝 (加成: {bonus_str})"
+                )
+                return None
 
             return {
                 "symbol": symbol,
@@ -2978,7 +2654,8 @@ class DeepSeekQuantBot:
                     if close_o:
                         logger.info(f"✅ 浮亏止损平仓 {sym}: {close_o.get('id', '?')}")
                         # 计算 PnL%
-                        position_value = entry * contracts
+                        csize = self.exchange.get_contract_size(sym_full)
+                        position_value = entry * contracts * csize
                         pnl_pct = (upl / (position_value / self.config.leverage)) * 100 if position_value > 0 else roi * 100
                         self.tlogger.log_position_close(
                             symbol=sym, direction=side, strategy="pullback",
@@ -3179,6 +2856,35 @@ class DeepSeekQuantBot:
                                     self.riskmon.cumulative_fees,
                                     "locked", 0, 0,
                                     self.riskmon.initial_equity, all_time)
+            self._audit_snapshot(acct)
+            return
+
+        # ── v4.1: 周末凌晨保护 —— 低流动性时段只平仓不开仓 ──
+        session_live = SessionManager.get_session(
+            self.config.adx_threshold, self.config.vol_ratio_threshold)
+        if session_live.get("name") == "weekend_dead":
+            logger.info(f"🛑 周末凌晨({session_live['label']})低流动性，本轮只平仓不开仓")
+            # 仍然执行持仓检查 (规则引擎平仓 + AI 解释)
+            if self.config.ai_position_review_enabled and acct.get("positions_detail"):
+                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
+                    self._review_open_positions(acct["positions_detail"])
+            # 扫描生成信号但不执行
+            candidates = self.scan_all()
+            if candidates:
+                logger.info(f"📊 周末凌晨信号: {len(candidates)} 个（不执行，仅记录）")
+                for sig in candidates:
+                    self.tlogger.log_signal(sig)
+            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
+            self.tlogger.log_cycle(cycle, len(candidates), 0,
+                                    self.riskmon.current_equity,
+                                    self.riskmon.daily_pnl_pct,
+                                    self.riskmon.cumulative_fees,
+                                    "weekend_dead", 0, 0,
+                                    self.riskmon.initial_equity, all_time)
+            # 执行网格策略 (低波动适用)
+            if self.grid_manager:
+                self.grid_manager.poll_grids()
+            self._audit_snapshot(acct)
             return
 
         # ── v4.0: 方向死锁检测 —— 长时间无信号+0持仓 → 强制放行一轮 ──
@@ -3702,6 +3408,12 @@ class DeepSeekQuantBot:
                         logger.info(f"  📊 OI仓位系数 {oi_mult:.2f}x (总={pos_mult:.2f}x)")
                 if pos_mult != 1.0:
                     logger.info(f"  📊 排名#{rank}/{total_cands} 总仓位系数 {pos_mult:.2f}x")
+                # ── v4.1: 币种级微调 (保守) ──
+                base = symbol.replace("/USDT:USDT", "")
+                coin_cap = getattr(self, '_coin_position_cap', {}).get(base, 1.0)
+                if coin_cap < 1.0:
+                    pos_mult *= coin_cap
+                    logger.info(f"  🔒 {base} 仓位系数 {pos_mult:.2f}x")
                 result = self.executor.execute(symbol, direction, price, atr, adx, strategy,
                                                position_multiplier=pos_mult,
                                                market_regime=market_regime,
@@ -3717,6 +3429,34 @@ class DeepSeekQuantBot:
                     sym_full = f"{symbol}/USDT:USDT"
                     if sym_full not in self._position_open_times:
                         self._position_open_times[sym_full] = time.time()
+                    # v4.1 fix: 标记本周期新开仓, 防止清理时误删
+                    if not hasattr(self, '_this_cycle_opened'):
+                        self._this_cycle_opened = set()
+                    self._this_cycle_opened.add(sym_full)
+                    # ── v4.1: 记录策略名 + 开仓特征 (平仓日志用) ──
+                    if not hasattr(self, '_position_strategies'):
+                        self._position_strategies = {}
+                    self._position_strategies[sym_full] = strategy
+                    if not hasattr(self, '_open_trade_factors'):
+                        self._open_trade_factors = {}
+                    self._open_trade_factors[sym_full] = {
+                        "confidence": sig.get("confidence", 50),
+                        "strategy": strategy, "direction": direction,
+                        "_kalman_score": sig.get("_kalman_score", 0),
+                        "_kalman_dir": sig.get("_kalman_dir", "flat"),
+                        "_hurst_regime": sig.get("_hurst_regime", "random_walk"),
+                    }
+                    # v4.1: 存储本周期开仓快照 (供 _prev_positions 合并)
+                    if not hasattr(self, '_this_cycle_trades'):
+                        self._this_cycle_trades = {}
+                    self._this_cycle_trades[sym_full] = {
+                        "entryPrice": price,
+                        "markPrice": price,
+                        "contracts": result.get("amount", 0),
+                        "unrealizedPnl": 0,
+                        "margin": result.get("margin_ratio_used", 0),
+                        "info": {"holdSide": "long" if direction == "LONG" else "short"},
+                    }
             else:
                 logger.info(f"❌ {symbol} {direction} → DeepSeek REJECT: {reason}")
                 self.stats["ai_rejects"] += 1
@@ -3778,25 +3518,32 @@ class DeepSeekQuantBot:
             current_syms = {p["symbol"] + "/USDT:USDT" for p in acct["positions_detail"]}
             closed = {
                 sym: pos for sym, pos in prev_positions.items()
-                if sym not in current_syms and sym not in self._closed_positions_done
+                if sym not in current_syms
+                and (sym, round(float(pos.get("entryPrice", 0) or 0), 4), int(abs(float(pos.get("contracts", 0) or 0))), today_str()) not in self._closed_positions_done
             }
             for sym, old_pos in closed.items():
-                self._closed_positions_done.add(sym)  # v4.0: 标记已处理
                 entry = float(old_pos.get("entryPrice", 0) or 0)
+                self._closed_positions_done.add((sym, round(entry, 4), int(contracts), today_str()))  # v4.1: 合约数防误跳
                 mark = float(old_pos.get("markPrice", 0) or 0)
                 contracts = abs(float(old_pos.get("contracts", 0) or 0))
                 side = "LONG" if str(old_pos.get("side") or old_pos.get("info", {}).get("holdSide", "")).lower() == "long" else "SHORT"
 
                 base = sym.replace("/USDT:USDT", "")
+                # v4.1: 获取真实策略名
+                close_strategy = getattr(self, '_position_strategies', {}).get(sym, "pullback")
 
                 # v4.0: 从 Bitget API 获取真实已实现 PnL (不再估算)
                 real_pnl = self.exchange.fetch_closed_position_pnl(sym)
                 if real_pnl and abs(real_pnl["pnl"]) > 0.01:
                     pnl = real_pnl["pnl"]
                     mark = real_pnl.get("exit_price", mark)
+                    # v4.1: 记录实际平仓费用
+                    close_fee = real_pnl.get("fee", 0)
+                    if close_fee > 0:
+                        self.riskmon.record_trade_fees(close_fee)
                     logger.info(
                         f"📊 {base} 真实PnL={pnl:+.2f} USDT "
-                        f"(交易所数据, exit={mark:.4f})"
+                        f"(交易所数据, exit={mark:.4f}, 平仓费={close_fee:.4f})"
                     )
                 else:
                     # 回退: API 不可用时用估算
@@ -3831,45 +3578,94 @@ class DeepSeekQuantBot:
                         strategy="pullback", duration_minutes=dur,
                     )
                 self.tlogger.log_position_close(
-                    symbol=base, direction=side, strategy="pullback",
+                    symbol=base, direction=side, strategy=close_strategy,
                     entry_price=entry, exit_price=mark,
                     pnl=pnl, pnl_pct=pnl_pct,
                     close_reason="DETECTED", holding_hours=0,
                 )
+                # v4.1: 累计已实现 PnL (用于审计对账)
+                self._bot_closed_pnl_total += pnl
+                self._bot_closed_trade_count += 1
                 self.learner.learn_from_closed_trade(
                     symbol=sym, direction=side,
                     entry_price=entry, exit_price=mark,
                     pnl=pnl, pnl_pct=pnl_pct,
-                    strategy="pullback", ai_decision="CONFIRM",
+                    strategy=close_strategy, ai_decision="CONFIRM",
                     market_regime=getattr(self, '_current_regime', 'unknown'),
                 )
+                # ── v4.1: 因子归因 —— 记录开仓特征 vs 实际 PnL ──
+                factors = getattr(self, '_open_trade_factors', {}).pop(sym, None)
+                if factors and self.learner:
+                    factor_scores = {
+                        "technical": factors.get("confidence", 50),
+                        "quant": int(50 + factors.get("_kalman_score", 0) * 30),
+                    }
+                    self.learner.tracker.record_factors(
+                        symbol=base, direction=side,
+                        strategy=factors.get("strategy", "pullback"),
+                        pnl=pnl, factor_scores=factor_scores,
+                    )
+
+                # ── v4.1: 币种止损冷却 + SL 归因 ──
+                if pnl < 0:
+                    if not hasattr(self, '_symbol_cooldowns'):
+                        self._symbol_cooldowns = {}
+                    self._symbol_cooldowns[base] = time.time() + 1800
+                    logger.info(
+                        f"⏳ {base} 亏损 {pnl:+.2f}U → 冷却 30min "
+                        f"(防止重复踩坑)"
+                    )
+                    # SL 归因: 记录止损时价格, 供后续分析止损是否太紧
+                    self.tlogger.log_sl_attribution(
+                        symbol=base, direction=side,
+                        exit_price=mark, pnl=pnl, pnl_pct=pnl_pct,
+                        strategy=close_strategy,
+                    )
         # v4.0: 每日清理平仓记录 (防止内存泄漏)
         if getattr(self, '_closed_date', '') != today_str():
             self._closed_positions_done = set()
             self._closed_date = today_str()
+        # v4.1 fix: 包含本周期新开仓 (acct 是周期初快照, 不含本周期执行的交易)
         self._prev_positions = {
             f"{p['symbol']}/USDT:USDT": {
                 "entryPrice": p["entry_price"],
                 "markPrice": p["mark_price"],
                 "contracts": p["contracts"],
-                "unrealizedPnl": p.get("unrealized_pnl", 0),  # v4.0: 用于 PnL 交叉验证
-                "margin": p.get("margin", 0),                  # v4.0: 用于 pnl_pct 计算
+                "unrealizedPnl": p.get("unrealized_pnl", 0),
+                "margin": p.get("margin", 0),
                 "info": {"holdSide": "long" if p["side"] == "LONG" else "short"},
             }
             for p in acct["positions_detail"]
         }
+        # 合并本周期开仓记录
+        if hasattr(self, '_this_cycle_trades') and self._this_cycle_trades:
+            for sym_full, trade_info in self._this_cycle_trades.items():
+                if sym_full not in self._prev_positions:  # 防止覆盖交易所数据
+                    self._prev_positions[sym_full] = trade_info
         # ── v3.6: 清理已平仓的开仓时间记录 ──
+        # v4.1 fix: 同周期新开仓位不能删 (acct是周期初快照,不含本周期新开仓)
         current_syms = {f"{p['symbol']}/USDT:USDT" for p in acct["positions_detail"]}
+        this_cycle_opened = getattr(self, '_this_cycle_opened', set())
         for sym in list(self._position_open_times.keys()):
-            if sym not in current_syms:
+            if sym not in current_syms and sym not in this_cycle_opened:
                 del self._position_open_times[sym]
-        # v3.4: 持久化仓位快照，重启后可检测平仓
+        # 清理本周期记录
+        if hasattr(self, '_this_cycle_opened'):
+            self._this_cycle_opened.clear()
+        if hasattr(self, '_this_cycle_trades'):
+            self._this_cycle_trades.clear()
+        # v3.4: 持久化仓位快照 + v4.1: 审计状态，重启后可恢复
         try:
             tmp = "positions_state.json.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({
                     "updated": now_iso(),
                     "positions": self._prev_positions,
+                    "audit": {  # v4.1: 跨重启 PnL 追踪
+                        "bot_closed_pnl_total": round(self._bot_closed_pnl_total, 4),
+                        "bot_closed_trade_count": self._bot_closed_trade_count,
+                        "cumulative_fees": round(self.riskmon.cumulative_fees, 4),
+                    },
                 }, f, ensure_ascii=False)
             os.replace(tmp, "positions_state.json")
         except Exception:
@@ -4047,12 +3843,20 @@ class DeepSeekQuantBot:
                                 acct["equity"], acct["unrealized_pnl"],
                                 self.riskmon.initial_equity, all_time)
 
+        # ── v4.1: 独立资金审计 ──
+        self._audit_snapshot(acct)
+
         # ── v2.7: 更新状态文件，复用预取 acct ──
         self._update_status_file(acct)
 
     def shutdown(self):
         """优雅退出: 写最终状态、关闭连接、记录停止事件"""
         logger.info("🛑 正在关闭 …")
+        # ── v4.1: 持久化审计记录 ──
+        try:
+            self.equity_auditor.save()
+        except Exception:
+            pass
         # ── v3.0: 取消所有网格 ──
         if self.grid_manager:
             try:
@@ -4091,6 +3895,19 @@ class DeepSeekQuantBot:
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 prev = json.load(f)
+            # v4.1: 恢复审计累计状态 (跨重启 PnL 追踪)
+            audit_state = prev.get("audit", {})
+            if audit_state:
+                saved_pnl = audit_state.get("bot_closed_pnl_total", 0)
+                saved_count = audit_state.get("bot_closed_trade_count", 0)
+                saved_fees = audit_state.get("cumulative_fees", 0)
+                if saved_pnl != 0:
+                    self._bot_closed_pnl_total = saved_pnl
+                    self._bot_closed_trade_count = saved_count
+                    logger.info(
+                        f"📋 审计状态恢复: PnL累计={saved_pnl:+.2f} "
+                        f"({saved_count}笔) 手续费={saved_fees:.2f}"
+                    )
             prev_positions = prev.get("positions", {})
             if not prev_positions:
                 return
@@ -4101,15 +3918,19 @@ class DeepSeekQuantBot:
                     mark = float(old_pos.get("markPrice", 0) or 0)
                     contracts = abs(float(old_pos.get("contracts", 0) or 0))
                     side = "LONG" if str(old_pos.get("side") or old_pos.get("info", {}).get("holdSide", "")).lower() == "long" else "SHORT"
-                    pnl = (mark - entry) * contracts if side == "LONG" else (entry - mark) * contracts
-                    pnl_pct = (pnl / (entry * contracts / self.config.leverage)) * 100 if (entry * contracts) > 0 else 0
+                    csize = self.exchange.get_contract_size(sym)
+                    pnl = (mark - entry) * contracts * csize if side == "LONG" else (entry - mark) * contracts * csize
+                    position_value = entry * contracts * csize
+                    pnl_pct = (pnl / (position_value / self.config.leverage)) * 100 if position_value > 0 else 0
                     logger.info(
                         f"📋 检测到停机期平仓: {sym} {side} "
                         f"入场{entry:.4f} 估算pnl={pnl:+.2f} ({pnl_pct:+.1f}%)"
                     )
+                    # v4.1 fix: 停机期 PnL 也要计入审计累计
+                    self._bot_closed_pnl_total += pnl
+                    self._bot_closed_trade_count += 1
                     if self.learner:
                         base = sym.replace("/USDT:USDT", "")
-                        # v4.0: learn_from_closed_trade 内部会调 record_closed_trade，不再重复调用
                         try:
                             self.learner.learn_from_closed_trade(
                                 symbol=base, direction=side,
@@ -4217,7 +4038,7 @@ class DeepSeekQuantBot:
         self._ensure_all_positions_protected()
 
         # 注册 SIGTERM 信号处理 (容器优雅关闭)
-        def _handle_signal(signum, frame):
+        def _handle_signal(signum, _frame):
             logger.info(f"\n📡 收到信号 {signum}，优雅退出 …")
             self.shutdown()
             sys.exit(0)

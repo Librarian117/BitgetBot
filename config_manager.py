@@ -133,6 +133,27 @@ class ConfigManager:
         self.deepseek_timeout = 45
         self.deepseek_enable_tools = os.getenv("DEEPSEEK_ENABLE_TOOLS", "true").lower() == "true"
 
+        # ── v4.1: AI 研究层开关 ──
+        # 总开关: false=完全关闭所有 AI API 调用 (信号解释/复盘/审查/诊断)
+        self.deepseek_master_switch = os.getenv("DEEPSEEK_MASTER_SWITCH", "true").lower() == "true"
+        self.deepseek_explain_signal_enabled = os.getenv("DEEPSEEK_EXPLAIN_SIGNAL_ENABLED", "true").lower() == "true"
+        self.deepseek_genetic_opinion_enabled = os.getenv("DEEPSEEK_GENETIC_OPINION_ENABLED", "true").lower() == "true"
+        self.deepseek_reflection_enabled = os.getenv("DEEPSEEK_REFLECTION_ENABLED", "true").lower() == "true"
+        self.deepseek_rule_generation_enabled = os.getenv("DEEPSEEK_RULE_GENERATION_ENABLED", "true").lower() == "true"
+        self.deepseek_periodic_review_enabled = os.getenv("DEEPSEEK_PERIODIC_REVIEW_ENABLED", "true").lower() == "true"
+        self.deepseek_filter_analysis_enabled = os.getenv("DEEPSEEK_FILTER_ANALYSIS_ENABLED", "true").lower() == "true"
+
+        # 总开关覆盖所有子开关
+        if not self.deepseek_master_switch:
+            for attr in ("deepseek_explain_signal_enabled", "deepseek_genetic_opinion_enabled",
+                         "deepseek_reflection_enabled", "deepseek_rule_generation_enabled",
+                         "deepseek_periodic_review_enabled", "deepseek_filter_analysis_enabled"):
+                setattr(self, attr, False)
+            logger.info("🔌 DEEPSEEK_MASTER_SWITCH=false — 所有 AI API 调用已关闭")
+
+        # ── v4.1: AI 决策层开关 (仅用于回退兼容) ──
+        self.deepseek_signal_review_enabled = os.getenv("DEEPSEEK_SIGNAL_REVIEW_ENABLED", "false").lower() == "true"
+
         # ── 模型废弃提醒 ──
         if self.deepseek_model == "deepseek-chat":
             logger.warning(

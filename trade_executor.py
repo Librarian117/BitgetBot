@@ -113,8 +113,8 @@ class TradeExecutor:
             )
 
         margin = balance * margin_ratio * kelly_mult * position_multiplier * regime_pos_mult
-        # v4.0: 单仓硬上限 8% (防止多个乘数叠加后仓位过大)
-        MAX_MARGIN_PCT = 0.08
+        # v4.0: 单仓硬上限 8% → v4.1 降到 5% (防止单币反转造成大亏)
+        MAX_MARGIN_PCT = 0.05
         if margin > balance * MAX_MARGIN_PCT:
             logger.warning(
                 f"⚠️  仓位超限: {margin:.0f}U ({margin/balance*100:.1f}%) "

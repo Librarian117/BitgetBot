@@ -92,15 +92,3 @@ class SessionManager:
                 "margin_mult": 0.5, "vol_ratio": max(0.5, base_vol * 0.4),
                 "sl_mult": 1.8, "max_positions": 3,
                 "advice": "全球真空-收紧+宽止损防噪音"}
-
-    @staticmethod
-    def effective_params(config) -> Dict[str, Any]:
-        session = SessionManager.get_session(config.adx_threshold, config.vol_ratio_threshold)
-        return {
-            **session,
-            "adx_threshold": session["adx_threshold"],
-            "margin_min": config.adx_margin_min * session["margin_mult"],
-            "margin_max": config.adx_margin_max * session["margin_mult"],
-            "vol_ratio": session["vol_ratio"],
-            "sl_atr_mult": config.sl_atr_mult * session["sl_mult"],
-        }
