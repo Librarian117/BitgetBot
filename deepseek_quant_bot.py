@@ -865,12 +865,9 @@ class DeepSeekQuantBot:
                 or (is_bullish_trend and kalman_dir == "down")
             )
             if ema_kalman_conflict and abs(kalman_score) > 0.3:
-                # 卡尔曼强信号与EMA冲突 → 信任卡尔曼(无滞后), 重置趋势判断
-                logger.info(f"🔧 {symbol} EMA-Kalman冲突 → Kalman={kalman_dir}({kalman_score})")
-                if kalman_dir == "up":
-                    is_bearish_trend, is_bullish_trend = False, True
-                elif kalman_dir == "down":
-                    is_bearish_trend, is_bullish_trend = True, False
+                # v4.1 fix: 卡尔曼短窗口(50bar≈4h)不可覆盖EMA200长期趋势
+                # 冲突时记录日志，保持EMA原判 (避免小时级反弹误翻方向)
+                logger.info(f"🔧 {symbol} EMA-Kalman冲突 → Kalman={kalman_dir}({kalman_score}) 保持EMA趋势")
 
             # v4.0: 大趋势偏向 — 熊市不产LONG信号(必被过滤), 牛市不产SHORT
             bearish_bias = is_bearish_trend
