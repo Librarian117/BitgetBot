@@ -973,14 +973,24 @@ class DeepSeekQuantBot:
                     or (direction == "LONG" and kalman_dir == "down")
                 )
                 if kalman_conflict and abs(kalman_score) > 0.15:
-                    self.tlogger.log_filter_reject(symbol, "KALMAN_CONFLICT",
-                        f"信号{direction} vs Kalman={kalman_dir}({kalman_score:.2f})",
-                        direction=direction, strategy=strategy)
-                    logger.info(
-                        f"🔧 {symbol} {direction} 信号与 Kalman 冲突 "
-                        f"(Kalman={kalman_dir} score={kalman_score:.2f})，拒绝"
-                    )
-                    return None
+                    # v4.1: EMA-Kalman死锁时 — 降级为counter_trend而非直接拒绝
+                    # 死锁场景: EMA=熊市(只允许SHORT) + Kalman=涨(拒绝SHORT) → 0候选
+                    if ema_kalman_conflict:
+                        logger.info(
+                            f"🔓 {symbol} {direction} EMA-Kalman死锁 → "
+                            f"降级为counter_trend (Kalman={kalman_dir} vs EMA)"
+                        )
+                        strategy = "counter_trend"
+                        # 不return, 继续评分 — 后续confidence>=65才放行
+                    else:
+                        self.tlogger.log_filter_reject(symbol, "KALMAN_CONFLICT",
+                            f"信号{direction} vs Kalman={kalman_dir}({kalman_score:.2f})",
+                            direction=direction, strategy=strategy)
+                        logger.info(
+                            f"🔧 {symbol} {direction} 信号与 Kalman 冲突 "
+                            f"(Kalman={kalman_dir} score={kalman_score:.2f})，拒绝"
+                        )
+                        return None
                 elif kalman_conflict:
                     # Kalman 弱信号冲突 → 降级为 counter_trend (降低仓位)
                     logger.info(
@@ -1286,6 +1296,9 @@ class DeepSeekQuantBot:
             # ── v4.1: 最低置信度过滤 —— 弱信号不开仓 ──
             # counter_trend 作为逆势机会可稍低, 趋势策略需更高置信度
             min_conf = 45 if strategy == "counter_trend" else 55
+            # v4.1: EMA-Kalman死锁降级的counter_trend需更高置信度
+            if strategy == "counter_trend" and ema_kalman_conflict:
+                min_conf = 65
             if confidence < min_conf:
                 logger.info(
                     f"🔇 {symbol} {direction} {strategy} 置信度{confidence}<{min_conf}，"
@@ -2046,6 +2059,10 @@ class DeepSeekQuantBot:
                         logger.info(f"  📊 OI仓位系数 {oi_mult:.2f}x (总={pos_mult:.2f}x)")
                 if pos_mult != 1.0:
                     logger.info(f"  📊 排名#{rank}/{total_cands} 总仓位系数 {pos_mult:.2f}x")
+                # v4.1: EMA-Kalman死锁降级的counter_trend → 半仓
+                if strategy == "counter_trend":
+                    pos_mult *= 0.5
+                    logger.info(f"  🔒 counter_trend半仓: 仓位系数 {pos_mult:.2f}x")
                 # ── v4.1: 币种级微调 (保守) ──
                 base = symbol.replace("/USDT:USDT", "")
                 coin_cap = getattr(self, '_coin_position_cap', {}).get(base, 1.0)
