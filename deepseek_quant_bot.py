@@ -1,35 +1,29 @@
 #!/usr/bin/env python3
 """
-deepseek_quant_bot.py — AI + 量化混合交易策略 v2.7
-====================================================
-架构：高度模块化，专业风控，DeepSeek V4 AI 决策确认
+deepseek_quant_bot.py — 量化信号 + AI 研究顾问混合交易机器人 v4.1
+=====================================================================
+架构：高度模块化，专业风控，DeepSeek V4 AI 研究层
 
-v2.0 新特性:
-  - 附带 SL/TP 下单（消除裸仓空窗期）
-  - 手续费计算 & 追踪
-  - ADX 动态仓位管理
-  - 最大并发持仓限制 + 滑点缓冲
-  - 多时间周期趋势分析（1h/4h 大局观）
-  - 市场情绪 & 新闻分析（cryptocurrency.cv + F&G Index）
-  - 部分止盈（50%@2×ATR + 50%@3×ATR）
-  - DeepSeek Function Call 按需查询市场情绪
+Phase 1 重构: 5 个服务类已提取为独立模块
+  - indicator_calculator.py  — IndicatorCalculator (本地量化计算)
+  - market_context.py        — MarketContextManager (市场情绪)
+  - deepseek_analyst.py      — DeepSeekAnalyst (AI 研究层)
+  - trade_logger.py          — TradeLogger (日志持久化)
+  - risk_monitor.py          — RiskMonitor (日内风控)
 
-模块清单：
-  1. ConfigManager        — 环境变量 & 策略参数
-  2. ExchangeInterface    — Bitget 沙箱封装 (U本位合约)
-  3. IndicatorCalculator  — 本地量化计算 (EMA200 / RSI14 / ATR14 / ADX14)
-  4. DeepSeekAnalyst      — AI 信号审核 (含多TF + 市场情绪上下文)
-  5. MarketContextManager — 市场情绪 & 新闻管理
-  6. TradeLogger          — 日志持久化 (JSONL)
-  7. RiskMonitor          — 日内风控 (亏损锁 + 日重置 + 手续费追踪)
-  8. TradeExecutor        — 风控 & 下单执行 (动态仓位 + 部分止盈)
-  9. DeepSeekQuantBot     — 主循环编排器 (每 5 分钟)
+外部模块 (18个):
+  config_manager, exchange_interface, trade_executor, signal_scorer,
+  session_manager, flow_monitor, genetic_evolver, self_learner,
+  safety_manager, health_monitor, portfolio_manager, trailing_sl,
+  grid_strategy, equity_auditor, news_integration, performance_tracker,
+  markov_regime, quant_math
+
+主控: DeepSeekQuantBot — 扫描→多TF→市场状态→量化评分→风控→下单 编排器
 """
 
 import json
 import logging
 import os
-import re
 import signal
 import sys
 import tempfile
@@ -40,7 +34,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import requests
 
 from config_manager import ConfigManager
 from equity_auditor import EquityAuditor
@@ -48,6 +41,13 @@ from exchange_interface import ExchangeInterface
 from quant_math import compute_quant_signals
 from session_manager import SessionManager
 from trade_executor import TradeExecutor
+
+# ── Phase 1: 服务类提取 ──
+from indicator_calculator import IndicatorCalculator
+from market_context import MarketContextManager
+from deepseek_analyst import DeepSeekAnalyst
+from trade_logger import TradeLogger
+from risk_monitor import RiskMonitor
 
 # ============================================================================
 # ◎ SessionManager — 交易时段感知 (v2.3)
@@ -64,1117 +64,12 @@ if sys.platform == 'win32':
 
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATE)
 
-# ============================================================================
-# 1. ConfigManager — 配置管理
-# ============================================================================
 logger = logging.getLogger("QuantBot")
 logging.getLogger("ccxt").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
+# ── Phase 1: 5 个服务类已提取到独立模块 (indicator_calculator, market_context, deepseek_analyst, trade_logger, risk_monitor) ──
 
-# ============================================================================
-# 1. IndicatorCalculator — 本地量化计算
-# ============================================================================
-class IndicatorCalculator:
-    """
-    纯 Python + pandas 本地计算；
-    不依赖交易所 API 的指标数据。
-
-    指标：
-      - EMA(N)     指数移动均线
-      - RSI(14)    相对强弱指标 (Wilder smoothing)
-      - ATR(14)    平均真实波幅 (Wilder smoothing)
-      - ADX(14)    平均趋向指数 (Wilder smoothing)
-    """
-
-    def __init__(self, config: ConfigManager):
-        self.ema_period = config.ema_period
-        self.rsi_period = config.rsi_period
-        self.atr_period = config.atr_period
-        self.adx_period = config.adx_period
-
-    def compute_all(self, df: pd.DataFrame) -> pd.DataFrame:
-        """输入 OHLCV DataFrame，追加 ema, rsi, atr, adx, macd, bb 列"""
-        df = df.copy()
-        close = df["close"]
-
-        df["ema"] = close.ewm(span=self.ema_period, adjust=False).mean()
-        df["rsi"] = self._wilder_rsi(close, self.rsi_period)
-        df["atr"] = self._wilder_atr(df, self.atr_period)
-        df["adx"] = self._wilder_adx(df, self.adx_period)
-
-        # ── v3.2: MACD (12, 26, 9) ──
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        df["macd"] = ema12 - ema26
-        df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-        df["macd_hist"] = df["macd"] - df["macd_signal"]
-
-        # ── v3.2: Bollinger Bands (20, 2) ──
-        bb_mean = close.rolling(20).mean()
-        bb_std = close.rolling(20).std()
-        df["bb_upper"] = bb_mean + 2 * bb_std
-        df["bb_lower"] = bb_mean - 2 * bb_std
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / bb_mean  # 带宽
-
-        return df
-
-    def compute_tf_indicators(self, df: pd.DataFrame, ema_period: int = 50) -> pd.DataFrame:
-        """为多时间周期计算简化指标 (EMA50 + ATR + ADX)"""
-        df = df.copy()
-        close = df["close"]
-
-        df["ema"] = close.ewm(span=ema_period, adjust=False).mean()
-        df["atr"] = self._wilder_atr(df, self.atr_period)
-        df["adx"] = self._wilder_adx(df, self.adx_period)
-
-        return df
-
-    @staticmethod
-    def _wilder_adx(df: pd.DataFrame, period: int) -> pd.Series:
-        """Wilder's ADX — 平均趋向指数"""
-        high, low, close = df["high"], df["low"], df["close"]
-        prev_high = high.shift(1)
-        prev_low = low.shift(1)
-        prev_close = close.shift(1)
-
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-        up_move = high - prev_high
-        down_move = prev_low - low
-
-        plus_dm = pd.Series(0.0, index=df.index)
-        minus_dm = pd.Series(0.0, index=df.index)
-
-        mask_plus = (up_move > down_move) & (up_move > 0)
-        mask_minus = (down_move > up_move) & (down_move > 0)
-
-        plus_dm[mask_plus] = up_move[mask_plus]
-        minus_dm[mask_minus] = down_move[mask_minus]
-
-        smooth_plus_dm = plus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-        smooth_minus_dm = minus_dm.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-        plus_di = 100.0 * smooth_plus_dm / atr.replace(0, np.nan)
-        minus_di = 100.0 * smooth_minus_dm / atr.replace(0, np.nan)
-
-        di_sum = plus_di + minus_di
-        dx = (plus_di - minus_di).abs() / di_sum.replace(0, np.nan) * 100.0
-
-        adx = dx.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-        return adx
-
-    @staticmethod
-    def _wilder_rsi(series: pd.Series, period: int) -> pd.Series:
-        """Wilder's RSI"""
-        delta = series.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-
-        avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-        avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100.0 - (100.0 / (1.0 + rs))
-        rsi[avg_loss == 0] = 100.0
-        return rsi
-
-    @staticmethod
-    def _wilder_atr(df: pd.DataFrame, period: int) -> pd.Series:
-        """Wilder's ATR"""
-        high, low, close = df["high"], df["low"], df["close"]
-        prev_close = close.shift(1)
-
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-
-        true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = true_range.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
-        return atr
-
-
-# ============================================================================
-# 4. MarketContextManager — 市场情绪 & 新闻管理 (v2 新增)
-# ============================================================================
-class MarketContextManager:
-    """
-    市场情绪与新闻管理器。
-
-    数据源:
-      - CoinGecko /search/trending (免费, 无需 API Key)
-      - alternative.me Fear & Greed Index (免费)
-
-    缓存策略: 每 N 小时刷新一次 (默认4小时)，注入 DeepSeek system prompt
-    """
-
-    def __init__(self, cache_ttl: int = 14400):
-        self.trending_cache: list = []
-        self._trending_details: list = []
-        self.fng_cache: dict = {}
-        self.last_refresh: float = 0.0
-        self.cache_ttl: int = cache_ttl
-        self._initialized = False
-
-    def _should_refresh(self) -> bool:
-        return (time.time() - self.last_refresh) > self.cache_ttl
-
-    def ensure_fresh(self):
-        """确保缓存是最新的（如果需要则刷新）"""
-        if self._should_refresh() or not self._initialized:
-            self.refresh_all()
-
-    def refresh_all(self):
-        """刷新所有缓存数据"""
-        self._fetch_trending()
-        self._fetch_fng()
-        self.last_refresh = time.time()
-        self._initialized = True
-        logger.info(
-            f"市场情绪数据已刷新 "
-            f"(热门币种={len(self.trending_cache)}个, "
-            f"F&G={self.fng_cache.get('value', 'N/A')})"
-        )
-
-    def _fetch_trending(self):
-        """获取 CoinGecko 热门币种"""
-        try:
-            resp = requests.get(
-                "https://api.coingecko.com/api/v3/search/trending",
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                coins = data.get("coins", [])
-                self.trending_cache = [
-                    c.get("item", {}).get("name", "")
-                    for c in coins[:15]
-                    if c.get("item", {}).get("name")
-                ]
-                self._trending_details = [
-                    {
-                        "name": c.get("item", {}).get("name", ""),
-                        "symbol": c.get("item", {}).get("symbol", ""),
-                        "market_cap_rank": c.get("item", {}).get("market_cap_rank", ""),
-                        "score": c.get("item", {}).get("score", ""),
-                    }
-                    for c in coins[:10]
-                ]
-            else:
-                logger.warning(f"CoinGecko trending 返回 {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"获取 trending 失败: {e}")
-
-    def _fetch_fng(self):
-        """获取恐惧与贪婪指数"""
-        try:
-            resp = requests.get(
-                "https://api.alternative.me/fng/",
-                params={"limit": 1},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("data"):
-                    entry = data["data"][0]
-                    self.fng_cache = {
-                        "value": int(entry.get("value", 50)),
-                        "classification": entry.get("value_classification", "Neutral"),
-                    }
-        except Exception as e:
-            logger.warning(f"获取F&G失败: {e}")
-
-    def get_system_context(self) -> str:
-        """生成市场上下文文本，用于注入 DeepSeek system prompt"""
-        self.ensure_fresh()
-        lines = []
-
-        # Fear & Greed
-        if self.fng_cache:
-            fg = self.fng_cache
-            fg_val = fg.get("value", 50)
-            if fg_val <= 25:
-                fg_advice = "极度恐惧 -> 可能接近底部，考虑逆势做多机会"
-            elif fg_val >= 75:
-                fg_advice = "极度贪婪 -> 可能接近顶部，注意回调风险"
-            elif fg_val >= 55:
-                fg_advice = "偏贪婪 -> 顺势操作但控制仓位"
-            else:
-                fg_advice = "偏恐惧 -> 市场谨慎，等待明确信号"
-            lines.append(
-                f"恐惧与贪婪指数: {fg_val}/100 ({fg.get('classification')}) -- {fg_advice}"
-            )
-
-        # Trending coins (market heat indicator)
-        if self.trending_cache:
-            lines.append(
-                f"CoinGecko 当前热门币种: {', '.join(self.trending_cache[:8])}"
-            )
-
-        return "\n".join(lines) if lines else ""
-
-    def get_sentiment_for_symbol(self, symbol: str) -> str:
-        """获取特定币种的市场数据 (供 DeepSeek Function Call 使用)"""
-        base = symbol.split("/")[0].lower()
-        result = {"asset": base.upper()}
-
-        # 1. CoinGecko 市场数据
-        try:
-            resp = requests.get(
-                f"https://api.coingecko.com/api/v3/coins/{base}",
-                params={"localization": "false", "tickers": "false",
-                        "community_data": "false", "developer_data": "false"},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                market = data.get("market_data", {})
-                result["current_price_usd"] = market.get("current_price", {}).get("usd")
-                result["market_cap_rank"] = data.get("market_cap_rank")
-                result["price_change_24h_pct"] = market.get("price_change_percentage_24h")
-                result["price_change_7d_pct"] = market.get("price_change_percentage_7d")
-                result["total_volume_24h"] = market.get("total_volume", {}).get("usd")
-                # 情绪相关
-                sentiment = data.get("sentiment_votes_up_percentage")
-                if sentiment:
-                    result["community_sentiment_up_pct"] = round(sentiment, 1)
-            else:
-                # Fallback to search endpoint
-                resp2 = requests.get(
-                    "https://api.coingecko.com/api/v3/search",
-                    params={"query": base}, timeout=10,
-                )
-                if resp2.status_code == 200:
-                    coins = resp2.json().get("coins", [])
-                    if coins:
-                        top = coins[0]
-                        result["name"] = top.get("name")
-                        result["market_cap_rank"] = top.get("market_cap_rank")
-        except Exception:
-            logger.debug("⚠️  静默异常", exc_info=True)
-
-        # 2. 是否在热门榜单中
-        if base.upper() in [t.upper() for t in self.trending_cache]:
-            result["is_trending"] = True
-
-        return json.dumps(result, ensure_ascii=False)
-
-# ============================================================================
-# 5. DeepSeekAnalyst — AI 信号审核
-# ============================================================================
-class DeepSeekAnalyst:
-    """调用 DeepSeek API，审核量化信号（v2: 含多TF + 市场情绪上下文 + 可选 Function Call）"""
-
-    # DeepSeek Function Call 定义
-    TOOLS = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_crypto_sentiment",
-                "description": "获取某个加密货币的当前市场情绪、新闻热度和社交情绪数据",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "asset": {
-                            "type": "string",
-                            "description": "资产代码，如 BTC, ETH, SOL, BNB, XRP 等",
-                        },
-                    },
-                    "required": ["asset"],
-                },
-            },
-        }
-    ]
-
-    def __init__(self, config: ConfigManager, market_ctx: Optional[MarketContextManager] = None):
-        self.config = config
-        self.market_ctx = market_ctx
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {config.deepseek_api_key}",
-            "Content-Type": "application/json",
-        })
-        # ── v2.7: 断路器 (连续失败 N 次后本周期跳过 AI，避免 DeepSeek 宕机时卡死) ──
-        self._consecutive_failures: int = 0
-        self._circuit_open: bool = False
-        self._circuit_threshold: int = 3
-        # ── v3.0: 新闻上下文 ──
-        self.news_context: str = ""
-        # ── v3.1: 交易智慧上下文 ──
-        self.wisdom_context: str = ""
-        # ── v4.1: 最后一次 AI 原始回复（用于解析失败时诊断） ──
-        self.last_raw_info: Dict[str, Any] = {}
-
-    def circuit_breaker_reset(self):
-        """每周期初重置断路器"""
-        self._consecutive_failures = 0
-        self._circuit_open = False
-
-    def circuit_breaker_open(self) -> bool:
-        """断路器是否已熔断"""
-        return self._circuit_open
-
-    def close(self):
-        """关闭 HTTP 会话 (v2.5)"""
-        try:
-            self.session.close()
-        except Exception:
-            logger.debug("⚠️  静默异常", exc_info=True)
-
-    @staticmethod
-    def _merge_content_reasoning(msg: Dict[str, Any]) -> str:
-        """v4.1: 智能合并 DeepSeek 推理模型的 content + reasoning_content。
-
-        策略: 优先使用 content（最终答案，通常含 JSON），
-        仅在 content 无 JSON 时才合并 reasoning_content。
-        避免 reasoning 中的分析文本污染 JSON 解析器。
-
-        返回: (merged_text, source_flag)
-          source_flag: "content" | "reasoning" | "merged" | "empty"
-        """
-        c = (msg.get("content") or "").strip()
-        r = (msg.get("reasoning_content") or "").strip()
-
-        # 1. content 中有 JSON → 只用 content（reasoning 是噪音）
-        if c and '{' in c:
-            return c
-        # 2. content 为空但 reasoning 有 JSON → 用 reasoning
-        if r and '{' in r:
-            return r
-        # 3. 都有但 content 无 JSON → 合并（reasoning 可能在文本中含 JSON）
-        if c and r:
-            return f"{c}\n{r}"
-        # 4. 只有其中一个
-        return c or r
-
-    @staticmethod
-    def _extract_json(raw: str, context: str = "entry_review") -> Dict[str, Any]:
-        """从可能包含 markdown 代码块或额外文本中提取 JSON。
-
-        Args:
-            raw: AI 原始回复文本
-            context: "entry_review" | "position_review" | "market_anomaly" | "genetic_evolve"
-                     控制解析失败时的默认决策
-        """
-        # v3.7: context 决定默认值 — entry_review 默认 REJECT (宁可错过),
-        #       position_review 默认 HOLD (保持现状)
-
-        candidates = []
-
-        # 1. 提取 ```json ... ``` 或 ``` ... ``` 代码块
-        for m in re.finditer(r'```(?:json)?\s*\n?(.*?)```', raw, re.DOTALL):
-            candidates.append(m.group(1).strip())
-
-        # 2. v4.1: 尾部优先 — AI 被告知"JSON 结尾"，从末尾提取最可靠
-        #    从最后 2000→1000→500→200 字符逐步收缩窗口查找完整 JSON
-        if not candidates:
-            for window in (2000, 1000, 500, 200):
-                tail = raw[-window:] if len(raw) > window else raw
-                # 在尾部找所有 { } 对，从最长的开始尝试
-                for m in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', tail, re.DOTALL):
-                    cand = m.group(0)
-                    if '"decision"' in cand:
-                        candidates.append(cand)
-                if candidates:
-                    break  # 找到就停，优先用大窗口的结果
-
-        # 3. 如果没有从尾部找到，尝试正则匹配 JSON 对象 (v3.7: 支持嵌套)
-        if not candidates:
-            for m in re.finditer(r'\{[^{}]*"decision"[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw, re.DOTALL):
-                candidates.append(m.group(0))
-
-        # 4. 尝试每个候选（尾部优先的排在前面）
-        for cand in candidates:
-            try:
-                return json.loads(cand)
-            except json.JSONDecodeError:
-                continue
-
-        # 5. 直接解析全文本
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-
-        # 5. 找第一个 { 到最后一个 }
-        try:
-            start = raw.index("{")
-            end = raw.rindex("}") + 1
-            return json.loads(raw[start:end])
-        except (ValueError, json.JSONDecodeError):
-            pass
-
-        # 5.5 v4.0: JSON 修复步骤 (从 genetic_evolver v2.0 移植)
-        for m in re.finditer(r'\{.*\}', raw, re.DOTALL):
-            candidate = m.group(0)
-            # 5a. 直接试
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-            # 5b. 移除尾部逗号
-            fixed = re.sub(r',\s*}', '}', candidate)
-            fixed = re.sub(r',\s*]', ']', fixed)
-            try:
-                return json.loads(fixed)
-            except json.JSONDecodeError:
-                pass
-            # 5c. 单引号 → 双引号
-            fixed = re.sub(r"'([^']*)'\s*:", r'"\1":', candidate)
-            fixed = re.sub(r":\s*'([^']*)'", r': "\1"', fixed)
-            try:
-                return json.loads(fixed)
-            except json.JSONDecodeError:
-                continue
-
-        # 6. v4.0: 智能关键词推断 — 加权评分，尾部优先，防误判
-        raw_lower = raw.lower()
-        # 取最后 500 字符(结论部分)权重 ×3，全文权重 ×1
-        tail = raw_lower[-500:] if len(raw_lower) > 500 else raw_lower
-
-        def _score_keywords(text, weight, keywords):
-            """v4.0 fix: 防误判 — 关键词前有"不/未/否/禁止"时不计数"""
-            score = 0
-            for kw in keywords:
-                idx = text.find(kw)
-                if idx == -1:
-                    continue
-                # 检查前几个字符是否有否定词
-                before = text[max(0, idx - 4):idx]
-                negated = any(n in before for n in ("不", "未", "否", "无", "非"))
-                if not negated:
-                    score += weight
-            return score
-
-        confirm_score = _score_keywords(tail, 3, ["confirm", "确认", "通过", "建议开仓", "建议做多", "建议做空", "可以开仓"]) \
-            + _score_keywords(raw_lower, 1, ["confirm", "确认", "通过", "建议开仓", "建议做多", "建议做空"])
-
-        reject_score = _score_keywords(tail, 3, ["reject", "拒绝", "不建议", "观望", "放弃", "风险过大", "不通过", "不开仓"]) \
-            + _score_keywords(raw_lower, 1, ["reject", "拒绝", "不建议", "观望", "放弃", "风险过大"])
-
-        close_score = _score_keywords(tail, 3, ["close", "平仓", "止盈", "止损退出", "建议平仓", "立即平仓", "锁仓", "离场", "出场"]) \
-            + _score_keywords(raw_lower, 1, ["close", "平仓", "止盈", "止损退出", "建议平仓"])
-
-        hold_score = _score_keywords(tail, 3, ["hold", "持有", "继续持有", "不动", "维持", "等待", "持仓", "暂持"]) \
-            + _score_keywords(raw_lower, 1, ["hold", "持有", "继续持有", "持仓", "不动"])
-
-        # 去重: 如果 confirm 出现在 "不建议开仓" 中，不要误判
-        if "不建议开仓" in raw_lower or "不confirm" in raw_lower:
-            confirm_score = max(0, confirm_score - 3)
-        if "不平仓" in raw_lower or "不close" in raw_lower:
-            close_score = max(0, close_score - 3)
-
-        max_score = max(confirm_score, reject_score, close_score, hold_score)
-        if max_score >= 4:  # 需要足够的置信度
-            if confirm_score == max_score:
-                logger.warning(f"⚠️  关键词推断 CONFIRM (score={confirm_score})")
-                return {"decision": "CONFIRM", "reason": f"文本推断确认(得分{confirm_score})"}
-            if reject_score == max_score:
-                logger.warning(f"⚠️  关键词推断 REJECT (score={reject_score})")
-                return {"decision": "REJECT", "reason": f"文本推断拒绝(得分{reject_score})"}
-            if close_score == max_score:
-                logger.warning(f"⚠️  关键词推断 CLOSE (score={close_score})")
-                return {"decision": "CLOSE", "reason": f"文本推断平仓(得分{close_score})"}
-            if hold_score == max_score:
-                logger.warning(f"⚠️  关键词推断 HOLD (score={hold_score})")
-                return {"decision": "HOLD", "reason": f"文本推断持有(得分{hold_score})"}
-
-        # 6.5 v4.0: 入场信号规则回退 — 关键词不足以判断时，用技术指标文本推断
-        if context == "entry_review" and max_score < 4:
-            indicators_ok = 0
-            # ADX 强趋势 (>25)
-            adx_m = re.search(r'(?:ADX|adx).*?(\d+\.?\d*)', raw)
-            if adx_m and float(adx_m.group(1)) > 25:
-                indicators_ok += 1
-            # RSI 在合理区间 (30-70)
-            rsi_m = re.search(r'(?:RSI|rsi).*?(\d+\.?\d*)', raw)
-            if rsi_m and 30 < float(rsi_m.group(1)) < 70:
-                indicators_ok += 1
-            # EMA 趋势支持 (价格在EMA之上或提到"EMA"+"之上/上方")
-            if re.search(r'(?:EMA|ema).*(?:之上|上方|above)', raw):
-                indicators_ok += 1
-            # 成交量确认 (提到"放量"、"量比"、"volume")
-            if re.search(r'(?:成交量|volume|Vol|放量|量比).*(?:放大|放量|突破|高于|充足)', raw, re.IGNORECASE):
-                indicators_ok += 1
-            if indicators_ok >= 3:
-                logger.warning(f"📋 规则回退 CONFIRM ({indicators_ok}/4指标)")
-                return {"decision": "CONFIRM", "reason": f"技术指标推断确认({indicators_ok}/4)"}
-            elif indicators_ok <= 1:
-                logger.warning(f"📋 规则回退 REJECT ({indicators_ok}/4指标)")
-                return {"decision": "REJECT", "reason": f"技术指标推断拒绝({indicators_ok}/4)"}
-
-        # 7. 最后手段：用正则暴力提取 decision 字段
-        import re as _re
-        m = _re.search(r'(?:decision|决定)[:\s]*["\']?\s*(CONFIRM|REJECT|CLOSE|HOLD|confirm|reject|close|hold)', raw, _re.IGNORECASE)
-        if m:
-            d = m.group(1).upper()
-            logger.warning(f"⚠️  正则推断 decision={d} | raw[:200]={raw[:200]}")
-            return {"decision": d, "reason": "正则推断"}
-
-        # v4.0: 记录解析失败详情便于诊断
-        logger.warning(f"⚠️  完全无法解析 DeepSeek 回复 (context={context}): raw[:300]={raw[:300]}")
-
-        # v3.7: context 感知的默认值
-        # v4.1: 保留旧决策层 context 兼容，新增研究层 context
-        defaults = {
-            # v4.1 deprecated — 保留兼容
-            "entry_review": {"decision": "REJECT", "reason": "解析失败-默认拒绝"},
-            "position_review": {"decision": "HOLD", "reason": "解析失败-默认持有"},
-            # v4.1 new — 研究层 context，不输出决策
-            "signal_explanation": {"signal_explanation": "解析失败", "risk_factors": [], "quality": "unknown"},
-            "position_explanation": {"trend_status": "无法分析", "risk_score": 5, "key_observations": []},
-            # 其他
-            "market_anomaly": {},
-            "genetic_evolve": {},
-        }
-        default = defaults.get(context, {"decision": "REJECT", "reason": "解析失败"})
-        logger.warning(f"⚠️  完全无法解析 DeepSeek 回复 (context={context}): raw={raw[:300]}...")
-        return default
-
-    # ── v3.0: 异常检测 & 市场评论 ──
-
-    def review_market_anomaly(
-        self, symbols_data: List[Dict[str, Any]], market_regime: str
-    ) -> Optional[str]:
-        """请求 DeepSeek 扫描全部币种数据，主动标记异常"""
-        if not symbols_data or self._circuit_open:
-            return None
-
-        summary_lines = [
-            f"市场状态: {market_regime}",
-            "当前币种数据:",
-        ]
-        for d in symbols_data:
-            summary_lines.append(
-                f"  {d.get('symbol','?')}: 方向={d.get('direction','?')} "
-                f"价格={d.get('price',0):.4f} ADX={d.get('adx',0):.2f} "
-                f"RSI={d.get('rsi',0):.2f} VolRatio={d.get('vol_ratio',1):.2f}"
-            )
-
-        system_prompt = (
-            "【必须使用中文回复，禁止使用英文】\n"
-            "你是一名加密市场异常检测器。分析以下币种数据，判断是否存在异常情况。"
-            "异常包括：价格与指标严重背离、多个币种同时出现极端信号、"
-            "成交量异常放大/缩小、可能的市场操纵迹象等。"
-            "返回 JSON: {\"anomaly_detected\": bool, \"description\": \"简要描述\"}"
-        )
-        user_prompt = "\n".join(summary_lines)
-
-        try:
-            resp = self.session.post(
-                self.config.deepseek_url,
-                json={
-                    "model": self.config.deepseek_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 256,
-                },
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                body = resp.json()
-                content = self._merge_content_reasoning(body["choices"][0]["message"]) or "{}"
-                result = self._extract_json(content, context="market_anomaly")
-                if result.get("anomaly_detected"):
-                    return result.get("description", "异常已检测")
-            else:
-                self._consecutive_failures += 1
-        except Exception:
-            self._consecutive_failures += 1
-        return None
-
-    def generate_commentary(self, cycle_data: Dict[str, Any]) -> str:
-        """请求 DeepSeek 生成一行市场评论"""
-        if self._circuit_open:
-            return ""
-
-        system_prompt = (
-            "【必须使用中文回复，禁止使用英文】\n"
-            "你是一名加密货币市场评论员。根据提供的周期摘要，"
-            "用一行中文（最多100字）总结当前市场情况。简洁有力。"
-        )
-        user_prompt = json.dumps(cycle_data, ensure_ascii=False)
-
-        try:
-            resp = self.session.post(
-                self.config.deepseek_url,
-                json={
-                    "model": self.config.deepseek_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.5,
-                    "max_tokens": 150,
-                },
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                body = resp.json()
-                msg = body["choices"][0]["message"]
-                return self._merge_content_reasoning(msg)
-        except Exception:
-            logger.debug("⚠️  静默异常", exc_info=True)
-        return ""
-
-
-# ============================================================================
-# 6. TradeLogger — 日志持久化 (JSONL)
-# ============================================================================
-class TradeLogger:
-    """所有信号、AI 决策、交易执行记录写入 logs/trades.jsonl (v2: 扩展字段)"""
-
-    def __init__(self, log_dir: str = "logs"):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.log_dir = os.path.join(script_dir, log_dir)
-        os.makedirs(self.log_dir, exist_ok=True)
-        # v3.6: 按日分割日志，防止单文件无限膨胀
-        self.today = today_str()
-        self.log_path = os.path.join(self.log_dir, f"trades_{self.today}.jsonl")
-        logger.info(f"📝 交易日志: {self.log_path}")
-
-    def _write(self, record: Dict[str, Any]):
-        """追加一行 JSON 到日志文件（按日分割）"""
-        record.setdefault("timestamp", now_iso())
-        # v3.6: 检查日期是否变更，自动切换文件
-        today = today_str()
-        if today != self.today:
-            self.today = today
-            self.log_path = os.path.join(self.log_dir, f"trades_{today}.jsonl")
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.error(f"写入日志失败: {e}")
-
-    def log_signal(self, sig: Dict[str, Any]):
-        """记录候选信号"""
-        self._write({
-            "event": "SIGNAL",
-            "symbol": sig["symbol"],
-            "direction": sig["direction"],
-            "price": sig["price"],
-            "ema": sig["ema"],
-            "rsi": sig["rsi"],
-            "atr": sig["atr"],
-            "adx": sig.get("adx"),
-            "recent_closes": sig.get("recent_closes", [])[-5:],
-        })
-
-    def log_ai_decision(self, symbol: str, direction: str,
-                        decision: str, reason: str):
-        """记录 DeepSeek 决策"""
-        self._write({
-            "event": "AI_DECISION",
-            "symbol": symbol,
-            "direction": direction,
-            "decision": decision,
-            "reason": reason,
-        })
-
-    def log_trade(self, symbol: str, direction: str, price: float,
-                  sl: float, tp_info: Any, amount: int,
-                  order_id: Optional[str], success: bool,
-                  entry_fee: float = 0.0, total_estimated_fee: float = 0.0,
-                  margin_ratio_used: float = 0.0):
-        """记录交易执行 (v2: 含手续费 & 部分TP信息)"""
-        self._write({
-            "event": "TRADE",
-            "symbol": symbol,
-            "direction": direction,
-            "entry_price": price,
-            "sl": sl,
-            "tp_info": tp_info,
-            "amount_contracts": amount,
-            "order_id": order_id,
-            "success": success,
-            "entry_fee_usdt": round(entry_fee, 4),
-            "total_estimated_fee_usdt": round(total_estimated_fee, 4),
-            "margin_ratio_used": round(margin_ratio_used, 4),
-        })
-
-    def log_risk(self, event_type: str, details: str):
-        """记录风控事件"""
-        self._write({
-            "event": "RISK",
-            "risk_type": event_type,
-            "details": details,
-        })
-
-    def log_cycle(self, cycle: int, candidates: int, trades: int,
-                  balance: float, pnl: float = 0.0,
-                  cumulative_fees: float = 0.0,
-                  market_regime: str = "",
-                  equity: float = 0.0, unrealized_pnl: float = 0.0,
-                  initial_equity: float = 0.0, all_time_pnl: float = 0.0):
-        """记录每轮扫描摘要 (v3.1: 初始资金 + 总盈亏)"""
-        self._write({
-            "event": "CYCLE",
-            "cycle": cycle,
-            "candidates": candidates,
-            "trades_this_cycle": trades,
-            "balance": round(balance, 2),
-            "equity": round(equity, 2),
-            "unrealized_pnl": round(unrealized_pnl, 4),
-            "daily_pnl_pct": round(pnl, 4),
-            "cumulative_fees": round(cumulative_fees, 4),
-            "market_regime": market_regime,
-            "initial_equity": round(initial_equity, 2),
-            "all_time_pnl": round(all_time_pnl, 2),
-        })
-
-    def log_adx_skip(self, symbol: str, adx: float):
-        """记录因 ADX 过低被过滤的信号"""
-        self._write({
-            "event": "ADX_SKIP",
-            "symbol": symbol,
-            "adx": round(adx, 2),
-        })
-
-    def log_tf_skip(self, symbol: str, direction: str, reason: str,
-                    tf_context: Optional[Dict[str, Any]] = None):
-        """记录因多TF趋势不一致被过滤的信号 (v2 新增)"""
-        self._write({
-            "event": "TF_SKIP",
-            "symbol": symbol,
-            "direction": direction,
-            "reason": reason,
-            "tf_context": (
-                {k: v.get("trend") for k, v in tf_context.items()}
-                if tf_context else {}
-            ),
-        })
-
-    def log_concurrent_skip(self, num_existing: int, max_allowed: int):
-        """记录因并发持仓满被跳过的轮次 (v2 新增)"""
-        self._write({
-            "event": "CONCURRENT_SKIP",
-            "num_existing": num_existing,
-            "max_allowed": max_allowed,
-        })
-
-    def log_vol_skip(self, symbol: str, vol_ratio: float):
-        """记录因成交量不足被过滤的信号 (v2.1 新增)"""
-        self._write({
-            "event": "VOL_SKIP",
-            "symbol": symbol,
-            "vol_ratio": round(vol_ratio, 2),
-        })
-
-    def log_direction_skip(self, symbol: str, direction: str, reason: str):
-        """v3.7: 记录因方向胜率过低被跳过的信号"""
-        self._write({
-            "event": "DIRECTION_SKIP",
-            "symbol": symbol,
-            "direction": direction,
-            "reason": reason,
-        })
-
-    def log_btc_filter(self, symbol: str, direction: str,
-                       btc_change: float, reason: str):
-        """记录因 BTC 联动被拦截的信号 (v2.1 新增)"""
-        self._write({
-            "event": "BTC_FILTER",
-            "symbol": symbol,
-            "direction": direction,
-            "btc_change_pct": round(btc_change * 100, 2),
-            "reason": reason,
-        })
-
-    # ── v3.5: 结构化日志 — 支持自学习复盘 ──
-
-    def log_position_close(self, symbol: str, direction: str, strategy: str,
-                           entry_price: float, exit_price: float,
-                           pnl: float, pnl_pct: float, close_reason: str,
-                           holding_hours: float = 0):
-        """记录平仓事件（自学习核心数据源）"""
-        self._write({
-            "event": "POSITION_CLOSE",
-            "symbol": symbol,
-            "direction": direction,
-            "strategy": strategy,
-            "entry_price": round(entry_price, 4),
-            "exit_price": round(exit_price, 4),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "close_reason": close_reason,  # TP / SL / MANUAL / ROTATION
-            "holding_hours": round(holding_hours, 1),
-        })
-
-    def log_signal_full(self, symbol: str, direction: str, strategy: str,
-                        price: float, ema: float, rsi: float, atr: float,
-                        adx: float, confidence: int, bonuses: list,
-                        market_regime: str):
-        """记录完整信号上下文（消融测试数据源）"""
-        self._write({
-            "event": "SIGNAL_FULL",
-            "symbol": symbol,
-            "direction": direction,
-            "strategy": strategy,
-            "price": round(price, 2),
-            "ema": round(ema, 2),
-            "rsi": round(rsi, 2),
-            "atr": round(atr, 4),
-            "adx": round(adx, 2),
-            "confidence": confidence,
-            "bonuses": bonuses,
-            "market_regime": market_regime,
-        })
-
-    def log_cycle_positions(self, cycle: int, positions: list):
-        """记录每轮持仓快照（PnL轨迹追踪）"""
-        self._write({
-            "event": "CYCLE_POSITIONS",
-            "cycle": cycle,
-            "positions": positions,  # [{symbol, side, entry, mark, upl, margin}]
-        })
-
-    def log_rule_exit_review(self, symbol: str, direction: str,
-                             decision: str, reason: str,
-                             entry_price: float, current_price: float,
-                             roi: float, holding_hours: float):
-        """v4.1: 记录规则引擎持仓审查决策 (替代旧AI_EXIT_DECISION)"""
-        self._write({
-            "event": "RULE_EXIT_REVIEW",
-            "symbol": symbol,
-            "direction": direction,
-            "decision": decision,  # HOLD or CLOSE
-            "reason": reason,
-            "entry_price": round(entry_price, 4),
-            "current_price": round(current_price, 4),
-            "roi": round(roi * 100, 1),
-            "holding_hours": round(holding_hours, 1),
-        })
-
-    def log_sl_attribution(self, symbol: str, direction: str,
-                           exit_price: float, pnl: float, pnl_pct: float,
-                           strategy: str = "pullback"):
-        """v4.1: Stop Loss Attribution — 记录止损出场信息, 供后续分析"""
-        self._write({
-            "event": "SL_ATTRIBUTION",
-            "symbol": symbol,
-            "direction": direction,
-            "exit_price": round(exit_price, 4),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 1),
-            "strategy": strategy,
-        })
-
-
-# ============================================================================
-# 7. RiskMonitor — 日内风控
-# ============================================================================
-class RiskMonitor:
-    """
-    风控监控器 v4.0 — 连续亏损冷却 + 百分比硬止损
-    ===============================================
-    v4.0 核心: 连续亏损 N 次 → 暂停 M 小时 (非百分比一刀切)
-      - 连续亏损 3 次 → 暂停 4 小时
-      - 连续亏损 5 次 → 暂停 24 小时
-      - 币种越多, 阈值越宽 (动态调整)
-      - 日亏损硬止损 (从 .env MAX_DAILY_LOSS_PCT 读取, 默认 3%)
-    """
-
-    # v4.0: 基础阈值 (10 币种)
-    # v4.1 fix: 10币种从3→5, 减少误触发 (正常波动不应锁死4小时)
-    BASE_STREAK_WARN = 5      # 连续亏损此次数 → 暂停
-    BASE_STREAK_HARD = 8      # 连续亏损此次数 → 长暂停
-    BASE_COOLDOWN_WARN_H = 2  # 暂停小时 (从4h降到2h, 够冷静但不过度)
-    BASE_COOLDOWN_HARD_H = 12 # 长暂停小时 (从24h降到12h)
-
-    def __init__(self, config: ConfigManager, exchange: ExchangeInterface):
-        self.config = config
-        self.exchange = exchange
-        self.day_start_equity: float = 0.0
-        self.current_equity: float = 0.0
-        self.daily_pnl_pct: float = 0.0
-        self._current_date: str = ""
-        self.cumulative_fees: float = 0.0
-        self.initial_equity: float = config.initial_equity
-
-        # v4.0: 从配置读取硬止损百分比 (默认 3%)
-        self.hard_loss_pct = -abs(getattr(config, 'daily_loss_limit', 0.05))
-
-        # v4.0: 连续亏损追踪
-        self.consecutive_losses: int = 0
-        self.consecutive_wins: int = 0
-        self.recent_pnls: List[float] = []  # 最近 20 笔 PnL (USDT)
-        self.cooldown_until: float = 0.0     # 冷却结束时间戳
-        self.cooldown_reason: str = ""
-
-        self._refresh()
-        if self.initial_equity <= 0 and self.current_equity > 0:
-            self.initial_equity = self.current_equity
-            logger.info(f"💰 初始资金自动检测: {self.initial_equity:.2f} USDT")
-
-    # ════════════════════════════════════════════
-    # v4.0: 动态阈值 (基于币种数)
-    # ════════════════════════════════════════════
-
-    def _get_thresholds(self) -> tuple:
-        """根据监控币种数返回 (streak_warn, streak_hard, cooldown_warn_h, cooldown_hard_h)"""
-        symbol_count = len(getattr(self.config, 'SYMBOLS', self.config.DEFAULT_SYMBOLS))
-        if symbol_count <= 10:
-            mult = 1.0
-        elif symbol_count <= 20:
-            mult = 1.3   # 币种多 → 阈值放宽 30%
-        elif symbol_count <= 50:
-            mult = 1.6   # 放宽 60%
-        else:
-            mult = 2.0   # 放宽 100%
-
-        return (
-            max(2, round(self.BASE_STREAK_WARN * mult)),
-            max(3, round(self.BASE_STREAK_HARD * mult)),
-            self.BASE_COOLDOWN_WARN_H,
-            self.BASE_COOLDOWN_HARD_H,
-        )
-
-    # ════════════════════════════════════════════
-    # 核心 API
-    # ════════════════════════════════════════════
-
-    def _refresh(self):
-        acct = self.exchange.get_account_summary()
-        self._refresh_with_data(acct)
-
-    def _refresh_with_data(self, acct: Dict[str, Any]):
-        today = today_str()
-        equity = acct["equity"]
-        if today != self._current_date:
-            self._current_date = today
-            self.cumulative_fees = 0.0
-            self.day_start_equity = equity
-            self.current_equity = equity
-            self.daily_pnl_pct = 0.0
-            logger.info(f"🌅 新交易日 {today} | 起始权益: {self.day_start_equity:.2f} USDT")
-        else:
-            self.current_equity = equity
-            if self.day_start_equity > 0:
-                self.daily_pnl_pct = (
-                    (self.current_equity - self.day_start_equity) / self.day_start_equity
-                )
-
-    def record_trade_fees(self, fees: float):
-        self.cumulative_fees += fees
-
-    def record_closed_trade(self, pnl: float, symbol: str = ""):
-        """v4.0: 记录已平仓交易 PnL, 追踪连续亏损"""
-        is_loss = pnl < 0
-
-        if is_loss:
-            self.consecutive_losses += 1
-            self.consecutive_wins = 0
-        else:
-            self.consecutive_wins += 1
-            self.consecutive_losses = 0  # 盈利 → 重置
-
-        self.recent_pnls.append(pnl)
-        if len(self.recent_pnls) > 20:
-            self.recent_pnls = self.recent_pnls[-20:]
-
-        # 检查是否触发冷却
-        self._check_streak_cooldown(symbol)
-
-    def _check_streak_cooldown(self, symbol: str = ""):
-        """v4.0: 连续亏损触发冷却"""
-        now = time.time()
-        streak_warn, streak_hard, cooldown_warn, cooldown_hard = self._get_thresholds()
-
-        if self.consecutive_losses >= streak_hard:
-            until = now + cooldown_hard * 3600
-            if until > self.cooldown_until:
-                self.cooldown_until = until
-                self.cooldown_reason = (
-                    f"连续亏损{self.consecutive_losses}次 "
-                    f"(阈值{streak_hard}) → 暂停{cooldown_hard}h"
-                )
-                logger.error(f"🚨 {self.cooldown_reason}")
-
-        elif self.consecutive_losses >= streak_warn and self.consecutive_losses < streak_hard:
-            until = now + cooldown_warn * 3600
-            if until > self.cooldown_until:
-                self.cooldown_until = until
-                self.cooldown_reason = (
-                    f"连续亏损{self.consecutive_losses}次 "
-                    f"(阈值{streak_warn}) → 暂停{cooldown_warn}h"
-                )
-                logger.error(f"⚠️  {self.cooldown_reason}")
-
-    def can_trade(self) -> bool:
-        """检查是否允许交易 (v4.0: 连续亏损冷却 + 百分比硬兜底)"""
-        self._refresh()
-
-        now = time.time()
-
-        # 1. 冷却检查: 冷却期未过?
-        if now < self.cooldown_until:
-            remaining_h = (self.cooldown_until - now) / 3600
-            logger.warning(
-                f"⛔ 冷却中: {self.cooldown_reason} | "
-                f"剩余 {remaining_h:.1f}h"
-            )
-            return False
-
-        # 2. 冷却期已过 → 自动恢复
-        if self.cooldown_until > 0 and now >= self.cooldown_until:
-            logger.info(f"🟢 冷却期结束, 恢复交易 (连胜{self.consecutive_wins}笔)")
-            self.cooldown_until = 0.0
-            self.cooldown_reason = ""
-            self.consecutive_losses = 0  # 重新计数
-
-        # 3. 百分比硬兜底 (从 .env 读取, 默认 3%)
-        if self.daily_pnl_pct < self.hard_loss_pct:
-            logger.error(
-                f"🚨 日内亏损 {self.daily_pnl_pct*100:.2f}% > "
-                f"{abs(self.hard_loss_pct)*100:.0f}%，硬止损！"
-            )
-            return False
-
-        return True
-
-    def can_trade_with_data(self, acct: Dict[str, Any]) -> bool:
-        self._refresh_with_data(acct)
-        return self.can_trade()  # 共用冷却逻辑 (不重复 refresh)
-
-    def get_status(self) -> Dict[str, Any]:
-        all_time_pnl = (self.current_equity - self.initial_equity) if self.initial_equity > 0 else 0.0
-        all_time_pnl_pct = (all_time_pnl / self.initial_equity * 100) if self.initial_equity > 0 else 0.0
-        streak_warn, streak_hard, _, _ = self._get_thresholds()
-        cooldown_remaining = max(0, (self.cooldown_until - time.time()) / 3600) if self.cooldown_until > 0 else 0
-
-        blocked = time.time() < self.cooldown_until or self.daily_pnl_pct < self.hard_loss_pct
-        return {
-            "date": self._current_date,
-            "initial_equity": self.initial_equity,
-            "start_equity": self.day_start_equity,
-            "current_equity": self.current_equity,
-            "pnl_pct": round(self.daily_pnl_pct * 100, 3),
-            "all_time_pnl": round(all_time_pnl, 2),
-            "all_time_pnl_pct": round(all_time_pnl_pct, 2),
-            "blocked": blocked,
-            "cumulative_fees": round(self.cumulative_fees, 4),
-            # v4.0
-            "consecutive_losses": self.consecutive_losses,
-            "consecutive_wins": self.consecutive_wins,
-            "streak_warn": streak_warn,
-            "streak_hard": streak_hard,
-            "cooldown_until": self.cooldown_until if self.cooldown_until > 0 else None,
-            "cooldown_remaining_h": round(cooldown_remaining, 1),
-            "cooldown_reason": self.cooldown_reason,
-        }
-
-
-# ============================================================================
-# 8. TradeExecutor — 风控 & 下单 (v2: 动态仓位 + 部分止盈 + 手续费)
-# ============================================================================
 class DeepSeekQuantBot:
     """
     主控机器人 (v2):
@@ -2458,674 +1353,389 @@ class DeepSeekQuantBot:
         return candidates
 
     # ==================================================================
-    # 主循环
+    # Phase 2A: 阶段函数
     # ==================================================================
-    def run_once(self):
-        """执行一次完整的扫描→多TF→AI审核→风控→执行周期 (v2.7: 账户数据一轮只查一次)"""
-        cycle = self.total_scans + 1
-        trades_this_cycle = 0
 
-        # ── v2.7: 清空本周期 TF 缓存 + 重置 DeepSeek 断路器 ──
-        self._tf_cache.clear()
-        self.analyst.circuit_breaker_reset()
+    def _phase_post_cycle(self, candidates, acct, cycle, trades_this_cycle):
+        """后处理: 异常检测+市场评论+平仓检测+自学习+遗传进化+健康检查+日志+审计"""
+        # ── v3.0: DeepSeek 异常检测 ──
+        if self.config.deepseek_anomaly_detection and not self.analyst.circuit_breaker_open():
+            if candidates or acct.get("positions_detail"):
+                symbols_data = []
+                for sig in candidates:
+                    symbols_data.append({
+                        "symbol": sig["symbol"], "direction": sig["direction"],
+                        "price": sig["price"], "rsi": sig["rsi"],
+                        "adx": sig["adx"], "vol_ratio": sig.get("vol_ratio", 1.0),
+                    })
+                cached_regime = "no_signal"
+                for sym_key in self._tf_cache:
+                    cached_regime = self._detect_market_regime(self._tf_cache[sym_key]).get("regime", "unknown")
+                    break
+                anomaly = self.analyst.review_market_anomaly(symbols_data, cached_regime)
+                if anomaly:
+                    self.tlogger.log_risk("AI_ANOMALY", anomaly)
+                    logger.warning(f"🚨 DeepSeek 异常检测: {anomaly}")
 
-        # ── v2.7: 一轮只查一次账户全景，后续传给 riskmon/status/log ──
-        acct = self.exchange.get_account_summary()
+        # ── v3.0: DeepSeek 市场评论 ──
+        self._market_commentary = ""
+        if self.config.deepseek_market_commentary and not self.analyst.circuit_breaker_open():
+            cycle_data = {
+                "cycle": cycle, "candidates": len(candidates),
+                "trades": trades_this_cycle,
+                "positions": len(acct["positions_detail"]),
+                "regime": "no_signal",
+            }
+            for sym_key in self._tf_cache:
+                cycle_data["regime"] = self._detect_market_regime(self._tf_cache[sym_key]).get("regime", "unknown")
+                break
+            self._market_commentary = self.analyst.generate_commentary(cycle_data)
+            if self._market_commentary:
+                logger.info(f"💬 DeepSeek 市场评论: {self._market_commentary}")
 
-        # ── v3.0: 紧急停止检查 ──
-        if self.safety:
-            if not hasattr(self, '_equity_history'):
-                self._equity_history: List[Tuple[float, float]] = []
-            now_ts = time.time()
-            self._equity_history.append((now_ts, acct["equity"]))
-            cutoff = now_ts - self.config.emergency_window
-            self._equity_history = [(ts, eq) for ts, eq in self._equity_history if ts >= cutoff]
-            triggered, reason = self.safety.check_emergency_stop(
-                acct["equity"], self._equity_history
-            )
-            if triggered:
-                logger.error(f"🚨 紧急停止已触发: {reason}")
-                positions = self.exchange.get_open_positions()
-                closed = self.safety.emergency_close_all(positions)
-                self.tlogger.log_risk("EMERGENCY_STOP", f"已平仓 {closed} 个持仓: {reason}")
-                self.riskmon.cooldown_until = time.time() + 86400  # 紧急停止: 24h 冷却
-                self.riskmon.cooldown_reason = "紧急停止"
-                return
+        # ── v3.1: 检测平仓交易 (当前持仓 vs 上一轮) ──
+        prev_positions = getattr(self, '_prev_positions', {})
+        # v4.0: 已处理平仓集合, 防止重复记录
+        if not hasattr(self, '_closed_positions_done'):
+            self._closed_positions_done: set = set()
+        if self.learner and prev_positions:
+            current_syms = {p["symbol"] + "/USDT:USDT" for p in acct["positions_detail"]}
+            closed = {
+                sym: pos for sym, pos in prev_positions.items()
+                if sym not in current_syms
+                and (sym, round(float(pos.get("entryPrice", 0) or 0), 4), int(abs(float(pos.get("contracts", 0) or 0))), today_str()) not in self._closed_positions_done
+            }
+            for sym, old_pos in closed.items():
+                entry = float(old_pos.get("entryPrice", 0) or 0)
+                contracts = abs(float(old_pos.get("contracts", 0) or 0))
+                self._closed_positions_done.add((sym, round(entry, 4), int(contracts), today_str()))  # v4.1: 合约数防误跳
+                mark = float(old_pos.get("markPrice", 0) or 0)
+                side = "LONG" if str(old_pos.get("side") or old_pos.get("info", {}).get("holdSide", "")).lower() == "long" else "SHORT"
 
-        logger.info(f"\n{'─' * 50}")
-        session = SessionManager.get_session(
-            self.config.adx_threshold, self.config.vol_ratio_threshold)
+                base = sym.replace("/USDT:USDT", "")
+                # v4.1: 获取真实策略名
+                close_strategy = getattr(self, '_position_strategies', {}).get(sym, "pullback")
 
-        # ── v2.3: 每轮刷新市场情绪 ──
+                # v4.0: 从 Bitget API 获取真实已实现 PnL (不再估算)
+                real_pnl = self.exchange.fetch_closed_position_pnl(sym)
+                if real_pnl and abs(real_pnl["pnl"]) > 0.01:
+                    pnl = real_pnl["pnl"]
+                    mark = real_pnl.get("exit_price", mark)
+                    # v4.1: 记录实际平仓费用
+                    close_fee = real_pnl.get("fee", 0)
+                    if close_fee > 0:
+                        self.riskmon.record_trade_fees(close_fee)
+                    logger.info(
+                        f"📊 {base} 真实PnL={pnl:+.2f} USDT "
+                        f"(交易所数据, exit={mark:.4f}, 平仓费={close_fee:.4f})"
+                    )
+                else:
+                    # 回退: API 不可用时用估算
+                    mark = float(old_pos.get("markPrice", 0) or 0)
+                    csize = self.exchange.get_contract_size(sym)
+                    pnl = (mark - entry) * contracts * csize if side == "LONG" else (entry - mark) * contracts * csize
+                    last_upnl = float(old_pos.get("unrealizedPnl", 0) or 0)
+                    if abs(last_upnl) > abs(pnl) * 0.5 and abs(last_upnl) > 1:
+                        pnl = last_upnl
+
+                position_value = entry * contracts * (self.exchange.get_contract_size(sym))
+                margin = float(old_pos.get("margin", position_value / self.config.leverage))
+                pnl_pct = (pnl / margin) * 100 if margin > 0 else 0.0
+                # v3.5: 取消残留计划单
+                try:
+                    for o in (self.exchange.exchange.fetch_open_orders(sym, params={"stop": True}) or []):
+                        if self.exchange._is_reduce_only(o):
+                            self.exchange.cancel_order(str(o.get('id','')), sym)
+                except Exception:
+                    logger.debug("⚠️  静默异常", exc_info=True)
+                # v4.0: 风险监控追踪连续亏损
+                self.riskmon.record_closed_trade(pnl, base)
+                # v4.0: 接线 PerformanceTracker
+                if self.perf:
+                    dur = 0.0
+                    if sym in self._position_open_times:
+                        dur = (time.time() - self._position_open_times[sym]) / 60.0
+                    self.perf.record_trade(
+                        symbol=base, direction=side,
+                        entry=entry, exit_price=mark,
+                        pnl=pnl, pnl_pct=pnl_pct,
+                        strategy="pullback", duration_minutes=dur,
+                    )
+                self.tlogger.log_position_close(
+                    symbol=base, direction=side, strategy=close_strategy,
+                    entry_price=entry, exit_price=mark,
+                    pnl=pnl, pnl_pct=pnl_pct,
+                    close_reason="DETECTED", holding_hours=0,
+                )
+                # v4.1: 累计已实现 PnL (用于审计对账)
+                self._bot_closed_pnl_total += pnl
+                self._bot_closed_trade_count += 1
+                self.learner.learn_from_closed_trade(
+                    symbol=sym, direction=side,
+                    entry_price=entry, exit_price=mark,
+                    pnl=pnl, pnl_pct=pnl_pct,
+                    strategy=close_strategy, ai_decision="CONFIRM",
+                    market_regime=getattr(self, '_current_regime', 'unknown'),
+                )
+                # ── v4.1: 因子归因 —— 记录开仓特征 vs 实际 PnL ──
+                factors = getattr(self, '_open_trade_factors', {}).pop(sym, None)
+                if factors and self.learner:
+                    factor_scores = {
+                        "technical": factors.get("confidence", 50),
+                        "quant": int(50 + factors.get("_kalman_score", 0) * 30),
+                    }
+                    self.learner.tracker.record_factors(
+                        symbol=base, direction=side,
+                        strategy=factors.get("strategy", "pullback"),
+                        pnl=pnl, factor_scores=factor_scores,
+                    )
+
+                # ── v4.1: 币种止损冷却 + SL 归因 ──
+                if pnl < 0:
+                    if not hasattr(self, '_symbol_cooldowns'):
+                        self._symbol_cooldowns = {}
+                    self._symbol_cooldowns[base] = time.time() + 1800
+                    logger.info(
+                        f"⏳ {base} 亏损 {pnl:+.2f}U → 冷却 30min "
+                        f"(防止重复踩坑)"
+                    )
+                    # SL 归因: 记录止损时价格, 供后续分析止损是否太紧
+                    self.tlogger.log_sl_attribution(
+                        symbol=base, direction=side,
+                        exit_price=mark, pnl=pnl, pnl_pct=pnl_pct,
+                        strategy=close_strategy,
+                    )
+        # v4.0: 每日清理平仓记录 (防止内存泄漏)
+        if getattr(self, '_closed_date', '') != today_str():
+            self._closed_positions_done = set()
+            self._closed_date = today_str()
+        # v4.1 fix: 包含本周期新开仓 (acct 是周期初快照, 不含本周期执行的交易)
+        self._prev_positions = {
+            f"{p['symbol']}/USDT:USDT": {
+                "entryPrice": p["entry_price"],
+                "markPrice": p["mark_price"],
+                "contracts": p["contracts"],
+                "unrealizedPnl": p.get("unrealized_pnl", 0),
+                "margin": p.get("margin", 0),
+                "info": {"holdSide": "long" if p["side"] == "LONG" else "short"},
+            }
+            for p in acct["positions_detail"]
+        }
+        # 合并本周期开仓记录
+        if hasattr(self, '_this_cycle_trades') and self._this_cycle_trades:
+            for sym_full, trade_info in self._this_cycle_trades.items():
+                if sym_full not in self._prev_positions:  # 防止覆盖交易所数据
+                    self._prev_positions[sym_full] = trade_info
+        # ── v3.6: 清理已平仓的开仓时间记录 ──
+        # v4.1 fix: 同周期新开仓位不能删 (acct是周期初快照,不含本周期新开仓)
+        current_syms = {f"{p['symbol']}/USDT:USDT" for p in acct["positions_detail"]}
+        this_cycle_opened = getattr(self, '_this_cycle_opened', set())
+        for sym in list(self._position_open_times.keys()):
+            if sym not in current_syms and sym not in this_cycle_opened:
+                del self._position_open_times[sym]
+        # 清理本周期记录
+        if hasattr(self, '_this_cycle_opened'):
+            self._this_cycle_opened.clear()
+        if hasattr(self, '_this_cycle_trades'):
+            self._this_cycle_trades.clear()
+        # v3.4: 持久化仓位快照 + v4.1: 审计状态，重启后可恢复
         try:
-            self.market_ctx.ensure_fresh()
+            tmp = "positions_state.json.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({
+                    "updated": now_iso(),
+                    "positions": self._prev_positions,
+                    "audit": {  # v4.1: 跨重启 PnL 追踪
+                        "bot_closed_pnl_total": round(self._bot_closed_pnl_total, 4),
+                        "bot_closed_trade_count": self._bot_closed_trade_count,
+                        "cumulative_fees": round(self.riskmon.cumulative_fees, 4),
+                    },
+                }, f, ensure_ascii=False)
+            os.replace(tmp, "positions_state.json")
         except Exception:
             logger.debug("⚠️  静默异常", exc_info=True)
 
-        # ── v2.7: 用预取数据刷新风控，避免重复 API 调用 ──
-        self.riskmon._refresh_with_data(acct)
-        risk_status = self.riskmon.get_status()
-        logger.info(f"🔄 第 {cycle} 轮扫描 — {now_str('%H:%M:%S')} | {session['label']}")
-        logger.info(f"📊 日内风控: PnL={risk_status['pnl_pct']:+.2f}% | "
-                     f"权益={risk_status['current_equity']:.2f} | "
-                     f"累计手续费={risk_status['cumulative_fees']:.4f} | "
-                     f"{'🔒锁定' if risk_status['blocked'] else '🟢正常'}")
-        logger.info(f"{'─' * 50}")
-
-        # ── v3.2: 移动止损检查 ──
-        if self.trailing_sl and acct.get("positions_detail"):
-            for pos_d in acct["positions_detail"]:
-                sym_full = f"{pos_d['symbol']}/USDT:USDT"
-                side = pos_d["side"]
-                mark = pos_d["mark_price"]
-                entry = pos_d["entry_price"]
-                # 获取当前 SL
-                try:
-                    stop_ords = self.exchange.fetch_open_orders(sym_full)
-                    current_sl = None
-                    for o in stop_ords:
-                        if self.exchange._is_reduce_only(o) and o.get("type") == "market":
-                            t = float(o.get("info", {}).get("triggerPrice", 0) or 0)
-                            if (side == "LONG" and t < mark) or (side == "SHORT" and t > mark):
-                                current_sl = t
-                                break
-                    if current_sl:
+        # ── v3.1: 周期性自我回顾 + v3.7: 紧急回顾 ──
+        _review_trades = None
+        if self.learner and (self.learner.should_review() or self.learner.should_emergency_review()):
+            try:
+                _review_trades = []
+                with open(self.tlogger.log_path, "r", encoding="utf-8") as f:
+                    for line in f:
                         try:
-                            df = self.indicator.compute_all(
-                                self.exchange.fetch_ohlcv(sym_full)
-                            )
-                            atr_v = float(df["atr"].iloc[-1])
-                            new_sl = self.trailing_sl.check_and_update(
-                                sym_full, side, mark, current_sl,
-                                atr_v if not pd.isna(atr_v) and atr_v > 0 else mark * 0.01,
-                                entry
-                            )
-                            if new_sl:
-                                # 找到现有 TP 价格，避免 SL 更新时摧毁 TP
-                                existing_tp = 0
-                                try:
-                                    all_stop = self.exchange.exchange.fetch_open_orders(
-                                        sym_full, params={"stop": True}
-                                    ) or []
-                                    for o in all_stop:
-                                        if self.exchange._is_reduce_only(o):
-                                            tp_val = float(o.get("info", {}).get("triggerPrice", 0) or 0)
-                                            # TP: LONG 止盈价高于入场价, SHORT 止盈价低于入场价
-                                            if side == "LONG" and tp_val > entry:
-                                                existing_tp = tp_val
-                                                break
-                                            if side == "SHORT" and tp_val < entry:
-                                                existing_tp = tp_val
-                                                break
-                                except Exception:
-                                    logger.debug("⚠️  静默异常", exc_info=True)
-                                # 取消旧 SL/TP，重新挂载，保留现有 TP
-                                self.exchange.set_position_sl_tp(
-                                    sym_full, "buy" if side == "LONG" else "sell",
-                                    new_sl, existing_tp
-                                )
+                            evt = json.loads(line)
+                            if evt.get("event") == "POSITION_CLOSE":
+                                _review_trades.append(evt)
+                            elif evt.get("event") == "TRADE" and evt.get("success"):
+                                _review_trades.append(evt)
                         except Exception:
                             logger.debug("⚠️  静默异常", exc_info=True)
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
+            except Exception:
+                _review_trades = None
 
-        # ── v3.3: 盈利锁仓 —— 浮盈超过 2x ATR 后移动 TP 锁定利润 ──
-        if acct.get("positions_detail"):
-            for pos_d in acct["positions_detail"]:
-                sym_full = f"{pos_d['symbol']}/USDT:USDT"
-                upl = pos_d.get("unrealized_pnl", 0)
-                entry = pos_d.get("entry_price", 0)
-                side = pos_d.get("side", "LONG")
-                margin = pos_d.get("margin", 0)
-                if margin <= 0 or entry <= 0:
-                    continue
-                roi = upl / margin  # 保证金回报率
-                if roi > 0.5:  # 盈利超过保证金的50%，锁仓
-                    try:
-                        orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
-                        reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
-                        if len(reduce_orders) >= 8:
-                            logger.warning(f"🔒 {pos_d['symbol']} SL/TP堆积({len(reduce_orders)}个)，先清理后锁仓")
-                            for o in reduce_orders:
-                                self.exchange.cancel_order(str(o.get('id','')), sym_full)
-                        # 重新设置锁仓 TP (移到当前盈利的50%位置)
-                        mark = pos_d.get("mark_price", entry)
-                        if side == "SHORT":
-                            lock_tp = round(entry - (entry - mark) * 0.5, 4)
-                            lock_sl = round(entry + (mark - entry) * 0.1, 4) if mark > entry else round(mark * 1.005, 4)
-                        else:
-                            lock_tp = round(entry + (mark - entry) * 0.5, 4)
-                            lock_sl = round(entry - (entry - mark) * 0.1, 4) if mark < entry else round(mark * 0.995, 4)
-                        if lock_tp > 0 and lock_sl > 0 and lock_tp != lock_sl:
-                            logger.info(f"🔒 {pos_d['symbol']} 盈利锁仓: ROI={roi*100:.0f}% → TP={lock_tp} SL={lock_sl}")
-                            close_side = "buy" if side == "SHORT" else "sell"
-                            self.exchange.set_position_sl_tp(sym_full, close_side, lock_sl, lock_tp)
-                    except Exception as e:
-                        logger.debug(f"🔒 锁仓 {pos_d['symbol']} 失败: {e}")
-
-        # ── v3.3: 持仓实时分析 (自学习 v2.0) ──
-        if self.learner and acct.get("positions_detail"):
+        if self.learner and self.learner.should_review() and _review_trades:
             try:
-                pos_insight = self.learner.analyze_open_positions(
-                    acct["positions_detail"], session["label"]
-                )
-                if pos_insight:
-                    logger.info(f"🧠 持仓分析:\n{pos_insight}")
+                suggestions = self.learner.periodic_review(_review_trades)
+                if suggestions:
+                    self.tlogger.log_risk("LEARN_REVIEW", f"生成 {len(suggestions)} 条策略建议")
+            except Exception as e:
+                logger.warning(f"🧠 周期性回顾异常: {e}")
+
+        if self.learner and self.learner.should_emergency_review() and _review_trades:
+            try:
+                logger.warning("🚨 连续亏损触发紧急回顾!")
+                self.learner.mark_emergency_review_done()
+                suggestions = self.learner.periodic_review(_review_trades)
+                if suggestions:
+                    self.tlogger.log_risk("EMERGENCY_REVIEW", f"紧急回顾: {len(suggestions)} 条建议")
+            except Exception as e:
+                logger.warning(f"🚨 紧急回顾异常: {e}")
+
+        # ── v3.1: 过滤器诊断 ──
+        if self.learner and len(candidates) == 0:
+            try:
+                diagnosis = self.learner.analyze_filter_effectiveness()
+                if diagnosis:
+                    logger.info(f"🧠 过滤器诊断: {diagnosis}")
             except Exception:
                 logger.debug("⚠️  静默异常", exc_info=True)
 
-        # ── v3.6: 浮亏自动止损 —— ROI < AUTO_SL_ROI_THRESHOLD 且持仓 > AUTO_SL_MIN_HOURS ──
-        if self.config.auto_sl_enabled and acct.get("positions_detail"):
-            for pos_d in acct["positions_detail"]:
-                margin = pos_d.get("margin", 0)
-                upl = pos_d.get("unrealized_pnl", 0)
-                if margin <= 0:
-                    continue
-                roi = upl / margin  # 保证金回报率
-                if roi >= self.config.auto_sl_roi_threshold:
-                    continue  # 浮亏未达阈值，跳过
-
-                # 检查持仓时长
-                sym_full = f"{pos_d['symbol']}/USDT:USDT"
-                open_ts = self._position_open_times.get(sym_full)
-                if not open_ts:
-                    continue  # 无开仓时间记录，跳过
-                holding_hours = (time.time() - open_ts) / 3600.0
-                if holding_hours < self.config.auto_sl_min_hours:
-                    continue  # 持仓不足，让正常SL处理
-
-                # 触发浮亏止损
-                side = pos_d.get("side", "LONG")
-                entry = pos_d.get("entry_price", 0)
-                contracts = abs(int(pos_d.get("contracts", 0)))
-                mark = pos_d.get("mark_price", 0)
-                sym = pos_d["symbol"]
-                logger.warning(
-                    f"🚨 {sym} {side} 浮亏止损触发: ROI={roi*100:.0f}% "
-                    f"持仓{holding_hours:.1f}h | 浮亏{upl:+.2f}"
-                )
-                try:
-                    # v3.6 fix: 使用 close_position API 正确平仓
-                    close_side = "buy" if side == "SHORT" else "sell"
-                    pos_side = "short" if side == "SHORT" else "long"
-                    close_o = self.exchange.create_market_order_close(
-                        sym_full, contracts, close_side, pos_side
-                    )
-                    if close_o:
-                        logger.info(f"✅ 浮亏止损平仓 {sym}: {close_o.get('id', '?')}")
-                        # 计算 PnL%
-                        csize = self.exchange.get_contract_size(sym_full)
-                        position_value = entry * contracts * csize
-                        pnl_pct = (upl / (position_value / self.config.leverage)) * 100 if position_value > 0 else roi * 100
-                        self.tlogger.log_position_close(
-                            symbol=sym, direction=side, strategy="pullback",
-                            entry_price=entry, exit_price=mark,
-                            pnl=upl, pnl_pct=pnl_pct,
-                            close_reason="AUTO_SL", holding_hours=round(holding_hours, 1),
-                        )
-                    else:
-                        logger.warning(f"⚠️  浮亏止损平仓 {sym} 返回空 (可能已平仓)")
-                except Exception as e:
-                    logger.error(f"❌ 浮亏止损平仓 {sym} 失败: {e}")
-
-        # ── v3.7: ① 僵尸仓退出 —— 持仓 >4h 且 |ROI| < 2% 自动平仓释放资金 ──
-        if acct.get("positions_detail"):
-            stale_hours = getattr(self.config, 'stale_exit_hours', 4.0)
-            stale_roi_limit = getattr(self.config, 'stale_roi_limit', 0.02)
-            for pos_d in acct["positions_detail"]:
-                sym_full = f"{pos_d['symbol']}/USDT:USDT"
-                open_ts = self._position_open_times.get(sym_full)
-                if not open_ts:
-                    continue
-                holding_hours = (time.time() - open_ts) / 3600.0
-                if holding_hours < stale_hours:
-                    continue
-                margin = pos_d.get("margin", 0)
-                upl = pos_d.get("unrealized_pnl", 0)
-                roi = upl / margin if margin > 0 else 0
-                if abs(roi) > stale_roi_limit:
-                    continue  # 有显著盈亏，让正常 SL/TP 处理
-                # 僵尸仓：持仓久 + 几乎不赚不亏 → 平仓释放保证金
-                side = pos_d.get("side", "LONG")
-                contracts = abs(int(pos_d.get("contracts", 0)))
-                sym = pos_d["symbol"]
-                logger.warning(
-                    f"🧟 {sym} {side} 僵尸仓退出: 持仓{holding_hours:.1f}h "
-                    f"ROI={roi*100:.1f}% |浮盈{upl:+.2f}| < {stale_roi_limit*100:.0f}%"
-                )
-                try:
-                    close_side = "buy" if side == "SHORT" else "sell"
-                    pos_side = "short" if side == "SHORT" else "long"
-                    close_o = self.exchange.create_market_order_close(
-                        sym_full, contracts, close_side, pos_side)
-                    if close_o:
-                        logger.info(f"✅ 僵尸仓平仓 {sym}: {close_o.get('id', '?')}")
-                        self.tlogger.log_position_close(
-                            symbol=sym, direction=side, strategy="pullback",
-                            entry_price=pos_d.get("entry_price", 0),
-                            exit_price=pos_d.get("mark_price", 0),
-                            pnl=upl, pnl_pct=roi * 100,
-                            close_reason="STALE_EXIT",
-                            holding_hours=round(holding_hours, 1),
-                        )
-                except Exception as e:
-                    logger.warning(f"🧟 僵尸仓平仓 {sym} 失败: {e}")
-
-        # ── v3.7: ② 波动率暴增熔断 —— ATR 突然翻倍时收紧全仓止损 ──
-        if acct.get("positions_detail"):
-            if not hasattr(self, '_atr_history'):
-                self._atr_history: Dict[str, list] = {}
-            vol_spike_threshold = 2.5  # ATR 超过均值的倍数触发熔断
-            for pos_d in acct["positions_detail"]:
-                sym = pos_d["symbol"]
-                sym_full = f"{sym}/USDT:USDT"
-                try:
-                    # 获取当前 ATR
-                    df = self.exchange.fetch_ohlcv_tf(sym_full, timeframe="15m", limit=30)
-                    atr_val = float(df["close"].diff().abs().rolling(14).mean().iloc[-1])
-                    float(df["close"].iloc[-1])
-                    if pd.isna(atr_val) or atr_val <= 0:
-                        continue
-                    # 追踪 ATR 历史
-                    if sym not in self._atr_history:
-                        self._atr_history[sym] = []
-                    self._atr_history[sym].append(atr_val)
-                    if len(self._atr_history[sym]) > 20:
-                        self._atr_history[sym] = self._atr_history[sym][-20:]
-                    hist = self._atr_history[sym]
-                    if len(hist) < 10:
-                        continue
-                    avg_atr = sum(hist[:-1]) / (len(hist) - 1)
-                    if avg_atr <= 0:
-                        continue
-                    spike_ratio = atr_val / avg_atr
-                    if spike_ratio > vol_spike_threshold:
-                        # 触发熔断：收紧止损到 1.0x ATR
-                        side = pos_d.get("side", "LONG")
-                        entry = pos_d.get("entry_price", 0)
-                        tight_sl = (entry - atr_val * 1.0 if side == "LONG"
-                                    else entry + atr_val * 1.0)
-                        logger.warning(
-                            f"⚡ {sym} 波动率暴增: ATR={atr_val:.4f} "
-                            f"({spike_ratio:.1f}x均值{avg_atr:.4f}) → 收紧SL至{tight_sl:.4f}"
-                        )
-                        # 使用 place-pos-tpsl 更新止损
-                        try:
-                            tp_price = (entry + atr_val * 2.0 if side == "LONG"
-                                        else entry - atr_val * 2.0)
-                            self.exchange.set_position_sl_tp(
-                                sym_full, "buy" if side == "LONG" else "sell",
-                                tight_sl, tp_price)
-                            self.tlogger.log_risk(
-                                "VOL_SPIKE", f"{sym} ATR {spike_ratio:.1f}x → SL收紧")
-                        except Exception as e:
-                            logger.warning(f"⚡ {sym} 波动熔断更新SL失败: {e}")
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)  # OI/ATR 获取失败不影响主循环
-
-        # ── v3.6: AI 持仓审核 —— 定期审查已持仓是否需要提前退出 ──
-        if self.config.ai_position_review_enabled and acct.get("positions_detail"):
-            if not self.analyst.circuit_breaker_open():
-                # 按 interval 间隔执行 (默认每3轮=15分钟)
-                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
-                    self._review_open_positions(acct["positions_detail"])
-            else:
-                logger.debug("🔌 断路器熔断，跳过 AI 持仓审核")
-
-        # ── v3.5: 清理无主订单（已平仓但计划单残留的币种）──
-        current_symbols = {f"{p['symbol']}/USDT:USDT" for p in acct.get("positions_detail", [])}
-        for sym in self.config.SYMBOLS:
-            sym_full = f"{sym}/USDT:USDT"
-            if sym_full in current_symbols:
-                continue  # 有仓位，正常处理
-            # 无仓位但有计划单 → 平仓残留，全部取消
+        # ── v3.6: ② 退出质量优化 (每 REVIEW_INTERVAL_HOURS 触发) ──
+        if self.learner and self.learner.should_review():
             try:
-                orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
+                exit_opt = self.learner.periodic_exit_optimization()
+                if exit_opt:
+                    self.tlogger.log_risk("EXIT_OPTIMIZE", exit_opt)
             except Exception:
-                continue
-            reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
-            if reduce_orders:
-                logger.warning(f"🧹 {sym} 已无仓位但有{len(reduce_orders)}个残留计划单，全部取消")
-                for o in reduce_orders:
-                    self.exchange.cancel_order(str(o.get('id','')), sym_full)
+                logger.debug("⚠️  静默异常", exc_info=True)
 
-        # ── v3.4: 每轮自动清理超额订单 (在仓币种) ──
-        try:
-            for p in acct.get("positions_detail", []):
-                sym_full = f"{p['symbol']}/USDT:USDT"
-                try:
-                    orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
-                except Exception:
-                    continue
-                reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
-                if len(reduce_orders) > 4:
-                    logger.warning(f"🧹 {p['symbol']} 超额订单({len(reduce_orders)}个)，自动清理...")
-                    reduce_orders.sort(key=lambda o: str(o.get('id', '')))
-                    for o in reduce_orders[:-2]:
-                        self.exchange.cancel_order(str(o.get('id','')), sym_full)
-        except Exception:
-            logger.debug("⚠️  静默异常", exc_info=True)
-
-        # ── v3.6: 每3轮检查仓位 TPSL 保护 (从 position info 读取，兼容 place-pos-tpsl) ──
-        if self.total_scans > 0 and self.total_scans % 3 == 0:
-            try:
-                bare = 0
-                for p in acct.get("positions_detail", []):
-                    sym_full = f"{p['symbol']}/USDT:USDT"
-                    entry = p.get("entry_price", 0)
-                    side = p.get("side", "LONG")
-                    mark = p.get("mark_price", 0)
-
-                    # v4.0 fix: 用新的 _has_position_tpsl (查计划单 + pos-tpsl API)
-                    has_sl, has_tp = self.exchange._has_position_tpsl(sym_full, entry, side)
-
-                    if not has_sl or not has_tp:
-                        if not has_sl and not has_tp:
-                            bare += 1
-                        close_side = "buy" if side == "SHORT" else "sell"
-                        atr = max(entry * 0.01, abs(mark - entry) * 0.3)
-                        sl_p = entry + 1.5 * atr if side == "SHORT" else entry - 1.5 * atr
-                        if side == "SHORT" and sl_p <= mark:
-                            sl_p = mark * 1.005
-                        elif side == "LONG" and sl_p >= mark:
-                            sl_p = mark * 0.995
-                        tp_p = entry - 2.0 * atr if side == "SHORT" else entry + 2.0 * atr
-                        missing = []
-                        if not has_sl:
-                            missing.append("SL")
-                        if not has_tp:
-                            missing.append("TP")
-                        logger.warning(f"🛡️  {p['symbol']} 缺少{'/'.join(missing)}，补挂 SL={sl_p:.4f} TP={tp_p:.4f}")
-                        self.exchange.set_position_sl_tp(sym_full, close_side, round(sl_p,4), round(tp_p,4))
-                if bare == 0 and acct.get("positions_detail"):
-                    logger.debug("🛡️  SL健康检查: 全部持仓已保护")
-            except Exception as e:
-                logger.warning(f"⚠️  SL健康检查异常: {e}")
-
-        # 如果日内亏损已触发锁定，本轮只扫描不交易
-        if not self.riskmon.can_trade_with_data(acct):
-            logger.warning("⛔ 日内风控已锁定，本轮仅扫描不执行交易")
-            candidates = self.scan_all()
-            logger.info(f"📊 本轮候选信号: {len(candidates)} 个（锁定模式，不执行）")
-            for sig in candidates:
-                self.tlogger.log_signal(sig)
-            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
-            self.tlogger.log_cycle(cycle, len(candidates), 0,
-                                    self.riskmon.current_equity,
-                                    self.riskmon.daily_pnl_pct,
-                                    self.riskmon.cumulative_fees,
-                                    "locked", 0, 0,
-                                    self.riskmon.initial_equity, all_time)
-            self._audit_snapshot(acct)
-            return
-
-        # ── v4.1: 周末凌晨保护 —— 低流动性时段只平仓不开仓 ──
-        session_live = SessionManager.get_session(
-            self.config.adx_threshold, self.config.vol_ratio_threshold)
-        if session_live.get("name") == "weekend_dead":
-            logger.info(f"🛑 周末凌晨({session_live['label']})低流动性，本轮只平仓不开仓")
-            # 仍然执行持仓检查 (规则引擎平仓 + AI 解释)
-            if self.config.ai_position_review_enabled and acct.get("positions_detail"):
-                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
-                    self._review_open_positions(acct["positions_detail"])
-            # 扫描生成信号但不执行
-            candidates = self.scan_all()
-            if candidates:
-                logger.info(f"📊 周末凌晨信号: {len(candidates)} 个（不执行，仅记录）")
-                for sig in candidates:
-                    self.tlogger.log_signal(sig)
-            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
-            self.tlogger.log_cycle(cycle, len(candidates), 0,
-                                    self.riskmon.current_equity,
-                                    self.riskmon.daily_pnl_pct,
-                                    self.riskmon.cumulative_fees,
-                                    "weekend_dead", 0, 0,
-                                    self.riskmon.initial_equity, all_time)
-            # 执行网格策略 (低波动适用)
-            if self.grid_manager:
-                self.grid_manager.poll_grids()
-            self._audit_snapshot(acct)
-            return
-
-        # ── v4.0: 方向死锁检测 —— 长时间无信号+0持仓 → 强制放行一轮 ──
-        positions_count = len(acct.get("positions_detail", []))
-        drought = getattr(self, '_drought_cycles', 0)
-        if not hasattr(self, '_force_allow_direction'):
-            self._force_allow_direction = False
-        # v4.0 fix: 逃生门冷却 — 放行一次后需等干旱重新累积 6 轮才能再放行
-        if not hasattr(self, '_escape_hatch_cooldown'):
-            self._escape_hatch_cooldown = 0
-        if self._escape_hatch_cooldown > 0:
-            self._escape_hatch_cooldown -= 1
-
-        # 干旱 ≥ 6 轮 (30min) + 无持仓 + 冷却期已过 → 放行一轮
-        if (drought >= 6 and positions_count == 0 and self.learner
-                and self._escape_hatch_cooldown == 0):
-            self._force_allow_direction = True
-            self._escape_hatch_cooldown = 12  # 放行后冷却 12 轮 (1小时)
-            logger.warning(f"⚠️  干旱{drought}轮+0持仓 → 本周期强制放行方向开关 (冷却12轮)")
-        else:
-            self._force_allow_direction = False
-
-        candidates = self.scan_all()
-        logger.info(f"📊 本轮候选信号: {len(candidates)} 个")
-
-        # ── v3.7: 干旱计数器 —— 追踪连续无成交周期 ──
-        # v4.0 fix: trades_this_cycle 在本位置永远是 0 (交易在后面执行),
-        # 所以改用 candidates 判断 - 有信号说明干旱结束
-        if not hasattr(self, '_drought_cycles'):
-            self._drought_cycles = 0
-        if len(candidates) == 0:
-            self._drought_cycles += 1
-        else:
-            self._drought_cycles = 0  # 有候选信号 → 干旱结束
-
-        # ── v3.0: 网格订单轮询 ──
-        if self.grid_manager:
-            grid_status = self.grid_manager.poll_grids()
-            if grid_status.get("filled_orders", 0) > 0:
-                logger.info(f"📋 网格成交: {grid_status['filled_orders']} 笔")
-
-        # ── v2: 并发持仓限制 + v3.7 时段动态上限 ──
-        session = SessionManager.get_session(
-            self.config.adx_threshold, self.config.vol_ratio_threshold)
-        effective_max_pos = min(self.config.max_concurrent_positions,
-                                session.get("max_positions", self.config.max_concurrent_positions))
-        num_existing = self.exchange.count_open_positions()
-        max_new = max(0, effective_max_pos - num_existing)
-        if max_new <= 0 and candidates:
-            # ── v3.3: 仓位轮动 —— 满仓时依次尝试换掉亏损仓 ──
-            rotated = 0
-            pos_list = sorted(acct.get("positions_detail", []),
-                             key=lambda x: x.get("unrealized_pnl", 0))  # 亏损最多的排前面
-            for sig in candidates[:3]:
-                if rotated >= 1:
-                    break
-                new_conf = sig.get("confidence", 50)
-                if new_conf < 55:
-                    continue
-                for worst in pos_list:
-                    worst_upl = worst.get("unrealized_pnl", 0)
-                    worst_symbol = worst.get("symbol", "?")
-                    if worst_upl >= 0:  # 只换亏损仓位
-                        continue
-                    logger.info(
-                        f"🔄 仓位轮动: 平掉 {worst_symbol} "
-                        f"(浮亏{worst_upl:+.2f}) → 开 {sig['symbol']} "
-                        f"(置信度={new_conf})"
-                    )
-                    try:
-                        sym_full = f"{worst_symbol}/USDT:USDT"
-                        w_side = "buy" if worst.get("side") == "SHORT" else "sell"
-                        w_cts = int(worst.get("contracts", 0))
-                        w_hold = "short" if worst.get("side") == "SHORT" else "long"
-                        if w_cts > 0:
-                            # v3.6 fix: 用 close_position API (遵守 Bitget v2 文档)
-                            close_o = self.exchange.create_market_order_close(
-                                sym_full, w_cts, w_side, w_hold
-                            )
-                            logger.info(f"🔄 平仓 {worst_symbol}: {close_o.get('id', '?') if close_o else 'CANCELLED'}")
-                            rotated += 1
-                            self.tlogger.log_risk("ROTATION_CLOSE",
-                                f"平{worst_symbol}浮亏{worst_upl:+.2f}→开{sig['symbol']}")
-                            num_existing = self.exchange.count_open_positions()
-                            max_new = max(0, self.config.max_concurrent_positions - num_existing)
-                            break  # 成功换仓，跳出最弱仓位循环
-                    except Exception as e:
-                        logger.warning(f"🔄 轮动平仓 {worst_symbol} 失败: {e}")
-                        continue  # 尝试下一个亏损仓位
-
-        if max_new <= 0:
-            logger.warning(
-                f"⛔ 已达最大并发持仓 ({num_existing}/{self.config.max_concurrent_positions})，"
-                f"跳过本轮交易"
-            )
-            self.tlogger.log_concurrent_skip(num_existing, self.config.max_concurrent_positions)
-            for sig in candidates:
-                self.tlogger.log_signal(sig)
-            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
-            self.tlogger.log_cycle(cycle, len(candidates), 0,
-                                    self.riskmon.current_equity,
-                                    self.riskmon.daily_pnl_pct,
-                                    self.riskmon.cumulative_fees,
-                                    "concurrent_full", 0, 0,
-                                    self.riskmon.initial_equity, all_time)
-            # v3.5: 持仓快照
-            if acct.get("positions_detail"):
-                self.tlogger.log_cycle_positions(cycle, [
-                    {"symbol": p["symbol"], "side": p["side"],
-                     "entry": p["entry_price"], "mark": p["mark_price"],
-                     "upl": p["unrealized_pnl"], "margin": p.get("margin", 0)}
-                    for p in acct["positions_detail"]
-                ])
-            return
-
-        if len(candidates) > max_new:
-            logger.info(f"⏳ 候选信号 {len(candidates)} > 可开仓 {max_new}，取前 {max_new} 个")
-            candidates = candidates[:max_new]
-
-        # ── v2.7: BTC 联动过滤 (有候选信号时才查，空信号跳过省API) ──
-        btc_change = None
-        if candidates:
-            btc_change = self.exchange.fetch_btc_change(self.config.btc_filter_timeframe)
-        if btc_change is not None:
-            logger.info(f"📊 BTC {self.config.btc_filter_timeframe} 涨跌幅: {btc_change*100:+.2f}%")
-
-            filtered_candidates = []
-            for sig in candidates:
-                symbol = sig["symbol"]
-                direction = sig["direction"]
-
-                if "BTC" in symbol:
-                    filtered_candidates.append(sig)
-                    continue
-
-                if (direction == "LONG" and
-                        btc_change < self.config.btc_drop_block_long):
-                    logger.warning(
-                        f"⏭️  {symbol} {direction} 因 BTC 暴跌 {btc_change*100:+.1f}% 被拦截"
-                    )
-                    self.tlogger.log_btc_filter(
-                        symbol, direction, btc_change, "btc_drop_block_long"
-                    )
-                    self.stats["btc_filters"] += 1
-                    continue
-                if (direction == "SHORT" and
-                        btc_change > self.config.btc_pump_block_short):
-                    logger.warning(
-                        f"⏭️  {symbol} {direction} 因 BTC 暴涨 {btc_change*100:+.1f}% 被拦截"
-                    )
-                    self.tlogger.log_btc_filter(
-                        symbol, direction, btc_change, "btc_pump_block_short"
-                    )
-                    self.stats["btc_filters"] += 1
-                    continue
-
-                filtered_candidates.append(sig)
-
-            if len(filtered_candidates) < len(candidates):
-                logger.info(
-                    f"📊 BTC 过滤: {len(candidates)} → {len(filtered_candidates)} 个候选"
-                )
-            candidates = filtered_candidates
-        else:
-            btc_change = None  # 无法获取BTC数据时跳过滤镜
-
-        # ── v3.0: 新闻上下文刷新 + v3.7: 情绪量化信号 ──
-        self._sentiment_signal = {}
-        if self.news_client and candidates:
-            currencies = [s["symbol"].split("/")[0] for s in candidates]
-            self.analyst.news_context = self.news_client.get_news_context(currencies)
-            # v3.7: 获取量化情绪信号
-            try:
-                self._sentiment_signal = self.news_client.get_sentiment_signal(currencies)
-                logger.info(
-                    f"📊 情绪量化: score={self._sentiment_signal.get('score','?')} "
-                    f"{self._sentiment_signal.get('signal','?')} "
-                    f"→ {self._sentiment_signal.get('market_action','?')}"
-                )
-            except Exception as e:
-                logger.debug(f"📊 情绪量化失败: {e}")
-            # v3.7: 订单流摘要注入 AI
-            if self.flow_monitor:
-                try:
-                    flow_summary = self.flow_monitor.get_summary(currencies)
-                    if flow_summary:
-                        self.analyst.news_context = (
-                            (self.analyst.news_context or "") + "\n" + flow_summary)
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
-        else:
-            self.analyst.news_context = ""
-
-        # ── v3.1: 交易智慧注入 ──
+        # ── v3.6: ③ Kelly 仓位更新 ──
         if self.learner:
-            self.analyst.wisdom_context = self.learner.get_full_context()  # v2.0: 智慧+策略绩效
-
-        # ── v3.0: 投资组合排名 ──
-        if self.portfolio and self.config.strength_ranking_enabled and len(candidates) > 1:
             try:
-                self.portfolio.ensure_correlations_fresh(self.config.SYMBOLS)
-                tf_ctxs = {}
-                for sig in candidates:
-                    tf_ctxs[sig["symbol"]] = self._tf_cache.get(sig["symbol"], {})
-                candidates = self.portfolio.rank_candidates(candidates, tf_ctxs)
-                logger.info(f"📊 投资组合排名完成 ({len(candidates)} 个候选)")
+                # 用当前最活跃策略的 Kelly 系数更新 config
+                # 默认用 pullback + 最近方向
+                dominant_dir = "SHORT"  # 当前市场主方向
+                kelly = self.learner.get_kelly_multiplier("pullback", dominant_dir)
+                self.config.kelly_multiplier = kelly
+            except Exception:
+                logger.debug("⚠️  静默异常", exc_info=True)
 
-                # v2.0: 用组合排名重新评分
-                total = len(candidates)
-                if self.scorer:
-                    for sig in candidates:
-                        rank = sig.get("_rank", 1)
-                        result = self.scorer.score(
-                            sig={"direction": sig["direction"],
-                                 "strategy": sig.get("strategy", "pullback"),
-                                 "confidence": sig.get("confidence", 50),
-                                 "bonuses": sig.get("bonuses", [])},
-                            regime_info=None,  # 评分侧重组合维度
-                            portfolio_rank=rank, portfolio_total=total,
-                            learner=self.learner,
-                        )
-                        sig["_portfolio_score"] = result["score"]
-                        # 组合排名信号注入 confidence
-                        result["breakdown"].get("portfolio", {}).get("score", 50)
-                        if rank <= 2:
-                            sig["confidence"] = min(100, sig.get("confidence", 50) + 5)
-                        elif rank > total * 0.7:
-                            sig["confidence"] = max(30, sig.get("confidence", 50) - 10)
+        # ── v3.7: ④ 遗传进化器 (每 2 小时，需 >= 10 笔交易) ──
+        if self.evolver and self.learner:
+            try:
+                recent_trades = self.learner.tracker.recent_trades
+                now_ts_val = time.time()
 
-                # v2.0: 组合摘要 (供 AI context)
-                sym_bases = [s["symbol"] for s in candidates[:5]]
-                port_summary = self.portfolio.get_portfolio_summary(sym_bases)
-                logger.info(f"📊 {port_summary}")
+                # v4.0: 验证上一次进化 (每3轮检查一次，需要>=5笔新交易)
+                if (getattr(self.evolver, '_applied_params', None) is not None and
+                        len(recent_trades) >= 5 and
+                        self.evolver._applied_at_cycle > 0 and
+                        (cycle - self.evolver._applied_at_cycle) >= 3):
+                    rolled_back = self.evolver.validate_and_rollback(recent_trades)
+                    if rolled_back:
+                        self.tlogger.log_risk("GENETIC_ROLLBACK", "参数退化，回滚到进化前")
+
+                # v4.0: 新一轮进化 (2h间隔, >=10笔, 未收敛)
+                if (not getattr(self.evolver, '_paused', False) and
+                        len(recent_trades) >= 10 and
+                        (now_ts_val - self._last_evolve_ts) > 7200):
+                    self._last_evolve_ts = now_ts_val
+                    result = self.evolver.evolve(recent_trades)
+                    if result and result.get("best_variant"):
+                        self.evolver.apply_best_variant(result)
+                        self.evolver._applied_params = result["best_variant"]
+                        self.evolver._applied_at_cycle = cycle
+                        logger.info(f"🧬 遗传进化完成: {result.get('reasoning', '?')[:80]}")
+                        self.tlogger.log_risk("GENETIC_EVOLVE",
+                            f"应用最佳变体: {result.get('reasoning', '?')[:100]}")
             except Exception as e:
-                logger.warning(f"⚠️  投资组合排名失败: {e}")
+                logger.warning(f"🧬 遗传进化异常: {e}")
 
-        # ── v2.1: 资金费率获取 ──
-        funding_rates: Dict[str, Optional[float]] = {}
-        for sig in candidates:
-            symbol = sig["symbol"]
-            funding_rates[symbol] = self.exchange.fetch_funding_rate(symbol)
+        # ── v4.0: 周度绩效快照 (每周日 00:00 UTC 附近, 604800s 间隔) ──
+        if not hasattr(self, '_last_weekly_snapshot'):
+            self._last_weekly_snapshot = 0.0
+        if time.time() - self._last_weekly_snapshot > 604800:
+            self._last_weekly_snapshot = time.time()
+            try:
+                if self.perf and len(self.perf.trades) >= 5:
+                    m = self.perf.get_metrics()
+                    logger.info(
+                        f"📊 周度绩效: 交易{m['total_trades']}笔 胜率{m['win_rate']:.0f}% "
+                        f"Sharpe={m['sharpe_ratio']:.2f} Sortino={m['sortino_ratio']:.2f} "
+                        f"Calmar={m['calmar_ratio']:.2f} 最大回撤{m['max_drawdown_pct']:.1f}%"
+                    )
+                    self.tlogger.log_risk("WEEKLY_SNAPSHOT",
+                        f"Sharpe={m['sharpe_ratio']:.2f} WR={m['win_rate']:.0f}% "
+                        f"PnL={m['total_pnl']:+.2f} MaxDD={m['max_drawdown_pct']:.1f}%")
+                # 因子归因
+                if self.learner and hasattr(self.learner.tracker, 'get_factor_attribution'):
+                    attr = self.learner.tracker.get_factor_attribution()
+                    if attr.get("status") != "insufficient_data":
+                        ranked = sorted(
+                            [(k, v.get("spread", 0)) for k, v in attr.items()
+                             if isinstance(v, dict) and v.get("spread") is not None],
+                            key=lambda x: x[1], reverse=True)
+                        if ranked:
+                            logger.info(f"📊 因子归因: 最佳={ranked[0][0]}(Δ={ranked[0][1]:.1f}%) "
+                                       f"最差={ranked[-1][0]}(Δ={ranked[-1][1]:.1f}%)")
+            except Exception as e:
+                logger.debug(f"📊 周度快照异常: {e}")
+
+        # ── v3.6: ① 信号率自适应 (无需 DeepSeek，纯统计) ──
+        if self.learner:
+            try:
+                # 收集最近周期数据
+                if not hasattr(self, '_cycle_history'):
+                    self._cycle_history = []
+                self._cycle_history.append({
+                    "cycle": cycle, "candidates": len(candidates),
+                    "trades": trades_this_cycle,
+                })
+                if len(self._cycle_history) > 100:
+                    self._cycle_history = self._cycle_history[-80:]
+
+                tune_result = self.learner.adaptive_signal_rate_tune(self._cycle_history)
+                if tune_result:
+                    self.tlogger.log_risk("ADAPTIVE_TUNE", tune_result)
+            except Exception:
+                logger.debug("⚠️  静默异常", exc_info=True)
+
+        # ── v3.2: 健康检查 ──
+        if self.health:
+            try:
+                self.health.check(
+                    cycle, len(candidates), trades_this_cycle,
+                    acct["positions_detail"],
+                    errors=(1 if self.analyst.circuit_breaker_open() else 0)
+                )
+            except Exception:
+                logger.debug("⚠️  静默异常", exc_info=True)
+
+        # ── 周期日志 (v2.7: 复用预取 acct，不再重复调用 API) ──
+        # 从 TF 缓存中取任意已分析币种的 market_regime
+        cached_regime = "no_signal"
+        if candidates:
+            for sym_key in self._tf_cache:
+                cached_regime = self._detect_market_regime(self._tf_cache[sym_key]).get("regime", "unknown")
+                break
+        all_time = self.riskmon.current_equity - self.riskmon.initial_equity
+        self.tlogger.log_cycle(cycle, len(candidates), trades_this_cycle,
+                                self.riskmon.current_equity,
+                                self.riskmon.daily_pnl_pct,
+                                self.riskmon.cumulative_fees,
+                                cached_regime,
+                                acct["equity"], acct["unrealized_pnl"],
+                                self.riskmon.initial_equity, all_time)
+
+        # ── v4.1: 独立资金审计 ──
+        self._audit_snapshot(acct)
+
+        # ── v2.7: 更新状态文件，复用预取 acct ──
+        self._update_status_file(acct)
+
+    def _phase_execute(self, candidates, acct, btc_change, funding_rates, cycle):
+        """执行交易: 逐信号过滤→下单。返回 trades_this_cycle"""
+        trades_this_cycle = 0
 
         for sig in candidates:
             # ── 记录信号 ──
@@ -3474,380 +2084,719 @@ class DeepSeekQuantBot:
                             self.grid_manager.cancel_grid(sym)
                             logger.info(f"📋 市场不再震荡，取消 {sym} 网格")
 
-        # ── v3.0: DeepSeek 异常检测 ──
-        if self.config.deepseek_anomaly_detection and not self.analyst.circuit_breaker_open():
-            if candidates or acct.get("positions_detail"):
-                symbols_data = []
-                for sig in candidates:
-                    symbols_data.append({
-                        "symbol": sig["symbol"], "direction": sig["direction"],
-                        "price": sig["price"], "rsi": sig["rsi"],
-                        "adx": sig["adx"], "vol_ratio": sig.get("vol_ratio", 1.0),
-                    })
-                cached_regime = "no_signal"
-                for sym_key in self._tf_cache:
-                    cached_regime = self._detect_market_regime(self._tf_cache[sym_key]).get("regime", "unknown")
+        return trades_this_cycle
+
+    def _phase_scan_and_filter(self, acct, cycle):
+        """扫描候选信号 + 6层过滤。返回 {"blocked": bool, "candidates": list, "btc_change": float|None, "funding_rates": dict}"""
+        candidates = self.scan_all()
+        logger.info(f"📊 本轮候选信号: {len(candidates)} 个")
+
+        # ── v3.7: 干旱计数器 —— 追踪连续无成交周期 ──
+        # v4.0 fix: trades_this_cycle 在本位置永远是 0 (交易在后面执行),
+        # 所以改用 candidates 判断 - 有信号说明干旱结束
+        if not hasattr(self, '_drought_cycles'):
+            self._drought_cycles = 0
+        if len(candidates) == 0:
+            self._drought_cycles += 1
+        else:
+            self._drought_cycles = 0  # 有候选信号 → 干旱结束
+
+        # ── v3.0: 网格订单轮询 ──
+        if self.grid_manager:
+            grid_status = self.grid_manager.poll_grids()
+            if grid_status.get("filled_orders", 0) > 0:
+                logger.info(f"📋 网格成交: {grid_status['filled_orders']} 笔")
+
+        # ── v2: 并发持仓限制 + v3.7 时段动态上限 ──
+        session = SessionManager.get_session(
+            self.config.adx_threshold, self.config.vol_ratio_threshold)
+        effective_max_pos = min(self.config.max_concurrent_positions,
+                                session.get("max_positions", self.config.max_concurrent_positions))
+        num_existing = self.exchange.count_open_positions()
+        max_new = max(0, effective_max_pos - num_existing)
+        if max_new <= 0 and candidates:
+            # ── v3.3: 仓位轮动 —— 满仓时依次尝试换掉亏损仓 ──
+            rotated = 0
+            pos_list = sorted(acct.get("positions_detail", []),
+                             key=lambda x: x.get("unrealized_pnl", 0))  # 亏损最多的排前面
+            for sig in candidates[:3]:
+                if rotated >= 1:
                     break
-                anomaly = self.analyst.review_market_anomaly(symbols_data, cached_regime)
-                if anomaly:
-                    self.tlogger.log_risk("AI_ANOMALY", anomaly)
-                    logger.warning(f"🚨 DeepSeek 异常检测: {anomaly}")
-
-        # ── v3.0: DeepSeek 市场评论 ──
-        self._market_commentary = ""
-        if self.config.deepseek_market_commentary and not self.analyst.circuit_breaker_open():
-            cycle_data = {
-                "cycle": cycle, "candidates": len(candidates),
-                "trades": trades_this_cycle,
-                "positions": len(acct["positions_detail"]),
-                "regime": "no_signal",
-            }
-            for sym_key in self._tf_cache:
-                cycle_data["regime"] = self._detect_market_regime(self._tf_cache[sym_key]).get("regime", "unknown")
-                break
-            self._market_commentary = self.analyst.generate_commentary(cycle_data)
-            if self._market_commentary:
-                logger.info(f"💬 DeepSeek 市场评论: {self._market_commentary}")
-
-        # ── v3.1: 检测平仓交易 (当前持仓 vs 上一轮) ──
-        prev_positions = getattr(self, '_prev_positions', {})
-        # v4.0: 已处理平仓集合, 防止重复记录
-        if not hasattr(self, '_closed_positions_done'):
-            self._closed_positions_done: set = set()
-        if self.learner and prev_positions:
-            current_syms = {p["symbol"] + "/USDT:USDT" for p in acct["positions_detail"]}
-            closed = {
-                sym: pos for sym, pos in prev_positions.items()
-                if sym not in current_syms
-                and (sym, round(float(pos.get("entryPrice", 0) or 0), 4), int(abs(float(pos.get("contracts", 0) or 0))), today_str()) not in self._closed_positions_done
-            }
-            for sym, old_pos in closed.items():
-                entry = float(old_pos.get("entryPrice", 0) or 0)
-                self._closed_positions_done.add((sym, round(entry, 4), int(contracts), today_str()))  # v4.1: 合约数防误跳
-                mark = float(old_pos.get("markPrice", 0) or 0)
-                contracts = abs(float(old_pos.get("contracts", 0) or 0))
-                side = "LONG" if str(old_pos.get("side") or old_pos.get("info", {}).get("holdSide", "")).lower() == "long" else "SHORT"
-
-                base = sym.replace("/USDT:USDT", "")
-                # v4.1: 获取真实策略名
-                close_strategy = getattr(self, '_position_strategies', {}).get(sym, "pullback")
-
-                # v4.0: 从 Bitget API 获取真实已实现 PnL (不再估算)
-                real_pnl = self.exchange.fetch_closed_position_pnl(sym)
-                if real_pnl and abs(real_pnl["pnl"]) > 0.01:
-                    pnl = real_pnl["pnl"]
-                    mark = real_pnl.get("exit_price", mark)
-                    # v4.1: 记录实际平仓费用
-                    close_fee = real_pnl.get("fee", 0)
-                    if close_fee > 0:
-                        self.riskmon.record_trade_fees(close_fee)
+                new_conf = sig.get("confidence", 50)
+                if new_conf < 55:
+                    continue
+                for worst in pos_list:
+                    worst_upl = worst.get("unrealized_pnl", 0)
+                    worst_symbol = worst.get("symbol", "?")
+                    if worst_upl >= 0:  # 只换亏损仓位
+                        continue
                     logger.info(
-                        f"📊 {base} 真实PnL={pnl:+.2f} USDT "
-                        f"(交易所数据, exit={mark:.4f}, 平仓费={close_fee:.4f})"
+                        f"🔄 仓位轮动: 平掉 {worst_symbol} "
+                        f"(浮亏{worst_upl:+.2f}) → 开 {sig['symbol']} "
+                        f"(置信度={new_conf})"
                     )
-                else:
-                    # 回退: API 不可用时用估算
-                    mark = float(old_pos.get("markPrice", 0) or 0)
-                    csize = self.exchange.get_contract_size(sym)
-                    pnl = (mark - entry) * contracts * csize if side == "LONG" else (entry - mark) * contracts * csize
-                    last_upnl = float(old_pos.get("unrealizedPnl", 0) or 0)
-                    if abs(last_upnl) > abs(pnl) * 0.5 and abs(last_upnl) > 1:
-                        pnl = last_upnl
+                    try:
+                        sym_full = f"{worst_symbol}/USDT:USDT"
+                        w_side = "buy" if worst.get("side") == "SHORT" else "sell"
+                        w_cts = int(worst.get("contracts", 0))
+                        w_hold = "short" if worst.get("side") == "SHORT" else "long"
+                        if w_cts > 0:
+                            # v3.6 fix: 用 close_position API (遵守 Bitget v2 文档)
+                            close_o = self.exchange.create_market_order_close(
+                                sym_full, w_cts, w_side, w_hold
+                            )
+                            logger.info(f"🔄 平仓 {worst_symbol}: {close_o.get('id', '?') if close_o else 'CANCELLED'}")
+                            rotated += 1
+                            self.tlogger.log_risk("ROTATION_CLOSE",
+                                f"平{worst_symbol}浮亏{worst_upl:+.2f}→开{sig['symbol']}")
+                            num_existing = self.exchange.count_open_positions()
+                            max_new = max(0, self.config.max_concurrent_positions - num_existing)
+                            break  # 成功换仓，跳出最弱仓位循环
+                    except Exception as e:
+                        logger.warning(f"🔄 轮动平仓 {worst_symbol} 失败: {e}")
+                        continue  # 尝试下一个亏损仓位
 
-                position_value = entry * contracts * (self.exchange.get_contract_size(sym))
-                margin = float(old_pos.get("margin", position_value / self.config.leverage))
-                pnl_pct = (pnl / margin) * 100 if margin > 0 else 0.0
-                # v3.5: 取消残留计划单
+        if max_new <= 0:
+            logger.warning(
+                f"⛔ 已达最大并发持仓 ({num_existing}/{self.config.max_concurrent_positions})，"
+                f"跳过本轮交易"
+            )
+            self.tlogger.log_concurrent_skip(num_existing, self.config.max_concurrent_positions)
+            for sig in candidates:
+                self.tlogger.log_signal(sig)
+            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
+            self.tlogger.log_cycle(cycle, len(candidates), 0,
+                                    self.riskmon.current_equity,
+                                    self.riskmon.daily_pnl_pct,
+                                    self.riskmon.cumulative_fees,
+                                    "concurrent_full", 0, 0,
+                                    self.riskmon.initial_equity, all_time)
+            # v3.5: 持仓快照
+            if acct.get("positions_detail"):
+                self.tlogger.log_cycle_positions(cycle, [
+                    {"symbol": p["symbol"], "side": p["side"],
+                     "entry": p["entry_price"], "mark": p["mark_price"],
+                     "upl": p["unrealized_pnl"], "margin": p.get("margin", 0)}
+                    for p in acct["positions_detail"]
+                ])
+            return {"blocked": True, "candidates": [], "btc_change": None, "funding_rates": {}}
+
+        if len(candidates) > max_new:
+            logger.info(f"⏳ 候选信号 {len(candidates)} > 可开仓 {max_new}，取前 {max_new} 个")
+            candidates = candidates[:max_new]
+
+        # ── v2.7: BTC 联动过滤 (有候选信号时才查，空信号跳过省API) ──
+        btc_change = None
+        if candidates:
+            btc_change = self.exchange.fetch_btc_change(self.config.btc_filter_timeframe)
+        if btc_change is not None:
+            logger.info(f"📊 BTC {self.config.btc_filter_timeframe} 涨跌幅: {btc_change*100:+.2f}%")
+
+            filtered_candidates = []
+            for sig in candidates:
+                symbol = sig["symbol"]
+                direction = sig["direction"]
+
+                if "BTC" in symbol:
+                    filtered_candidates.append(sig)
+                    continue
+
+                if (direction == "LONG" and
+                        btc_change < self.config.btc_drop_block_long):
+                    logger.warning(
+                        f"⏭️  {symbol} {direction} 因 BTC 暴跌 {btc_change*100:+.1f}% 被拦截"
+                    )
+                    self.tlogger.log_btc_filter(
+                        symbol, direction, btc_change, "btc_drop_block_long"
+                    )
+                    self.stats["btc_filters"] += 1
+                    continue
+                if (direction == "SHORT" and
+                        btc_change > self.config.btc_pump_block_short):
+                    logger.warning(
+                        f"⏭️  {symbol} {direction} 因 BTC 暴涨 {btc_change*100:+.1f}% 被拦截"
+                    )
+                    self.tlogger.log_btc_filter(
+                        symbol, direction, btc_change, "btc_pump_block_short"
+                    )
+                    self.stats["btc_filters"] += 1
+                    continue
+
+                filtered_candidates.append(sig)
+
+            if len(filtered_candidates) < len(candidates):
+                logger.info(
+                    f"📊 BTC 过滤: {len(candidates)} → {len(filtered_candidates)} 个候选"
+                )
+            candidates = filtered_candidates
+        else:
+            btc_change = None  # 无法获取BTC数据时跳过滤镜
+
+        # ── v3.0: 新闻上下文刷新 + v3.7: 情绪量化信号 ──
+        self._sentiment_signal = {}
+        if self.news_client and candidates:
+            currencies = [s["symbol"].split("/")[0] for s in candidates]
+            self.analyst.news_context = self.news_client.get_news_context(currencies)
+            # v3.7: 获取量化情绪信号
+            try:
+                self._sentiment_signal = self.news_client.get_sentiment_signal(currencies)
+                logger.info(
+                    f"📊 情绪量化: score={self._sentiment_signal.get('score','?')} "
+                    f"{self._sentiment_signal.get('signal','?')} "
+                    f"→ {self._sentiment_signal.get('market_action','?')}"
+                )
+            except Exception as e:
+                logger.debug(f"📊 情绪量化失败: {e}")
+            # v3.7: 订单流摘要注入 AI
+            if self.flow_monitor:
                 try:
-                    for o in (self.exchange.exchange.fetch_open_orders(sym, params={"stop": True}) or []):
-                        if self.exchange._is_reduce_only(o):
-                            self.exchange.cancel_order(str(o.get('id','')), sym)
+                    flow_summary = self.flow_monitor.get_summary(currencies)
+                    if flow_summary:
+                        self.analyst.news_context = (
+                            (self.analyst.news_context or "") + "\n" + flow_summary)
                 except Exception:
                     logger.debug("⚠️  静默异常", exc_info=True)
-                # v4.0: 风险监控追踪连续亏损
-                self.riskmon.record_closed_trade(pnl, base)
-                # v4.0: 接线 PerformanceTracker
-                if self.perf:
-                    dur = 0.0
-                    if sym in self._position_open_times:
-                        dur = (time.time() - self._position_open_times[sym]) / 60.0
-                    self.perf.record_trade(
-                        symbol=base, direction=side,
-                        entry=entry, exit_price=mark,
-                        pnl=pnl, pnl_pct=pnl_pct,
-                        strategy="pullback", duration_minutes=dur,
-                    )
-                self.tlogger.log_position_close(
-                    symbol=base, direction=side, strategy=close_strategy,
-                    entry_price=entry, exit_price=mark,
-                    pnl=pnl, pnl_pct=pnl_pct,
-                    close_reason="DETECTED", holding_hours=0,
-                )
-                # v4.1: 累计已实现 PnL (用于审计对账)
-                self._bot_closed_pnl_total += pnl
-                self._bot_closed_trade_count += 1
-                self.learner.learn_from_closed_trade(
-                    symbol=sym, direction=side,
-                    entry_price=entry, exit_price=mark,
-                    pnl=pnl, pnl_pct=pnl_pct,
-                    strategy=close_strategy, ai_decision="CONFIRM",
-                    market_regime=getattr(self, '_current_regime', 'unknown'),
-                )
-                # ── v4.1: 因子归因 —— 记录开仓特征 vs 实际 PnL ──
-                factors = getattr(self, '_open_trade_factors', {}).pop(sym, None)
-                if factors and self.learner:
-                    factor_scores = {
-                        "technical": factors.get("confidence", 50),
-                        "quant": int(50 + factors.get("_kalman_score", 0) * 30),
-                    }
-                    self.learner.tracker.record_factors(
-                        symbol=base, direction=side,
-                        strategy=factors.get("strategy", "pullback"),
-                        pnl=pnl, factor_scores=factor_scores,
-                    )
+        else:
+            self.analyst.news_context = ""
 
-                # ── v4.1: 币种止损冷却 + SL 归因 ──
-                if pnl < 0:
-                    if not hasattr(self, '_symbol_cooldowns'):
-                        self._symbol_cooldowns = {}
-                    self._symbol_cooldowns[base] = time.time() + 1800
-                    logger.info(
-                        f"⏳ {base} 亏损 {pnl:+.2f}U → 冷却 30min "
-                        f"(防止重复踩坑)"
+        # ── v3.1: 交易智慧注入 ──
+        if self.learner:
+            self.analyst.wisdom_context = self.learner.get_full_context()  # v2.0: 智慧+策略绩效
+
+        # ── v3.0: 投资组合排名 ──
+        if self.portfolio and self.config.strength_ranking_enabled and len(candidates) > 1:
+            try:
+                self.portfolio.ensure_correlations_fresh(self.config.SYMBOLS)
+                tf_ctxs = {}
+                for sig in candidates:
+                    tf_ctxs[sig["symbol"]] = self._tf_cache.get(sig["symbol"], {})
+                candidates = self.portfolio.rank_candidates(candidates, tf_ctxs)
+                logger.info(f"📊 投资组合排名完成 ({len(candidates)} 个候选)")
+
+                # v2.0: 用组合排名重新评分
+                total = len(candidates)
+                if self.scorer:
+                    for sig in candidates:
+                        rank = sig.get("_rank", 1)
+                        result = self.scorer.score(
+                            sig={"direction": sig["direction"],
+                                 "strategy": sig.get("strategy", "pullback"),
+                                 "confidence": sig.get("confidence", 50),
+                                 "bonuses": sig.get("bonuses", [])},
+                            regime_info=None,  # 评分侧重组合维度
+                            portfolio_rank=rank, portfolio_total=total,
+                            learner=self.learner,
+                        )
+                        sig["_portfolio_score"] = result["score"]
+                        # 组合排名信号注入 confidence
+                        result["breakdown"].get("portfolio", {}).get("score", 50)
+                        if rank <= 2:
+                            sig["confidence"] = min(100, sig.get("confidence", 50) + 5)
+                        elif rank > total * 0.7:
+                            sig["confidence"] = max(30, sig.get("confidence", 50) - 10)
+
+                # v2.0: 组合摘要 (供 AI context)
+                sym_bases = [s["symbol"] for s in candidates[:5]]
+                port_summary = self.portfolio.get_portfolio_summary(sym_bases)
+                logger.info(f"📊 {port_summary}")
+            except Exception as e:
+                logger.warning(f"⚠️  投资组合排名失败: {e}")
+
+        # ── v2.1: 资金费率获取 ──
+        funding_rates: Dict[str, Optional[float]] = {}
+        for sig in candidates:
+            symbol = sig["symbol"]
+            funding_rates[symbol] = self.exchange.fetch_funding_rate(symbol)
+
+        return {"blocked": False, "candidates": candidates, "btc_change": btc_change, "funding_rates": funding_rates}
+
+    def _phase_trade_guard(self, acct, cycle):
+        """交易守卫: 日损锁+周末保护+方向死锁。返回 {"blocked": bool, "reason": str}"""
+        # 如果日内亏损已触发锁定，本轮只扫描不交易
+        if not self.riskmon.can_trade_with_data(acct):
+            logger.warning("⛔ 日内风控已锁定，本轮仅扫描不执行交易")
+            candidates = self.scan_all()
+            logger.info(f"📊 本轮候选信号: {len(candidates)} 个（锁定模式，不执行）")
+            for sig in candidates:
+                self.tlogger.log_signal(sig)
+            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
+            self.tlogger.log_cycle(cycle, len(candidates), 0,
+                                    self.riskmon.current_equity,
+                                    self.riskmon.daily_pnl_pct,
+                                    self.riskmon.cumulative_fees,
+                                    "locked", 0, 0,
+                                    self.riskmon.initial_equity, all_time)
+            self._audit_snapshot(acct)
+            return {"blocked": True, "reason": "daily_loss"}
+
+        # ── v4.1: 周末凌晨保护 —— 低流动性时段只平仓不开仓 ──
+        session_live = SessionManager.get_session(
+            self.config.adx_threshold, self.config.vol_ratio_threshold)
+        if session_live.get("name") == "weekend_dead":
+            logger.info(f"🛑 周末凌晨({session_live['label']})低流动性，本轮只平仓不开仓")
+            # 仍然执行持仓检查 (规则引擎平仓 + AI 解释)
+            if self.config.ai_position_review_enabled and acct.get("positions_detail"):
+                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
+                    self._review_open_positions(acct["positions_detail"])
+            # 扫描生成信号但不执行
+            candidates = self.scan_all()
+            if candidates:
+                logger.info(f"📊 周末凌晨信号: {len(candidates)} 个（不执行，仅记录）")
+                for sig in candidates:
+                    self.tlogger.log_signal(sig)
+            all_time = self.riskmon.current_equity - self.riskmon.initial_equity
+            self.tlogger.log_cycle(cycle, len(candidates), 0,
+                                    self.riskmon.current_equity,
+                                    self.riskmon.daily_pnl_pct,
+                                    self.riskmon.cumulative_fees,
+                                    "weekend_dead", 0, 0,
+                                    self.riskmon.initial_equity, all_time)
+            # 执行网格策略 (低波动适用)
+            if self.grid_manager:
+                self.grid_manager.poll_grids()
+            self._audit_snapshot(acct)
+            return {"blocked": True, "reason": "weekend"}
+
+        # ── v4.0: 方向死锁检测 —— 长时间无信号+0持仓 → 强制放行一轮 ──
+        positions_count = len(acct.get("positions_detail", []))
+        drought = getattr(self, '_drought_cycles', 0)
+        if not hasattr(self, '_force_allow_direction'):
+            self._force_allow_direction = False
+        # v4.0 fix: 逃生门冷却 — 放行一次后需等干旱重新累积 6 轮才能再放行
+        if not hasattr(self, '_escape_hatch_cooldown'):
+            self._escape_hatch_cooldown = 0
+        if self._escape_hatch_cooldown > 0:
+            self._escape_hatch_cooldown -= 1
+
+        # 干旱 ≥ 6 轮 (30min) + 无持仓 + 冷却期已过 → 放行一轮
+        if (drought >= 6 and positions_count == 0 and self.learner
+                and self._escape_hatch_cooldown == 0):
+            self._force_allow_direction = True
+            self._escape_hatch_cooldown = 12  # 放行后冷却 12 轮 (1小时)
+            logger.warning(f"⚠️  干旱{drought}轮+0持仓 → 本周期强制放行方向开关 (冷却12轮)")
+        else:
+            self._force_allow_direction = False
+
+        return {"blocked": False, "reason": "ok"}
+
+    def _phase_position_protect(self, acct, session):
+        """持仓保护: 移动止损+锁仓+浮亏止损+僵尸仓退出+波动熔断+AI审核+订单清理+TPSL检查"""
+        # ── v3.2: 移动止损检查 ──
+        if self.trailing_sl and acct.get("positions_detail"):
+            for pos_d in acct["positions_detail"]:
+                sym_full = f"{pos_d['symbol']}/USDT:USDT"
+                side = pos_d["side"]
+                mark = pos_d["mark_price"]
+                entry = pos_d["entry_price"]
+                # 获取当前 SL
+                try:
+                    stop_ords = self.exchange.fetch_open_orders(sym_full)
+                    current_sl = None
+                    for o in stop_ords:
+                        if self.exchange._is_reduce_only(o) and o.get("type") == "market":
+                            t = float(o.get("info", {}).get("triggerPrice", 0) or 0)
+                            if (side == "LONG" and t < mark) or (side == "SHORT" and t > mark):
+                                current_sl = t
+                                break
+                    if current_sl:
+                        try:
+                            df = self.indicator.compute_all(
+                                self.exchange.fetch_ohlcv(sym_full)
+                            )
+                            atr_v = float(df["atr"].iloc[-1])
+                            new_sl = self.trailing_sl.check_and_update(
+                                sym_full, side, mark, current_sl,
+                                atr_v if not pd.isna(atr_v) and atr_v > 0 else mark * 0.01,
+                                entry
+                            )
+                            if new_sl:
+                                # 找到现有 TP 价格，避免 SL 更新时摧毁 TP
+                                existing_tp = 0
+                                try:
+                                    all_stop = self.exchange.exchange.fetch_open_orders(
+                                        sym_full, params={"stop": True}
+                                    ) or []
+                                    for o in all_stop:
+                                        if self.exchange._is_reduce_only(o):
+                                            tp_val = float(o.get("info", {}).get("triggerPrice", 0) or 0)
+                                            # TP: LONG 止盈价高于入场价, SHORT 止盈价低于入场价
+                                            if side == "LONG" and tp_val > entry:
+                                                existing_tp = tp_val
+                                                break
+                                            if side == "SHORT" and tp_val < entry:
+                                                existing_tp = tp_val
+                                                break
+                                except Exception:
+                                    logger.debug("⚠️  静默异常", exc_info=True)
+                                # 取消旧 SL/TP，重新挂载，保留现有 TP
+                                self.exchange.set_position_sl_tp(
+                                    sym_full, "buy" if side == "LONG" else "sell",
+                                    new_sl, existing_tp
+                                )
+                        except Exception:
+                            logger.debug("⚠️  静默异常", exc_info=True)
+                except Exception:
+                    logger.debug("⚠️  静默异常", exc_info=True)
+
+        # ── v3.3: 盈利锁仓 —— 浮盈超过 2x ATR 后移动 TP 锁定利润 ──
+        if acct.get("positions_detail"):
+            for pos_d in acct["positions_detail"]:
+                sym_full = f"{pos_d['symbol']}/USDT:USDT"
+                upl = pos_d.get("unrealized_pnl", 0)
+                entry = pos_d.get("entry_price", 0)
+                side = pos_d.get("side", "LONG")
+                margin = pos_d.get("margin", 0)
+                if margin <= 0 or entry <= 0:
+                    continue
+                roi = upl / margin  # 保证金回报率
+                if roi > 0.5:  # 盈利超过保证金的50%，锁仓
+                    try:
+                        orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
+                        reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
+                        if len(reduce_orders) >= 8:
+                            logger.warning(f"🔒 {pos_d['symbol']} SL/TP堆积({len(reduce_orders)}个)，先清理后锁仓")
+                            for o in reduce_orders:
+                                self.exchange.cancel_order(str(o.get('id','')), sym_full)
+                        # 重新设置锁仓 TP (移到当前盈利的50%位置)
+                        mark = pos_d.get("mark_price", entry)
+                        if side == "SHORT":
+                            lock_tp = round(entry - (entry - mark) * 0.5, 4)
+                            lock_sl = round(entry + (mark - entry) * 0.1, 4) if mark > entry else round(mark * 1.005, 4)
+                        else:
+                            lock_tp = round(entry + (mark - entry) * 0.5, 4)
+                            lock_sl = round(entry - (entry - mark) * 0.1, 4) if mark < entry else round(mark * 0.995, 4)
+                        if lock_tp > 0 and lock_sl > 0 and lock_tp != lock_sl:
+                            logger.info(f"🔒 {pos_d['symbol']} 盈利锁仓: ROI={roi*100:.0f}% → TP={lock_tp} SL={lock_sl}")
+                            close_side = "buy" if side == "SHORT" else "sell"
+                            self.exchange.set_position_sl_tp(sym_full, close_side, lock_sl, lock_tp)
+                    except Exception as e:
+                        logger.debug(f"🔒 锁仓 {pos_d['symbol']} 失败: {e}")
+
+        # ── v3.3: 持仓实时分析 (自学习 v2.0) ──
+        if self.learner and acct.get("positions_detail"):
+            try:
+                pos_insight = self.learner.analyze_open_positions(
+                    acct["positions_detail"], session["label"]
+                )
+                if pos_insight:
+                    logger.info(f"🧠 持仓分析:\n{pos_insight}")
+            except Exception:
+                logger.debug("⚠️  静默异常", exc_info=True)
+
+        # ── v3.6: 浮亏自动止损 —— ROI < AUTO_SL_ROI_THRESHOLD 且持仓 > AUTO_SL_MIN_HOURS ──
+        if self.config.auto_sl_enabled and acct.get("positions_detail"):
+            for pos_d in acct["positions_detail"]:
+                margin = pos_d.get("margin", 0)
+                upl = pos_d.get("unrealized_pnl", 0)
+                if margin <= 0:
+                    continue
+                roi = upl / margin  # 保证金回报率
+                if roi >= self.config.auto_sl_roi_threshold:
+                    continue  # 浮亏未达阈值，跳过
+
+                # 检查持仓时长
+                sym_full = f"{pos_d['symbol']}/USDT:USDT"
+                open_ts = self._position_open_times.get(sym_full)
+                if not open_ts:
+                    continue  # 无开仓时间记录，跳过
+                holding_hours = (time.time() - open_ts) / 3600.0
+                if holding_hours < self.config.auto_sl_min_hours:
+                    continue  # 持仓不足，让正常SL处理
+
+                # 触发浮亏止损
+                side = pos_d.get("side", "LONG")
+                entry = pos_d.get("entry_price", 0)
+                contracts = abs(int(pos_d.get("contracts", 0)))
+                mark = pos_d.get("mark_price", 0)
+                sym = pos_d["symbol"]
+                logger.warning(
+                    f"🚨 {sym} {side} 浮亏止损触发: ROI={roi*100:.0f}% "
+                    f"持仓{holding_hours:.1f}h | 浮亏{upl:+.2f}"
+                )
+                try:
+                    # v3.6 fix: 使用 close_position API 正确平仓
+                    close_side = "buy" if side == "SHORT" else "sell"
+                    pos_side = "short" if side == "SHORT" else "long"
+                    close_o = self.exchange.create_market_order_close(
+                        sym_full, contracts, close_side, pos_side
                     )
-                    # SL 归因: 记录止损时价格, 供后续分析止损是否太紧
-                    self.tlogger.log_sl_attribution(
-                        symbol=base, direction=side,
-                        exit_price=mark, pnl=pnl, pnl_pct=pnl_pct,
-                        strategy=close_strategy,
-                    )
-        # v4.0: 每日清理平仓记录 (防止内存泄漏)
-        if getattr(self, '_closed_date', '') != today_str():
-            self._closed_positions_done = set()
-            self._closed_date = today_str()
-        # v4.1 fix: 包含本周期新开仓 (acct 是周期初快照, 不含本周期执行的交易)
-        self._prev_positions = {
-            f"{p['symbol']}/USDT:USDT": {
-                "entryPrice": p["entry_price"],
-                "markPrice": p["mark_price"],
-                "contracts": p["contracts"],
-                "unrealizedPnl": p.get("unrealized_pnl", 0),
-                "margin": p.get("margin", 0),
-                "info": {"holdSide": "long" if p["side"] == "LONG" else "short"},
-            }
-            for p in acct["positions_detail"]
-        }
-        # 合并本周期开仓记录
-        if hasattr(self, '_this_cycle_trades') and self._this_cycle_trades:
-            for sym_full, trade_info in self._this_cycle_trades.items():
-                if sym_full not in self._prev_positions:  # 防止覆盖交易所数据
-                    self._prev_positions[sym_full] = trade_info
-        # ── v3.6: 清理已平仓的开仓时间记录 ──
-        # v4.1 fix: 同周期新开仓位不能删 (acct是周期初快照,不含本周期新开仓)
-        current_syms = {f"{p['symbol']}/USDT:USDT" for p in acct["positions_detail"]}
-        this_cycle_opened = getattr(self, '_this_cycle_opened', set())
-        for sym in list(self._position_open_times.keys()):
-            if sym not in current_syms and sym not in this_cycle_opened:
-                del self._position_open_times[sym]
-        # 清理本周期记录
-        if hasattr(self, '_this_cycle_opened'):
-            self._this_cycle_opened.clear()
-        if hasattr(self, '_this_cycle_trades'):
-            self._this_cycle_trades.clear()
-        # v3.4: 持久化仓位快照 + v4.1: 审计状态，重启后可恢复
+                    if close_o:
+                        logger.info(f"✅ 浮亏止损平仓 {sym}: {close_o.get('id', '?')}")
+                        # 计算 PnL%
+                        csize = self.exchange.get_contract_size(sym_full)
+                        position_value = entry * contracts * csize
+                        pnl_pct = (upl / (position_value / self.config.leverage)) * 100 if position_value > 0 else roi * 100
+                        self.tlogger.log_position_close(
+                            symbol=sym, direction=side, strategy="pullback",
+                            entry_price=entry, exit_price=mark,
+                            pnl=upl, pnl_pct=pnl_pct,
+                            close_reason="AUTO_SL", holding_hours=round(holding_hours, 1),
+                        )
+                    else:
+                        logger.warning(f"⚠️  浮亏止损平仓 {sym} 返回空 (可能已平仓)")
+                except Exception as e:
+                    logger.error(f"❌ 浮亏止损平仓 {sym} 失败: {e}")
+
+        # ── v3.7: ① 僵尸仓退出 —— 持仓 >4h 且 |ROI| < 2% 自动平仓释放资金 ──
+        if acct.get("positions_detail"):
+            stale_hours = getattr(self.config, 'stale_exit_hours', 4.0)
+            stale_roi_limit = getattr(self.config, 'stale_roi_limit', 0.02)
+            for pos_d in acct["positions_detail"]:
+                sym_full = f"{pos_d['symbol']}/USDT:USDT"
+                open_ts = self._position_open_times.get(sym_full)
+                if not open_ts:
+                    continue
+                holding_hours = (time.time() - open_ts) / 3600.0
+                if holding_hours < stale_hours:
+                    continue
+                margin = pos_d.get("margin", 0)
+                upl = pos_d.get("unrealized_pnl", 0)
+                roi = upl / margin if margin > 0 else 0
+                if abs(roi) > stale_roi_limit:
+                    continue  # 有显著盈亏，让正常 SL/TP 处理
+                # 僵尸仓：持仓久 + 几乎不赚不亏 → 平仓释放保证金
+                side = pos_d.get("side", "LONG")
+                contracts = abs(int(pos_d.get("contracts", 0)))
+                sym = pos_d["symbol"]
+                logger.warning(
+                    f"🧟 {sym} {side} 僵尸仓退出: 持仓{holding_hours:.1f}h "
+                    f"ROI={roi*100:.1f}% |浮盈{upl:+.2f}| < {stale_roi_limit*100:.0f}%"
+                )
+                try:
+                    close_side = "buy" if side == "SHORT" else "sell"
+                    pos_side = "short" if side == "SHORT" else "long"
+                    close_o = self.exchange.create_market_order_close(
+                        sym_full, contracts, close_side, pos_side)
+                    if close_o:
+                        logger.info(f"✅ 僵尸仓平仓 {sym}: {close_o.get('id', '?')}")
+                        self.tlogger.log_position_close(
+                            symbol=sym, direction=side, strategy="pullback",
+                            entry_price=pos_d.get("entry_price", 0),
+                            exit_price=pos_d.get("mark_price", 0),
+                            pnl=upl, pnl_pct=roi * 100,
+                            close_reason="STALE_EXIT",
+                            holding_hours=round(holding_hours, 1),
+                        )
+                except Exception as e:
+                    logger.warning(f"🧟 僵尸仓平仓 {sym} 失败: {e}")
+
+        # ── v3.7: ② 波动率暴增熔断 —— ATR 突然翻倍时收紧全仓止损 ──
+        if acct.get("positions_detail"):
+            if not hasattr(self, '_atr_history'):
+                self._atr_history: Dict[str, list] = {}
+            vol_spike_threshold = 2.5  # ATR 超过均值的倍数触发熔断
+            for pos_d in acct["positions_detail"]:
+                sym = pos_d["symbol"]
+                sym_full = f"{sym}/USDT:USDT"
+                try:
+                    # 获取当前 ATR
+                    df = self.exchange.fetch_ohlcv_tf(sym_full, timeframe="15m", limit=30)
+                    atr_val = float(df["close"].diff().abs().rolling(14).mean().iloc[-1])
+                    float(df["close"].iloc[-1])
+                    if pd.isna(atr_val) or atr_val <= 0:
+                        continue
+                    # 追踪 ATR 历史
+                    if sym not in self._atr_history:
+                        self._atr_history[sym] = []
+                    self._atr_history[sym].append(atr_val)
+                    if len(self._atr_history[sym]) > 20:
+                        self._atr_history[sym] = self._atr_history[sym][-20:]
+                    hist = self._atr_history[sym]
+                    if len(hist) < 10:
+                        continue
+                    avg_atr = sum(hist[:-1]) / (len(hist) - 1)
+                    if avg_atr <= 0:
+                        continue
+                    spike_ratio = atr_val / avg_atr
+                    if spike_ratio > vol_spike_threshold:
+                        # 触发熔断：收紧止损到 1.0x ATR
+                        side = pos_d.get("side", "LONG")
+                        entry = pos_d.get("entry_price", 0)
+                        tight_sl = (entry - atr_val * 1.0 if side == "LONG"
+                                    else entry + atr_val * 1.0)
+                        logger.warning(
+                            f"⚡ {sym} 波动率暴增: ATR={atr_val:.4f} "
+                            f"({spike_ratio:.1f}x均值{avg_atr:.4f}) → 收紧SL至{tight_sl:.4f}"
+                        )
+                        # 使用 place-pos-tpsl 更新止损
+                        try:
+                            tp_price = (entry + atr_val * 2.0 if side == "LONG"
+                                        else entry - atr_val * 2.0)
+                            self.exchange.set_position_sl_tp(
+                                sym_full, "buy" if side == "LONG" else "sell",
+                                tight_sl, tp_price)
+                            self.tlogger.log_risk(
+                                "VOL_SPIKE", f"{sym} ATR {spike_ratio:.1f}x → SL收紧")
+                        except Exception as e:
+                            logger.warning(f"⚡ {sym} 波动熔断更新SL失败: {e}")
+                except Exception:
+                    logger.debug("⚠️  静默异常", exc_info=True)  # OI/ATR 获取失败不影响主循环
+
+        # ── v3.6: AI 持仓审核 —— 定期审查已持仓是否需要提前退出 ──
+        if self.config.ai_position_review_enabled and acct.get("positions_detail"):
+            if not self.analyst.circuit_breaker_open():
+                # 按 interval 间隔执行 (默认每3轮=15分钟)
+                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
+                    self._review_open_positions(acct["positions_detail"])
+            else:
+                logger.debug("🔌 断路器熔断，跳过 AI 持仓审核")
+
+        # ── v3.5: 清理无主订单（已平仓但计划单残留的币种）──
+        current_symbols = {f"{p['symbol']}/USDT:USDT" for p in acct.get("positions_detail", [])}
+        for sym in self.config.SYMBOLS:
+            sym_full = f"{sym}/USDT:USDT"
+            if sym_full in current_symbols:
+                continue  # 有仓位，正常处理
+            # 无仓位但有计划单 → 平仓残留，全部取消
+            try:
+                orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
+            except Exception:
+                continue
+            reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
+            if reduce_orders:
+                logger.warning(f"🧹 {sym} 已无仓位但有{len(reduce_orders)}个残留计划单，全部取消")
+                for o in reduce_orders:
+                    self.exchange.cancel_order(str(o.get('id','')), sym_full)
+
+        # ── v3.4: 每轮自动清理超额订单 (在仓币种) ──
         try:
-            tmp = "positions_state.json.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({
-                    "updated": now_iso(),
-                    "positions": self._prev_positions,
-                    "audit": {  # v4.1: 跨重启 PnL 追踪
-                        "bot_closed_pnl_total": round(self._bot_closed_pnl_total, 4),
-                        "bot_closed_trade_count": self._bot_closed_trade_count,
-                        "cumulative_fees": round(self.riskmon.cumulative_fees, 4),
-                    },
-                }, f, ensure_ascii=False)
-            os.replace(tmp, "positions_state.json")
+            for p in acct.get("positions_detail", []):
+                sym_full = f"{p['symbol']}/USDT:USDT"
+                try:
+                    orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
+                except Exception:
+                    continue
+                reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
+                if len(reduce_orders) > 4:
+                    logger.warning(f"🧹 {p['symbol']} 超额订单({len(reduce_orders)}个)，自动清理...")
+                    reduce_orders.sort(key=lambda o: str(o.get('id', '')))
+                    for o in reduce_orders[:-2]:
+                        self.exchange.cancel_order(str(o.get('id','')), sym_full)
         except Exception:
             logger.debug("⚠️  静默异常", exc_info=True)
 
-        # ── v3.1: 周期性自我回顾 + v3.7: 紧急回顾 ──
-        _review_trades = None
-        if self.learner and (self.learner.should_review() or self.learner.should_emergency_review()):
+        # ── v3.6: 每3轮检查仓位 TPSL 保护 (从 position info 读取，兼容 place-pos-tpsl) ──
+        if self.total_scans > 0 and self.total_scans % 3 == 0:
             try:
-                _review_trades = []
-                with open(self.tlogger.log_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            evt = json.loads(line)
-                            if evt.get("event") == "POSITION_CLOSE":
-                                _review_trades.append(evt)
-                            elif evt.get("event") == "TRADE" and evt.get("success"):
-                                _review_trades.append(evt)
-                        except Exception:
-                            logger.debug("⚠️  静默异常", exc_info=True)
-            except Exception:
-                _review_trades = None
+                bare = 0
+                for p in acct.get("positions_detail", []):
+                    sym_full = f"{p['symbol']}/USDT:USDT"
+                    entry = p.get("entry_price", 0)
+                    side = p.get("side", "LONG")
+                    mark = p.get("mark_price", 0)
 
-        if self.learner and self.learner.should_review() and _review_trades:
-            try:
-                suggestions = self.learner.periodic_review(_review_trades)
-                if suggestions:
-                    self.tlogger.log_risk("LEARN_REVIEW", f"生成 {len(suggestions)} 条策略建议")
+                    # v4.0 fix: 用新的 _has_position_tpsl (查计划单 + pos-tpsl API)
+                    has_sl, has_tp = self.exchange._has_position_tpsl(sym_full, entry, side)
+
+                    if not has_sl or not has_tp:
+                        if not has_sl and not has_tp:
+                            bare += 1
+                        close_side = "buy" if side == "SHORT" else "sell"
+                        atr = max(entry * 0.01, abs(mark - entry) * 0.3)
+                        sl_p = entry + 1.5 * atr if side == "SHORT" else entry - 1.5 * atr
+                        if side == "SHORT" and sl_p <= mark:
+                            sl_p = mark * 1.005
+                        elif side == "LONG" and sl_p >= mark:
+                            sl_p = mark * 0.995
+                        tp_p = entry - 2.0 * atr if side == "SHORT" else entry + 2.0 * atr
+                        missing = []
+                        if not has_sl:
+                            missing.append("SL")
+                        if not has_tp:
+                            missing.append("TP")
+                        logger.warning(f"🛡️  {p['symbol']} 缺少{'/'.join(missing)}，补挂 SL={sl_p:.4f} TP={tp_p:.4f}")
+                        self.exchange.set_position_sl_tp(sym_full, close_side, round(sl_p,4), round(tp_p,4))
+                if bare == 0 and acct.get("positions_detail"):
+                    logger.debug("🛡️  SL健康检查: 全部持仓已保护")
             except Exception as e:
-                logger.warning(f"🧠 周期性回顾异常: {e}")
+                logger.warning(f"⚠️  SL健康检查异常: {e}")
 
-        if self.learner and self.learner.should_emergency_review() and _review_trades:
-            try:
-                logger.warning("🚨 连续亏损触发紧急回顾!")
-                self.learner.mark_emergency_review_done()
-                suggestions = self.learner.periodic_review(_review_trades)
-                if suggestions:
-                    self.tlogger.log_risk("EMERGENCY_REVIEW", f"紧急回顾: {len(suggestions)} 条建议")
-            except Exception as e:
-                logger.warning(f"🚨 紧急回顾异常: {e}")
+    def _phase_emergency_guard(self, acct, cycle):
+        """紧急停止检查 + 市场刷新 + 风控状态。返回 {"blocked": bool, "session": dict}"""
+        # ── v3.0: 紧急停止检查 ──
+        if self.safety:
+            if not hasattr(self, '_equity_history'):
+                self._equity_history: List[Tuple[float, float]] = []
+            now_ts = time.time()
+            self._equity_history.append((now_ts, acct["equity"]))
+            cutoff = now_ts - self.config.emergency_window
+            self._equity_history = [(ts, eq) for ts, eq in self._equity_history if ts >= cutoff]
+            triggered, reason = self.safety.check_emergency_stop(
+                acct["equity"], self._equity_history
+            )
+            if triggered:
+                logger.error(f"🚨 紧急停止已触发: {reason}")
+                positions = self.exchange.get_open_positions()
+                closed = self.safety.emergency_close_all(positions)
+                self.tlogger.log_risk("EMERGENCY_STOP", f"已平仓 {closed} 个持仓: {reason}")
+                self.riskmon.cooldown_until = time.time() + 86400  # 紧急停止: 24h 冷却
+                self.riskmon.cooldown_reason = "紧急停止"
+                return {"blocked": True, "session": {}}
 
-        # ── v3.1: 过滤器诊断 ──
-        if self.learner and len(candidates) == 0:
-            try:
-                diagnosis = self.learner.analyze_filter_effectiveness()
-                if diagnosis:
-                    logger.info(f"🧠 过滤器诊断: {diagnosis}")
-            except Exception:
-                logger.debug("⚠️  静默异常", exc_info=True)
+        logger.info(f"\n{'─' * 50}")
+        session = SessionManager.get_session(
+            self.config.adx_threshold, self.config.vol_ratio_threshold)
 
-        # ── v3.6: ② 退出质量优化 (每 REVIEW_INTERVAL_HOURS 触发) ──
-        if self.learner and self.learner.should_review():
-            try:
-                exit_opt = self.learner.periodic_exit_optimization()
-                if exit_opt:
-                    self.tlogger.log_risk("EXIT_OPTIMIZE", exit_opt)
-            except Exception:
-                logger.debug("⚠️  静默异常", exc_info=True)
+        # ── v2.3: 每轮刷新市场情绪 ──
+        try:
+            self.market_ctx.ensure_fresh()
+        except Exception:
+            logger.debug("⚠️  静默异常", exc_info=True)
 
-        # ── v3.6: ③ Kelly 仓位更新 ──
-        if self.learner:
-            try:
-                # 用当前最活跃策略的 Kelly 系数更新 config
-                # 默认用 pullback + 最近方向
-                dominant_dir = "SHORT"  # 当前市场主方向
-                kelly = self.learner.get_kelly_multiplier("pullback", dominant_dir)
-                self.config.kelly_multiplier = kelly
-            except Exception:
-                logger.debug("⚠️  静默异常", exc_info=True)
+        # ── v2.7: 用预取数据刷新风控，避免重复 API 调用 ──
+        self.riskmon._refresh_with_data(acct)
+        risk_status = self.riskmon.get_status()
+        logger.info(f"🔄 第 {cycle} 轮扫描 — {now_str('%H:%M:%S')} | {session['label']}")
+        logger.info(f"📊 日内风控: PnL={risk_status['pnl_pct']:+.2f}% | "
+                     f"权益={risk_status['current_equity']:.2f} | "
+                     f"累计手续费={risk_status['cumulative_fees']:.4f} | "
+                     f"{'🔒锁定' if risk_status['blocked'] else '🟢正常'}")
+        logger.info(f"{'─' * 50}")
 
-        # ── v3.7: ④ 遗传进化器 (每 2 小时，需 >= 10 笔交易) ──
-        if self.evolver and self.learner:
-            try:
-                recent_trades = self.learner.tracker.recent_trades
-                now_ts_val = time.time()
+        return {"blocked": False, "session": session}
 
-                # v4.0: 验证上一次进化 (每3轮检查一次，需要>=5笔新交易)
-                if (getattr(self.evolver, '_applied_params', None) is not None and
-                        len(recent_trades) >= 5 and
-                        self.evolver._applied_at_cycle > 0 and
-                        (cycle - self.evolver._applied_at_cycle) >= 3):
-                    rolled_back = self.evolver.validate_and_rollback(recent_trades)
-                    if rolled_back:
-                        self.tlogger.log_risk("GENETIC_ROLLBACK", "参数退化，回滚到进化前")
+    # ==================================================================
+    # 主循环
+    # ==================================================================
+    def run_once(self):
+        """执行一次完整的扫描→多TF→AI审核→风控→执行周期 (v2.7: 账户数据一轮只查一次)"""
+        cycle = self.total_scans + 1
+        trades_this_cycle = 0
 
-                # v4.0: 新一轮进化 (2h间隔, >=10笔, 未收敛)
-                if (not getattr(self.evolver, '_paused', False) and
-                        len(recent_trades) >= 10 and
-                        (now_ts_val - self._last_evolve_ts) > 7200):
-                    self._last_evolve_ts = now_ts_val
-                    result = self.evolver.evolve(recent_trades)
-                    if result and result.get("best_variant"):
-                        self.evolver.apply_best_variant(result)
-                        self.evolver._applied_params = result["best_variant"]
-                        self.evolver._applied_at_cycle = cycle
-                        logger.info(f"🧬 遗传进化完成: {result.get('reasoning', '?')[:80]}")
-                        self.tlogger.log_risk("GENETIC_EVOLVE",
-                            f"应用最佳变体: {result.get('reasoning', '?')[:100]}")
-            except Exception as e:
-                logger.warning(f"🧬 遗传进化异常: {e}")
+        # ── v2.7: 清空本周期 TF 缓存 + 重置 DeepSeek 断路器 ──
+        self._tf_cache.clear()
+        self.analyst.circuit_breaker_reset()
 
-        # ── v4.0: 周度绩效快照 (每周日 00:00 UTC 附近, 604800s 间隔) ──
-        if not hasattr(self, '_last_weekly_snapshot'):
-            self._last_weekly_snapshot = 0.0
-        if time.time() - self._last_weekly_snapshot > 604800:
-            self._last_weekly_snapshot = time.time()
-            try:
-                if self.perf and len(self.perf.trades) >= 5:
-                    m = self.perf.get_metrics()
-                    logger.info(
-                        f"📊 周度绩效: 交易{m['total_trades']}笔 胜率{m['win_rate']:.0f}% "
-                        f"Sharpe={m['sharpe_ratio']:.2f} Sortino={m['sortino_ratio']:.2f} "
-                        f"Calmar={m['calmar_ratio']:.2f} 最大回撤{m['max_drawdown_pct']:.1f}%"
-                    )
-                    self.tlogger.log_risk("WEEKLY_SNAPSHOT",
-                        f"Sharpe={m['sharpe_ratio']:.2f} WR={m['win_rate']:.0f}% "
-                        f"PnL={m['total_pnl']:+.2f} MaxDD={m['max_drawdown_pct']:.1f}%")
-                # 因子归因
-                if self.learner and hasattr(self.learner.tracker, 'get_factor_attribution'):
-                    attr = self.learner.tracker.get_factor_attribution()
-                    if attr.get("status") != "insufficient_data":
-                        ranked = sorted(
-                            [(k, v.get("spread", 0)) for k, v in attr.items()
-                             if isinstance(v, dict) and v.get("spread") is not None],
-                            key=lambda x: x[1], reverse=True)
-                        if ranked:
-                            logger.info(f"📊 因子归因: 最佳={ranked[0][0]}(Δ={ranked[0][1]:.1f}%) "
-                                       f"最差={ranked[-1][0]}(Δ={ranked[-1][1]:.1f}%)")
-            except Exception as e:
-                logger.debug(f"📊 周度快照异常: {e}")
+        # ── v2.7: 一轮只查一次账户全景，后续传给 riskmon/status/log ──
+        acct = self.exchange.get_account_summary()
 
-        # ── v3.6: ① 信号率自适应 (无需 DeepSeek，纯统计) ──
-        if self.learner:
-            try:
-                # 收集最近周期数据
-                if not hasattr(self, '_cycle_history'):
-                    self._cycle_history = []
-                self._cycle_history.append({
-                    "cycle": cycle, "candidates": len(candidates),
-                    "trades": trades_this_cycle,
-                })
-                if len(self._cycle_history) > 100:
-                    self._cycle_history = self._cycle_history[-80:]
+        # 1. 紧急停止 + 市场刷新
+        guard = self._phase_emergency_guard(acct, cycle)
+        if guard["blocked"]:
+            return
+        session = guard["session"]
 
-                tune_result = self.learner.adaptive_signal_rate_tune(self._cycle_history)
-                if tune_result:
-                    self.tlogger.log_risk("ADAPTIVE_TUNE", tune_result)
-            except Exception:
-                logger.debug("⚠️  静默异常", exc_info=True)
+        # 2. 持仓保护
+        self._phase_position_protect(acct, session)
 
-        # ── v3.2: 健康检查 ──
-        if self.health:
-            try:
-                self.health.check(
-                    cycle, len(candidates), trades_this_cycle,
-                    acct["positions_detail"],
-                    errors=(1 if self.analyst.circuit_breaker_open() else 0)
-                )
-            except Exception:
-                logger.debug("⚠️  静默异常", exc_info=True)
+        # 3. 交易守卫 (日损锁/周末/死锁)
+        trade_guard = self._phase_trade_guard(acct, cycle)
+        if trade_guard["blocked"]:
+            return
 
-        # ── 周期日志 (v2.7: 复用预取 acct，不再重复调用 API) ──
-        # 从 TF 缓存中取任意已分析币种的 market_regime
-        cached_regime = "no_signal"
-        if candidates:
-            for sym_key in self._tf_cache:
-                cached_regime = self._detect_market_regime(self._tf_cache[sym_key]).get("regime", "unknown")
-                break
-        all_time = self.riskmon.current_equity - self.riskmon.initial_equity
-        self.tlogger.log_cycle(cycle, len(candidates), trades_this_cycle,
-                                self.riskmon.current_equity,
-                                self.riskmon.daily_pnl_pct,
-                                self.riskmon.cumulative_fees,
-                                cached_regime,
-                                acct["equity"], acct["unrealized_pnl"],
-                                self.riskmon.initial_equity, all_time)
+        # 4. 扫描 + 过滤
+        scan = self._phase_scan_and_filter(acct, cycle)
+        if scan["blocked"]:
+            return
+        candidates = scan["candidates"]
+        btc_change = scan["btc_change"]
+        funding_rates = scan["funding_rates"]
 
-        # ── v4.1: 独立资金审计 ──
-        self._audit_snapshot(acct)
+        # 5. 执行交易
+        trades_this_cycle = self._phase_execute(candidates, acct, btc_change, funding_rates, cycle)
 
-        # ── v2.7: 更新状态文件，复用预取 acct ──
-        self._update_status_file(acct)
+        # 6. 后处理
+        self._phase_post_cycle(candidates, acct, cycle, trades_this_cycle)
 
     def shutdown(self):
         """优雅退出: 写最终状态、关闭连接、记录停止事件"""
