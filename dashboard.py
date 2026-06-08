@@ -78,6 +78,13 @@ def print_dashboard(ex):
     shorts = 0
     bare = 0
 
+    # v4.2: 预取所有计划单 (一次 API, 用于 SL/TP 双重检测)
+    stop_orders = []
+    try:
+        stop_orders = ex.fetch_open_orders(params={"stop": True}) or []
+    except Exception:
+        pass
+
     for p in positions:
         c = float(p.get("contracts", 0))
         if c == 0:
@@ -97,15 +104,46 @@ def print_dashboard(ex):
             shorts += 1
 
         info = p.get("info", {})
-        # v4.0 fix: Bitget place-pos-tpsl 把 SL/TP 挂在持仓 info 上
-        # fetch_positions 返回 info.stopLoss / info.takeProfit (不是 stopLossPrice)
-        has_sl = bool(info.get("stopLoss", "") or info.get("stopLossPrice", ""))
-        has_tp = bool(info.get("takeProfit", "") or info.get("takeProfitPrice", ""))
-        if not has_sl or not has_tp:
-            bare += 1
-
+        # ── v4.2 fix: 双重检测 SL/TP (对齐 _has_position_tpsl) ──
+        # 方法1: fetch_positions().info — 沙箱不返回, 实盘返回
         sl_val = info.get("stopLoss", "") or info.get("stopLossPrice", "")
         tp_val = info.get("takeProfit", "") or info.get("takeProfitPrice", "")
+        has_sl = bool(sl_val)
+        has_tp = bool(tp_val)
+
+        # 方法2: 独立计划单兜底 — 沙箱必须查
+        if not has_sl or not has_tp:
+            try:
+                side_is_long = str(side).lower() == "long"
+                for o in stop_orders:
+                    if o.get("symbol") != sym_full:
+                        continue
+                    trigger = float(o.get("info", {}).get("triggerPrice", 0) or 0)
+                    if trigger <= 0 or entry <= 0:
+                        continue
+                    if side_is_long:
+                        if trigger < entry and not has_sl:
+                            has_sl = True
+                            if not sl_val:
+                                sl_val = str(trigger)
+                        if trigger > entry and not has_tp:
+                            has_tp = True
+                            if not tp_val:
+                                tp_val = str(trigger)
+                    else:
+                        if trigger > entry and not has_sl:
+                            has_sl = True
+                            if not sl_val:
+                                sl_val = str(trigger)
+                        if trigger < entry and not has_tp:
+                            has_tp = True
+                            if not tp_val:
+                                tp_val = str(trigger)
+            except Exception:
+                pass
+
+        if not has_sl or not has_tp:
+            bare += 1
         roi = upl / mgn * 100 if mgn > 0 else 0
         pos_list.append({
             "symbol": base, "side": side, "entry": entry, "mark": mark,
