@@ -25,6 +25,8 @@ class TradeLogger:
         # v3.6: 按日分割日志，防止单文件无限膨胀
         self.today = today_str()
         self.log_path = os.path.join(self.log_dir, f"trades_{self.today}.jsonl")
+        # v4.3: 过滤器周期计数
+        self._cycle_filter_counts: Dict[str, int] = {}
         logger.info(f"📝 交易日志: {self.log_path}")
 
     def _write(self, record: Dict[str, Any]):
@@ -264,4 +266,79 @@ class TradeLogger:
             "detail": detail,
             "direction": direction,
             "strategy": strategy,
+        })
+        # v4.3: 周期统计计数
+        self._cycle_filter_counts[reason] = self._cycle_filter_counts.get(reason, 0) + 1
+
+    def get_filter_counts(self) -> dict:
+        """v4.3: 获取本周期过滤器统计并重置"""
+        counts = dict(self._cycle_filter_counts)
+        self._cycle_filter_counts = {}
+        return counts
+
+    # ════════════════════════════════════════════
+    # v4.3: 增强日志 — ENTRY_SNAPSHOT / EXIT_SNAPSHOT / FILTER_STATS
+    # ════════════════════════════════════════════
+
+    def log_entry_snapshot(self, symbol: str, direction: str, strategy: str,
+                           score: int, entry_price: float, sl: float, tp: float,
+                           ema: float, rsi: float, adx: float,
+                           ema_trend: str, kalman_dir: str, kalman_score: float,
+                           session: str, market_regime: str,
+                           bonuses: list, amount: int = 0):
+        """P2: 开仓完整快照 — 记录所有入场上下文，用于后续盈亏归因分析"""
+        self._write({
+            "event": "ENTRY_SNAPSHOT",
+            "symbol": symbol,
+            "direction": direction,
+            "strategy": strategy,
+            "score": score,
+            "entry_price": round(entry_price, 4),
+            "sl": round(sl, 4) if sl else 0,
+            "tp": round(tp, 4) if tp else 0,
+            "ema": round(ema, 2),
+            "rsi": round(rsi, 1),
+            "adx": round(adx, 1),
+            "ema_trend": ema_trend,          # "BULL" / "BEAR" / "NEUTRAL"
+            "kalman_dir": kalman_dir,         # "up" / "down" / "flat"
+            "kalman_score": round(kalman_score, 3),
+            "session": session,               # 7时段标签
+            "market_regime": market_regime,   # TREND_UP / TREND_DOWN / RANGE / VOLATILE
+            "bonuses": bonuses,               # 信号加成列表
+            "amount_contracts": amount,
+        })
+
+    def log_exit_snapshot(self, symbol: str, direction: str, strategy: str,
+                          entry_price: float, exit_price: float,
+                          pnl: float, pnl_pct: float,
+                          exit_reason: str,              # STOP_LOSS / TAKE_PROFIT / TRAILING_STOP / TIME_EXIT / RULE_EXIT
+                          hold_minutes: float,
+                          score: int = 0,
+                          ema_trend: str = "",
+                          kalman_dir: str = "",
+                          market_regime: str = ""):
+        """P1+P4: 平仓完整快照 — 含时间戳、出场原因细分、入场上下文"""
+        self._write({
+            "event": "EXIT_SNAPSHOT",
+            "symbol": symbol,
+            "direction": direction,
+            "strategy": strategy,
+            "entry_price": round(entry_price, 4),
+            "exit_price": round(exit_price, 4),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 1),
+            "exit_reason": exit_reason,
+            "hold_minutes": round(hold_minutes, 1),
+            "score_at_entry": score,           # 入场时评分
+            "ema_trend_at_entry": ema_trend,   # 入场时 EMA 趋势
+            "kalman_at_entry": kalman_dir,     # 入场时 Kalman 方向
+            "regime_at_entry": market_regime,  # 入场时市场状态
+        })
+
+    def log_filter_stats(self, cycle: int, stats: dict):
+        """P4: 每周期过滤器统计 — 一眼看出各过滤器的拦截次数"""
+        self._write({
+            "event": "FILTER_STATS",
+            "cycle": cycle,
+            "stats": stats,  # {"EMA_KALMAN_CONFLICT": 17, "ADX_TOO_LOW": 4, ...}
         })

@@ -997,28 +997,32 @@ class DeepSeekQuantBot:
                 )
                 if kalman_conflict:
                     score = abs(kalman_score)
+                    # v4.3: 统一改为降分+降级, 不再硬拒绝
+                    # 旧逻辑: >0.8 return None (硬拒) — 导致信号枯竭
+                    # 新逻辑: 全部降分+可选降级, 让评分系统决定
                     if score > 0.8:
-                        # 强 Kalman 信号 → 硬拒绝 (趋势明确反向，强行逆势风险极大)
+                        # 强冲突 → 重度扣分 + counter_trend 半仓
+                        _kalman_penalty = int(score * 25)
+                        strategy = "counter_trend"
                         self.tlogger.log_filter_reject(symbol, "KALMAN_CONFLICT",
-                            f"信号{direction} vs Kalman={kalman_dir}({kalman_score:.2f}) 强冲突",
+                            f"信号{direction} vs Kalman={kalman_dir}({kalman_score:.2f}) "
+                            f"强冲突→counter_trend扣{_kalman_penalty}分",
                             direction=direction, strategy=strategy)
                         logger.info(
-                            f"🔧 {symbol} {direction} Kalman强冲突 "
-                            f"(score={kalman_score:.2f}>0.8)，拒绝"
+                            f"🔓 {symbol} {direction} Kalman强冲突→降级 "
+                            f"(score={kalman_score:.2f}>0.8) 扣{_kalman_penalty}分"
                         )
-                        return None
                     elif score > 0.5:
-                        # 中等冲突 → 降级为 counter_trend (半仓 + 高置信度)
                         strategy = "counter_trend"
+                        _kalman_penalty = int(score * 20)
                         logger.info(
-                            f"🔧 {symbol} {direction} Kalman中冲突 "
-                            f"(score={kalman_score:.2f}) → counter_trend 半仓"
+                            f"🔓 {symbol} {direction} Kalman中冲突 "
+                            f"(score={kalman_score:.2f}) → counter_trend 半仓 扣{_kalman_penalty}分"
                         )
                     elif score > 0.2:
-                        # 弱冲突 → 保留原策略但降置信度 (标记延迟扣分)
                         _kalman_penalty = int(score * 25)
                         logger.info(
-                            f"🔧 {symbol} {direction} Kalman弱冲突 "
+                            f"🔓 {symbol} {direction} Kalman弱冲突 "
                             f"(score={kalman_score:.2f}) → 待扣{_kalman_penalty}分"
                         )
                     # score <= 0.2: Kalman 噪声 → 忽略，不干预信号
@@ -1570,24 +1574,58 @@ class DeepSeekQuantBot:
                             self.exchange.cancel_order(str(o.get('id','')), sym)
                 except Exception:
                     logger.debug("⚠️  静默异常", exc_info=True)
-                # v4.0: 风险监控追踪连续亏损
-                self.riskmon.record_closed_trade(pnl, base)
-                # v4.0: 接线 PerformanceTracker
-                if self.perf:
-                    dur = 0.0
+                # ── v4.3: 出场原因分类 ──
+                dur_min = 0.0
+                open_ts = self._position_open_times.get(sym)
+                close_ts = time.time()
+                if open_ts:
+                    dur_min = (close_ts - open_ts) / 60.0
                     if sym in self._position_open_times:
-                        dur = (time.time() - self._position_open_times[sym]) / 60.0
+                        del self._position_open_times[sym]
+
+                # 推断真实出场原因 (不再全写 DETECTED)
+                abs_pnl_pct = abs(pnl_pct)
+                if pnl_pct <= -25:
+                    exit_reason = "STOP_LOSS"
+                elif pnl_pct >= 30:
+                    exit_reason = "TAKE_PROFIT"
+                elif dur_min > 240 and abs_pnl_pct < 2:
+                    exit_reason = "TIME_EXIT"
+                elif abs_pnl_pct < 1 and dur_min < 10:
+                    exit_reason = "BREAKEVEN_STOP"
+                else:
+                    exit_reason = "MARKET_CLOSE"  # Bitget pos-tpsl 触发
+
+                # v4.0: 风险监控
+                self.riskmon.record_closed_trade(pnl, base)
+                if self.perf:
                     self.perf.record_trade(
                         symbol=base, direction=side,
                         entry=entry, exit_price=mark,
                         pnl=pnl, pnl_pct=pnl_pct,
-                        strategy="pullback", duration_minutes=dur,
+                        strategy=close_strategy, duration_minutes=dur_min,
                     )
+
+                # v4.3: 写出场快照 — 含入场上下文 + 出场原因 + 持仓时长
+                factors = getattr(self, '_open_trade_factors', {}).pop(sym, {})
+                self.tlogger.log_exit_snapshot(
+                    symbol=base, direction=side,
+                    strategy=factors.get("strategy", close_strategy),
+                    entry_price=entry, exit_price=mark,
+                    pnl=pnl, pnl_pct=pnl_pct,
+                    exit_reason=exit_reason,
+                    hold_minutes=dur_min,
+                    score=factors.get("confidence", 0),
+                    ema_trend=factors.get("ema_trend", ""),
+                    kalman_dir=factors.get("_kalman_dir", ""),
+                    market_regime=factors.get("market_regime", ""),
+                )
+                # 保留旧日志做兼容 (后续可删)
                 self.tlogger.log_position_close(
                     symbol=base, direction=side, strategy=close_strategy,
                     entry_price=entry, exit_price=mark,
                     pnl=pnl, pnl_pct=pnl_pct,
-                    close_reason="DETECTED", holding_hours=0,
+                    close_reason=exit_reason, holding_hours=round(dur_min / 60, 1),
                 )
                 # v4.1: 累计已实现 PnL (用于审计对账)
                 self._bot_closed_pnl_total += pnl
@@ -2186,13 +2224,47 @@ class DeepSeekQuantBot:
                     self._position_strategies[sym_full] = strategy
                     if not hasattr(self, '_open_trade_factors'):
                         self._open_trade_factors = {}
+                    # v4.3: 完整开仓快照 — EMA趋势/Kalman方向/RSI/ADX/时段/市场状态
+                    ema50 = sig.get("_ema50", 0)
+                    ema200 = sig.get("_ema200", 0)
+                    if ema50 > ema200:
+                        ema_trend = "BULL"
+                    elif ema50 < ema200:
+                        ema_trend = "BEAR"
+                    else:
+                        ema_trend = "NEUTRAL"
                     self._open_trade_factors[sym_full] = {
                         "confidence": sig.get("confidence", 50),
                         "strategy": strategy, "direction": direction,
+                        "entry_price": sig.get("price", 0),
+                        "sl": sl_price,
+                        "tp": tp_price,
+                        "ema": sig.get("ema", 0),
+                        "rsi": sig.get("rsi", 0),
+                        "adx": sig.get("adx", 0),
+                        "ema_trend": ema_trend,
                         "_kalman_score": sig.get("_kalman_score", 0),
                         "_kalman_dir": sig.get("_kalman_dir", "flat"),
                         "_hurst_regime": sig.get("_hurst_regime", "random_walk"),
+                        "session": SessionManager.get_session_label() if hasattr(SessionManager, 'get_session_label') else "UNKNOWN",
+                        "market_regime": getattr(self, '_current_regime', 'unknown'),
+                        "bonuses": sig.get("bonuses", []),
                     }
+                    # v4.3: 开仓快照写 JSONL — 含完整入场上下文
+                    factors = self._open_trade_factors[sym_full]
+                    self.tlogger.log_entry_snapshot(
+                        symbol=symbol, direction=direction,
+                        strategy=factors["strategy"], score=factors["confidence"],
+                        entry_price=price, sl=sl_price, tp=tp_price,
+                        ema=factors["ema"], rsi=factors["rsi"], adx=factors["adx"],
+                        ema_trend=factors["ema_trend"],
+                        kalman_dir=factors["_kalman_dir"],
+                        kalman_score=factors["_kalman_score"],
+                        session=factors["session"],
+                        market_regime=factors["market_regime"],
+                        bonuses=factors["bonuses"],
+                        amount=int(result.get("amount", 0)),
+                    )
                     # v4.1: 存储本周期开仓快照 (供 _prev_positions 合并)
                     if not hasattr(self, '_this_cycle_trades'):
                         self._this_cycle_trades = {}
@@ -2933,6 +3005,11 @@ class DeepSeekQuantBot:
 
         # 6. 后处理
         self._phase_post_cycle(candidates, acct, cycle, trades_this_cycle)
+
+        # v4.3: 每周期过滤器统计
+        filter_counts = self.tlogger.get_filter_counts()
+        if filter_counts:
+            self.tlogger.log_filter_stats(cycle, filter_counts)
 
     def shutdown(self):
         """优雅退出: 写最终状态、关闭连接、记录停止事件"""
