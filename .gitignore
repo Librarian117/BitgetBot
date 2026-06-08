@@ -11,6 +11,7 @@ dist/
 # Bot 运行时数据 (服务器独立, 本地不跟踪)
 logs/
 *.jsonl
+deploy.log
 status.json
 health.json
 performance.json

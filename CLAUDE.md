@@ -28,21 +28,53 @@
 
 ## 启动/停止
 
-```bash
-# 本地启动
-python deepseek_quant_bot.py
+### Git 部署工作流 (主)
 
-# 智能同步部署 (MD5 差异对比, 只上传变更文件)
-.\sync.ps1                # 完整: 对比→上传变更→重启→显示日志
-.\sync.ps1 -DryRun        # 仅查看有无差异, 不上传
+```bash
+# 本地开发 → 提交推送
+git add -A
+git commit -m "feat: xxx"
+git push origin main
+
+# 服务器一键部署 (git pull + 优雅重启 + 记录)
+ssh root@8.210.3.197 "bash /root/BitgetBot/deploy.sh"
+```
+
+### 回滚
+
+```bash
+ssh root@8.210.3.197
+cd /root/BitgetBot
+git log --oneline -5                    # 找到目标 commit
+git reset --hard <commit>               # 回退版本
+bash deploy.sh                          # 重启
+```
+
+### 本地启动
+
+```bash
+python deepseek_quant_bot.py
+```
+
+### 备用部署 (GitHub 不可用时)
+
+```powershell
+.\sync.ps1                # MD5 对比 → SCP 上传变更 → 远程重启
+.\sync.ps1 -DryRun        # 仅查看有无差异
 .\sync.ps1 -NoRestart     # 上传但不重启 bot
 .\sync.ps1 -Full          # 强制全量上传
+```
 
-# 服务器手动操作
+### 服务器手动操作
+
+```bash
 ssh root@8.210.3.197
-pkill -f deepseek_quant_bot.py        # 停止
-bash /root/BitgetBot/start.sh         # 启动 (自动 nohup)
-tail -f /tmp/bot.log                  # 查看日志
+bash /root/BitgetBot/deploy.sh          # 一键部署 (推荐)
+bash /root/BitgetBot/start.sh           # 仅启动 (不拉代码)
+pkill -15 -f deepseek_quant_bot.py      # 优雅停止
+cat /root/BitgetBot/deploy.log          # 部署历史
+grep BOT_VERSION /tmp/bot.log           # 当前运行版本
+tail -f /tmp/bot.log                    # 实时日志
 ```
 
 ## 架构 (主文件 `deepseek_quant_bot.py`)

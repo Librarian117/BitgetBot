@@ -1,4 +1,6 @@
-# sync.ps1 - DeepSeekQuantBot 智能同步部署
+# sync.ps1 - DeepSeekQuantBot 智能同步部署 [备用方案]
+# 主部署方式: Git Push → GitHub → ssh deploy.sh (见 CLAUDE.md)
+# 备用场景: GitHub 不可用时直接 SCP 上传 (本脚本)
 # 用法: .\sync.ps1 [-DryRun] [-NoRestart] [-Full]
 param([switch]$DryRun, [switch]$NoRestart, [switch]$Full)
 

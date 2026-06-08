@@ -22,6 +22,8 @@ sleep 1
 
 # 3. 启动 (单实例, bot 自己管理 PID 文件)
 cd "$BOTDIR"
+VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+echo "BOT_VERSION=$VERSION" | tee -a "$LOGFILE"
 nohup python3 -u deepseek_quant_bot.py >"$LOGFILE" 2>&1 &
 BOT_PID=$!
 
