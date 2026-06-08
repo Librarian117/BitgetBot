@@ -866,26 +866,39 @@ class DeepSeekQuantBot:
                     logger.info(f"🌵 干旱自适应: RSI阈值放宽±{drought_relax} "
                                 f"(超卖{effective_oversold}/超买{effective_overbought})")
 
-            # ── v4.0: 卡尔曼滤波趋势共识 — EMA+Kalman双确认, 减少假方向死锁 ──
+            # ── v4.3: EMA+Kalman 共识/冲突处理 ──
+            # 核心改变: 冲突时不再硬拒绝，改为:
+            #   1. 统计冲突样本 (EMA方向 vs Kalman方向 vs 1h后实际走势)
+            #   2. 置信度扣分 (score -= 15)
+            #   3. 降级为 counter_trend (半仓 + 高置信度门槛)
             kalman_dir = quant.get("kalman_direction", "flat")
             kalman_score = quant.get("kalman_score", 0)
             ema_kalman_conflict = (
                 (is_bearish_trend and kalman_dir == "up")
                 or (is_bullish_trend and kalman_dir == "down")
             )
+            kalman_ema_disagree = False  # v4.3: 用于后续降分+降级
             if ema_kalman_conflict and abs(kalman_score) > 0.5:
-                # v4.2: EMA-Kalman冲突阈值从0.3→0.5，避免弱Kalman信号覆盖EMA长期趋势
-                # v4.1 fix: 卡尔曼短窗口(50bar≈4h)不可覆盖EMA200长期趋势
-                # 冲突时记录日志，保持EMA原判 (避免小时级反弹误翻方向)
-                self.tlogger.log_filter_reject(symbol, "EMA_KALMAN_CONFLICT",
-                    f"Kalman={kalman_dir}({kalman_score}) vs EMA", direction="")
-                logger.info(f"🔧 {symbol} EMA-Kalman冲突 → Kalman={kalman_dir}({kalman_score}) 保持EMA趋势")
+                ema_label = "SHORT" if is_bearish_trend else "LONG"
+                kalman_label = "LONG" if kalman_dir == "up" else "SHORT"
+                # v4.3: 冲突样本统计 — 用于后续离线分析谁更准
+                # 格式: EMA方向 | Kalman方向 | Kalman强度 | 当前价格
+                self.tlogger.log_filter_reject(symbol, "KALMAN_VS_EMA",
+                    f"EMA={ema_label} Kalman={kalman_label} "
+                    f"score={kalman_score:.2f} close={close:.4f}",
+                    direction="BOTH")
+                logger.info(
+                    f"📊 {symbol} EMA={ema_label} vs Kalman={kalman_label} "
+                    f"(score={kalman_score:.2f}) — 冲突样本已记录"
+                )
+                kalman_ema_disagree = True  # v4.3: 标记冲突, 后续降分+降级
 
-            # v4.0: 大趋势偏向 — 熊市不产LONG信号(必被过滤), 牛市不产SHORT
+            # v4.3: 大趋势偏向 — Kalman 冲突时降级而非硬拒绝
             bearish_bias = is_bearish_trend
             bullish_bias = is_bullish_trend
-            block_long = bearish_bias   # 熊市: 禁止做多信号
-            block_short = bullish_bias  # 牛市: 禁止做空信号
+            # 当EMA和Kalman冲突时, 不硬阻止 — 改在方向检查处降分+降级
+            block_long = bearish_bias and not kalman_ema_disagree
+            block_short = bullish_bias and not kalman_ema_disagree
             if bearish_bias:
                 # 熊市: 做空门槛从 overbought 降到 overbought-10 (最低45)
                 effective_overbought = max(45, effective_overbought - 10)
@@ -1041,7 +1054,19 @@ class DeepSeekQuantBot:
             # 深度超卖/超买的逆势信号标记为 counter_trend 并放行。
             if direction == "LONG" and strategy == "pullback":
                 if is_bearish_trend:
-                    if rsi > effective_oversold * 0.7:
+                    # v4.3: Kalman 冲突时放宽 RSI 门槛 — 不硬拒绝, 让评分系统决定
+                    if kalman_ema_disagree:
+                        # Kalman说涨 → 有反弹可能, 仅要求RSI不过分(不接飞刀)
+                        if rsi < 25:  # 极端超卖 → 可以尝试逆势
+                            logger.info(f"🔓 {symbol} LONG Kalman冲突→counter_trend "
+                                        f"(RSI={rsi:.1f}<25)")
+                            strategy = "counter_trend"
+                        else:
+                            # RSI不够极端, 但Kalman冲突 → 不拒绝, 保持pullback, 靠后续降分
+                            logger.info(f"🔓 {symbol} LONG Kalman冲突→保留pullback+降分 "
+                                        f"(RSI={rsi:.1f})")
+                            # 不放行counter_trend, 但也不return None — 让后面的评分系统决定
+                    elif rsi > effective_oversold * 0.7:
                         self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
                             f"熊市禁LONG RSI={rsi:.1f}>{effective_oversold*0.7:.0f}",
                             direction="LONG", strategy="pullback")
@@ -1056,7 +1081,15 @@ class DeepSeekQuantBot:
                         strategy = "counter_trend"
             elif direction == "SHORT" and strategy == "pullback":
                 if is_bullish_trend:
-                    if rsi < effective_overbought * 1.2:
+                    if kalman_ema_disagree:
+                        if rsi > 75:  # 极端超买 → 可以尝试逆势
+                            logger.info(f"🔓 {symbol} SHORT Kalman冲突→counter_trend "
+                                        f"(RSI={rsi:.1f}>75)")
+                            strategy = "counter_trend"
+                        else:
+                            logger.info(f"🔓 {symbol} SHORT Kalman冲突→保留pullback+降分 "
+                                        f"(RSI={rsi:.1f})")
+                    elif rsi < effective_overbought * 1.2:
                         self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
                             f"牛市禁SHORT RSI={rsi:.1f}<{effective_overbought*1.2:.0f}",
                             direction="SHORT", strategy="pullback")
@@ -1104,6 +1137,29 @@ class DeepSeekQuantBot:
             # ── v3.2: 高胜率加成 ──
             confidence = 50  # 基础分
             bonuses = []
+
+            # ── v4.3: EMA-Kalman 冲突降分 + 降级 ──
+            # 当 EMA 说熊市(禁LONG) 但 Kalman 说涨 → 不硬拒绝, 改为扣分+降级
+            if kalman_ema_disagree:
+                goes_against_ema = (
+                    (direction == "LONG" and is_bearish_trend) or
+                    (direction == "SHORT" and is_bullish_trend)
+                )
+                if goes_against_ema:
+                    # 第2步: 冲突降分 (硬拒绝 → 扣15分)
+                    kalman_penalty = int(abs(kalman_score) * 20)
+                    kalman_penalty = min(kalman_penalty, 20)  # 最多扣20
+                    confidence -= kalman_penalty
+                    bonuses.append(f"Kalman冲突-{kalman_penalty}")
+                    # 第3步: counter_trend 降级 (半仓+高置信度门槛由执行层处理)
+                    if strategy == "pullback":
+                        strategy = "counter_trend"
+                        bonuses.append("→counter_trend")
+                    logger.info(
+                        f"🔓 {symbol} {direction} EMA-Kalman冲突放行: "
+                        f"EMA={'熊' if is_bearish_trend else '牛'} Kalman={kalman_dir} "
+                        f"扣{kalman_penalty}分 | 策略={strategy}"
+                    )
 
             # 1. MACD 背离检测 (值 20 分)
             macd_hist = float(df["macd_hist"].iloc[-1])
