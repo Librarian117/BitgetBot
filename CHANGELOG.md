@@ -2,6 +2,26 @@
 
 ## 2026-06-08
 
+### 重大变更: Freqtrade 迁移试点
+- **调研**: Bitget U本位合约 Freqtrade 官方支持 (Isolated only, One-way Mode 强制, stoploss_on_exchange 可用, Hedge 模式不支持)
+- **环境**: `E:\freqtrade\` — Freqtrade 2026.5.1 + Python 3.14 + 10 币种 OHLCV 数据 (5m + 1h, 2024.06-2026.06)
+- **中文路径 Bug**: Python 3.14 multiprocessing + 中文用户名路径导致 Hyperopt 崩溃 → `run.ps1` 包装脚本绕过 (TEMP=E:\freqtrade\temp + PYTHONUTF8=1)
+- **项目已搁置**: 原 bot 服务器继续跑, Freqtrade 本机保留环境暂不切换
+
+### Freqtrade 回测迭代记录
+| 版本 | K线 | 策略 | Hyperopt | 盈亏 | 胜率 | 笔数 | 结论 |
+|------|-----|------|---------|------|------|------|------|
+| v4 | 1h | bollinger+pullback | 200 epochs | **+2.09%** | 48.5% | 478 | 🏆 当前最优 |
+| v5 | 1h | +独立pullback参数+新僵尸仓 | 100 epochs | -7.33% | 42.5% | 398 | 🔴 多变量同时改导致崩盘 |
+| v4+RSI43 | 1h | 仅改RSI 33→43 | 无 | +2.42% | 48.7% | 487 | pullback活了但不赚钱 |
+
+### 单变量实验结论 (20,080根1h K线)
+- **pullback v4 = 0 信号** (RSI<33/67 + ADX>27 完全压死)
+- **瓶颈是 RSI, 不是 ADX**: ADX 27→20 单独改 = 0 信号; RSI 33→43 单独改 = 26 信号
+- **pullback 即使活了也不赚钱**: 18笔全僵尸仓出场, -0.16%, 38.9%胜率
+- **最有用的方法是 Hyperopt**: -0.06% → +2.09% 的改进来自参数优化, 不是策略逻辑改动
+- **教训: 单变量实验, 先统计再改码**
+
 ### Bug 修复
 - **STRATEGY_ROUTE 误杀信号**: range 市场推荐策略从 `["pullback", "bollinger"]` 扩展为 `["pullback", "bollinger", "ema_cross"]`。死锁修复后 STRATEGY_ROUTE 成为新主导瓶颈——ema_cross/momentum 信号被全部拦截（6月7日晚至8日上午0笔交易），而 pullback 和 bollinger 在当前行情下无法触发（RSI未达极端值）。range≠完全横盘，当前温和偏向市场中 ema_cross 能有效捕捉小趋势。
 - **Markov 微调硬编码修正**: bear→range 和 bull→range 降级时推荐列表同步更新为 `["pullback", "bollinger", "ema_cross"]`

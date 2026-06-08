@@ -187,6 +187,73 @@ ssh root@8.210.3.197 "grep HEALTHY /root/BitgetBot/health.json"
 python -c "import json; [print(json.loads(l)) for l in open('logs/trades.jsonl').readlines()[-20:] if 'POSITION_CLOSE' in l or 'AI_DECISION' in l or 'CYCLE' in l]"
 ```
 
+## Freqtrade (独立试点)
+
+> 位于 `E:\freqtrade\` — 与主 bot 并行运行，纯英文路径避免 Python 3.14 中文 multiprocessing bug
+
+### 安装 & 环境
+
+```powershell
+cd E:\freqtrade
+.\run.ps1 list-strategies          # 验证环境 (自动设置 TEMP + UTF8 编码)
+```
+
+### 关键文件
+
+| 文件 | 用途 |
+|------|------|
+| `E:\freqtrade\config.json` | Bitget Futures 配置 (API密钥留空, 用环境变量) |
+| `E:\freqtrade\run.ps1` | 一键运行脚本 (自动修复中文路径 bug) |
+| `E:\freqtrade\strategies\bitget_simple_strategy.py` | 精简策略 (pullback + bollinger, 1h) |
+| `E:\freqtrade\strategies\bitget_hybrid_strategy.py` | 6 策略合一 (5m, 信号过多不推荐) |
+| `E:\freqtrade\FREQTRADE_迁移指南.md` | 完整使用文档 |
+
+### 常用命令
+
+```powershell
+cd E:\freqtrade
+
+# 回测
+.\run.ps1 backtesting -s BitgetSimpleStrategy --timerange 20250101-20260601 --fee 0.0006
+
+# Hyperopt (多线程, 200 epochs ≈ 30min)
+.\run.ps1 hyperopt -s BitgetSimpleStrategy --hyperopt-loss SharpeHyperOptLoss --spaces buy stoploss roi --epochs 200 -j 4
+
+# 模拟交易
+.\run.ps1 trade -s BitgetSimpleStrategy --dry-run
+
+# 实盘
+.\run.ps1 trade -s BitgetSimpleStrategy
+```
+
+### 回测基线 (2026-06-08 最终)
+
+| 策略 | K线 | 笔数 | 盈亏 | 胜率 | Sharpe | 说明 |
+|------|-----|------|------|------|--------|------|
+| BitgetSimpleStrategy v4 | 1h | 478 | **+2.09%** | 48.5% | 9.30 | 🏆 最优 (Hyperopt 200 epochs) |
+| BitgetSimpleStrategy v4+RSI43 | 1h | 487 | +2.42% | 48.7% | 10.58 | pullback活了但不赚钱 |
+| BitgetSimpleStrategy v5 | 1h | 398 | -7.33% | 42.5% | -17.0 | 多变量同时改-崩盘 |
+| BitgetHybridStrategy | 5m | 932 | -5.25% | 38.9% | -24.0 | 过度交易, 已弃用 |
+
+**v4 最优参数**: stoploss=-0.221, ROI={0:0.349, 154:0.233, 638:0.072, 1952:0}, RSI=33/67, ADX=27
+
+### 迭代教训
+- **Hyperopt 是最有效的改进手段** (-0.06%→+2.09%), 比手写策略逻辑可靠
+- **单变量实验 > 多变量同时改**: v5 改3-4个东西直接崩盘, 不知道哪个导致的
+- **先统计再改码**: 20,000根K线分析证明 pullback 瓶颈是 RSI 而非 ADX
+- **回测 +2% ≠ 实盘 +2%**: 92天太短, 没跑过 dry-run, 不能当真
+- **项目已搁置**: 原 bot 服务器继续跑, Freqtrade 本机随时可恢复
+
+### 核心差异 vs 主 Bot
+
+| 维度 | DeepSeekQuantBot | Freqtrade |
+|------|-----------------|-----------|
+| Hedge 模式 | 支持 (但方向失衡) | One-way only |
+| 止损管理 | 手写 pos-tpsl 映射 | 框架层自动 |
+| 参数优化 | 手写遗传进化 | Hyperopt (optuna) |
+| AI 审核 | DeepSeek (乱码 fallback) | 无 (纯规则) |
+| 信号过滤 | 10 层保护 | Protections 插件 |
+
 ## 关键 gotcha
 
 - **v4.1 AI 不是决策者** → 信号开仓由量化评分决定，AI 仅提供研究解释；`DEEPSEEK_SIGNAL_REVIEW_ENABLED` 默认 `false`
@@ -207,6 +274,8 @@ python -c "import json; [print(json.loads(l)) for l in open('logs/trades.jsonl')
 - **Kalman 方向冲突** → 信号方向与 Kalman 趋势相反时直接拒绝 (v4.1)
 - **币种止损冷却** → 同币种止损后 30 分钟内禁止重新开仓，防止连环止损 (v4.1)
 - **counter_trend 先于方向阻止通过** → 趋势校验→counter_trend 放行→方向阻止检查 (v4.1)
+- **过度过滤**: ADX 阈值经 SessionManager+沙箱+干旱自适应后 floor=6, 实际瓶颈是 Kalman+STRATEGY_ROUTE+方向阻止三层组合过滤, ADX 只是替罪羊
+- **Freqtrade 回测不可全信**: v4 +2.09% 仅 92 天验证期, 单一策略(bollinger), 90%僵尸仓出场, 未经历完整牛熊
 
 ## 关键 .env 配置
 

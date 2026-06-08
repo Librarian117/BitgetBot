@@ -73,7 +73,21 @@ class EquityAuditor:
         return entry
 
     def _alarm(self, deviation: float, entry: Dict):
-        """偏差超过阈值时记录报警"""
+        """偏差超过阈值时记录报警 (v4.1: 抑制重复报警 — 偏差变化<20%且<100USDT时不重复写日志)"""
+        # 检查是否需要抑制重复报警
+        if self.alarms:
+            last = self.alarms[-1]
+            last_dev = last["deviation"]
+            dev_change = abs(deviation - last_dev)
+            dev_pct_change = dev_change / (abs(last_dev) + 0.01)  # 避免除零
+            if dev_pct_change < 0.20 and dev_change < 100:
+                # 偏差未显著变化 → 更新计数但不写报警日志
+                self.alarms.append({
+                    "time": entry["time"], "deviation": deviation,
+                    "msg": f"偏差持续: {deviation:+.2f} (抑制)",
+                })
+                return
+
         direction = "虚增" if deviation < 0 else "低估"
         msg = (
             f"🚨 资金对账偏差 {deviation:+.2f} USDT ! "
