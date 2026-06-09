@@ -285,7 +285,8 @@ class TradeLogger:
                            ema: float, rsi: float, adx: float,
                            ema_trend: str, kalman_dir: str, kalman_score: float,
                            session: str, market_regime: str,
-                           bonuses: list, amount: int = 0):
+                           bonuses: list, amount: int = 0,
+                           rr_ratio: float = 0.0):
         """P2: 开仓完整快照 — 记录所有入场上下文，用于后续盈亏归因分析"""
         self._write({
             "event": "ENTRY_SNAPSHOT",
@@ -306,6 +307,7 @@ class TradeLogger:
             "market_regime": market_regime,   # TREND_UP / TREND_DOWN / RANGE / VOLATILE
             "bonuses": bonuses,               # 信号加成列表
             "amount_contracts": amount,
+            "rr_ratio": round(rr_ratio, 2),  # v4.4: 跨重启持久化
         })
 
     def log_exit_snapshot(self, symbol: str, direction: str, strategy: str,
@@ -341,4 +343,37 @@ class TradeLogger:
             "event": "FILTER_STATS",
             "cycle": cycle,
             "stats": stats,  # {"EMA_KALMAN_CONFLICT": 17, "ADX_TOO_LOW": 4, ...}
+        })
+
+    # ════════════════════════════════════════════
+    # v4.4: 影子模式 — WOULD_REJECT_RR / RR_OUTCOME / OPPOSITE_HELD 增强
+    # ════════════════════════════════════════════
+
+    def log_rr_shadow(self, symbol: str, direction: str, strategy: str,
+                      rr_ratio: float, expected_profit: float, fee: float,
+                      confidence: int, order_id: str = ""):
+        """P1: R:R 影子拦截 — 记录但不阻止，48h后用于阈值校准"""
+        self._write({
+            "event": "WOULD_REJECT_RR",
+            "symbol": symbol,
+            "direction": direction,
+            "strategy": strategy,
+            "rr_ratio": round(rr_ratio, 2),
+            "expected_profit": round(expected_profit, 4),
+            "fee": round(fee, 4),
+            "confidence": confidence,
+            "order_id": order_id,
+            "actual_pnl": None,  # 平仓后由 RR_OUTCOME 回填
+        })
+
+    def log_rr_outcome(self, symbol: str, direction: str, rr_ratio: float,
+                       actual_pnl: float, exit_reason: str = ""):
+        """P4: R:R 结果回填 — 平仓后补充 actual_pnl，用于按 RR 区间统计"""
+        self._write({
+            "event": "RR_OUTCOME",
+            "symbol": symbol,
+            "direction": direction,
+            "rr_ratio": round(rr_ratio, 2),
+            "actual_pnl": round(actual_pnl, 4),
+            "exit_reason": exit_reason,
         })

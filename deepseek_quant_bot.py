@@ -2096,6 +2096,24 @@ class DeepSeekQuantBot:
                     self.tlogger.log_risk("OI_BLOCK", f"{symbol} {direction}: {reason}")
                     continue
 
+            # ── v4.4: 禁止同币种对锁 ──
+            if not self.config.allow_hedge:
+                base = symbol.replace("/USDT:USDT", "")
+                pos_list = acct.get("positions_detail", [])
+                for existing in pos_list:
+                    if existing.get("symbol") == base and existing.get("side") != direction:
+                        logger.warning(
+                            f"⛔ {symbol} 已有{existing.get('side')}持仓，"
+                            f"allow_hedge=false → 拒绝开{direction}"
+                        )
+                        self.tlogger.log_filter_reject(symbol, "OPPOSITE_HELD",
+                            f"已有{existing.get('side')}反向仓, allow_hedge=false",
+                            direction=direction, strategy=strategy)
+                        sig["_blocked"] = True
+                        break
+            if sig.get("_blocked"):
+                continue
+
             # ── v4.0: 方向平衡 + 开仓间隔 ──
             pos_list = acct.get("positions_detail", [])
             if pos_list:
@@ -2264,6 +2282,7 @@ class DeepSeekQuantBot:
                         market_regime=factors["market_regime"],
                         bonuses=factors["bonuses"],
                         amount=int(result.get("amount", 0)),
+                        rr_ratio=result.get("rr_ratio", 0),  # v4.4: 跨重启持久化
                     )
                     # v4.1: 存储本周期开仓快照 (供 _prev_positions 合并)
                     if not hasattr(self, '_this_cycle_trades'):

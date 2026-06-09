@@ -211,6 +211,14 @@ class ConfigManager:
         # ── 沙箱标记（供 auto_tune 调整策略） ──
         self.is_sandbox = os.getenv("BITGET_SANDBOX", "true").lower() == "true"
 
+        # ── v4.4: 交易质量守卫 ──
+        # 禁止同一币种同时持有多空双向仓位 (Hedge模式)
+        self.allow_hedge = os.getenv("ALLOW_HEDGE", "false").lower() == "true"
+        # 最小风险回报比: TP距离/手续费距离 < 此值则拒绝开仓
+        self.min_rr_ratio = float(os.getenv("MIN_RR_RATIO", "1.5"))
+        # 沙箱也启用安全校验 (最小仓位/费后利润检查)
+        self.sandbox_safety = os.getenv("SANDBOX_SAFETY", "true").lower() == "true"
+
         # ── v3.0: 投资组合管理 ──
         self.portfolio_manager_enabled = os.getenv("PORTFOLIO_MANAGER_ENABLED", "false").lower() == "true"
         self.correlation_window_hours = int(os.getenv("CORRELATION_WINDOW_HOURS", "24"))

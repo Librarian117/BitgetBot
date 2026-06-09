@@ -26,6 +26,8 @@ class TradeExecutor:
         # ── v3.0: 安全层引用（由 DeepSeekQuantBot 在加载 safety 后设置） ──
         self.safety: Any = None
         self._skip_safety: bool = True  # 默认跳过安全校验，由 bot 启用
+        # ── v4.4: R:R 影子模式存储 — 开仓时记录, 平仓时回填 RR_OUTCOME ──
+        self._rr_shadow_store: Dict[str, dict] = {}
 
     # v4.0: 市场状态 → 仓位/SL 乘数
     REGIME_MULTIPLIERS = {
@@ -209,8 +211,39 @@ class TradeExecutor:
             f"预估总手续费={total_estimated_fee:.4f} USDT"
         )
 
-        # ── v3.0: 实盘安全检查 ──
-        if not self._skip_safety and self.safety:
+        # ── v4.4: 最小风险回报比检查 (影子模式 — 只记录不拦截) ──
+        _rr_ratio = 0.0
+        _rr_expected_profit = 0.0
+        if not self._skip_safety or self.config.sandbox_safety:
+            tp1_mult = self.config.tp_atr_mults[0] if self.config.tp_atr_mults else 2.0
+            tp_dist = tp1_mult * atr * effective_tp_mult
+            _rr_expected_profit = tp_dist * amount_contracts * contract_size
+            total_fee_cost = total_estimated_fee
+            if total_fee_cost > 0 and _rr_expected_profit > 0:
+                _rr_ratio = _rr_expected_profit / total_fee_cost
+                if _rr_ratio < self.config.min_rr_ratio:
+                    # 影子模式: 结构化记录, 不拒绝 (48h后数据驱动校准阈值)
+                    logger.warning(
+                        f"👻 {symbol} R:R影子: {expected_profit:.4f}/{total_fee_cost:.4f}"
+                        f" = {rr_ratio:.1f}x < {self.config.min_rr_ratio}x (放行)"
+                    )
+                    self.logger.log_rr_shadow(
+                        symbol=symbol.split(':')[0].split('/')[0],
+                        direction=direction, strategy=strategy,
+                        rr_ratio=_rr_ratio,
+                        expected_profit=_rr_expected_profit,
+                        fee=total_fee_cost,
+                        confidence=0,  # 由调用方回填
+                        order_id="",   # 下单后回填
+                    )
+                else:
+                    logger.debug(
+                        f"📊 {symbol} R:R通过: {expected_profit:.4f}/{total_fee_cost:.4f}"
+                        f" = {rr_ratio:.1f}x >= {self.config.min_rr_ratio}x"
+                    )
+
+        # ── v3.0: 实盘安全检查 (v4.4: 沙箱也启用) ──
+        if (not self._skip_safety or self.config.sandbox_safety) and self.safety:
             # 最小仓位
             ok, reason = self.safety.check_min_position_value(position_value, symbol)
             if not ok:
@@ -333,8 +366,8 @@ class TradeExecutor:
         )
 
         # ── 6. 下单 (部分止盈) ──
-        # ── v3.0: 带限价后备的市价单 ──
-        if not self._skip_safety and self.safety and self.config.limit_fallback_enabled:
+        # ── v3.0: 带限价后备的市价单 (v4.4: 沙箱也启用) ──
+        if (not self._skip_safety or self.config.sandbox_safety) and self.safety and self.config.limit_fallback_enabled:
             order = self.safety.place_with_limit_fallback(
                 symbol, side, amount_contracts, sl_price, tp_parts
             )
@@ -348,8 +381,8 @@ class TradeExecutor:
             )
 
         if order:
-            # ── v3.0: 订单成交确认 ──
-            if not self._skip_safety and self.safety and self.config.order_confirmation_enabled:
+            # ── v3.0: 订单成交确认 (v4.4: 沙箱也启用) ──
+            if (not self._skip_safety or self.config.sandbox_safety) and self.safety and self.config.order_confirmation_enabled:
                 confirmed, _ = self.safety.confirm_order_fill(
                     str(order.get("id", "")), symbol,
                     self.config.order_confirmation_timeout
@@ -361,6 +394,16 @@ class TradeExecutor:
 
             result["success"] = True
             result["order_id"] = str(order.get("id", "N/A"))
+            # v4.4: 回传 RR 数据到结果, 供 ENTRY_SNAPSHOT 持久化 (跨重启安全)
+            result["rr_ratio"] = _rr_ratio
+            result["rr_expected_profit"] = _rr_expected_profit
+            # v4.4: 内存存储 RR 数据, 供平仓时回填 RR_OUTCOME (重启后丢失但可从日志恢复)
+            symbol_short = symbol.split(':')[0].split('/')[0]
+            self._rr_shadow_store[symbol_short + '_' + direction] = {
+                'rr_ratio': _rr_ratio,
+                'expected_profit': _rr_expected_profit,
+                'strategy': strategy,
+            }
             self.logger.log_trade(
                 symbol=symbol, direction=direction, price=price,
                 sl=sl_price, tp_info=result["tp_info"],
@@ -380,6 +423,19 @@ class TradeExecutor:
             )
 
         return result
+
+    def pop_rr_shadow(self, symbol: str, direction: str) -> dict:
+        """v4.4: 平仓时取出 RR 影子数据并发射 RR_OUTCOME"""
+        key = symbol + '_' + direction
+        data = self._rr_shadow_store.pop(key, None)
+        if data and data.get('rr_ratio', 0) > 0:
+            self.logger.log_rr_outcome(
+                symbol=symbol, direction=direction,
+                rr_ratio=data['rr_ratio'],
+                actual_pnl=0,  # 由调用方回填
+                exit_reason="",
+            )
+        return data or {}
 
 
 # ============================================================================
