@@ -2,6 +2,50 @@
 
 ## 2026-06-09
 
+### v4.4: 交易质量守卫 + 归因数据闭环
+
+**Alpha Attribution — 7天实盘数据诊断**:
+- SHORT 87笔 胜率67% +$3,435 | LONG 42笔 胜率15% -$2,991
+- DOGE LONG 7笔全败 -$2,269 | LINK SHORT 12笔全胜 +$947
+- 核心问题不是参数，而是 LONG 方向在熊市中系统性失效
+
+**新增 3 个执行层守卫** (不改 Alpha 引擎):
+
+#### 1. 禁止同币种对锁 (`ALLOW_HEDGE=false`)
+- `_phase_execute()` 开仓前检查同一币种是否已有反向持仓
+- 如有 → `FILTER_REJECT: OPPOSITE_HELD` + 跳过
+- 配置化：设为 `true` 恢复 Hedge 对锁（未来组合策略用）
+
+#### 2. R:R 最小盈利门槛 — 影子模式 (`MIN_RR_RATIO=1.5`)
+- 预期TP1盈利 / 预估手续费 < 1.5x → 只记录不拦截
+- 新日志事件: `WOULD_REJECT_RR` (开仓时) + `RR_OUTCOME` (平仓时)
+- `ENTRY_SNAPSHOT.rr_ratio` 持久化 (跨重启安全)
+- 48h后按 RR 区间统计实际 PnL，数据驱动校准阈值
+
+#### 3. 沙箱风控统一 (`SANDBOX_SAFETY=true`)
+- `trade_executor.py` 安全校验从 `_skip_safety` 扩展为 `sandbox_safety`
+- 沙箱=实盘同一套: 最小仓位 + 费后利润 + 限价后备 + 成交确认
+- 消除 sandbox≠live 导致的回测失真
+
+**新增日志事件类型**:
+| 事件 | 触发时机 | 用途 |
+|------|---------|------|
+| `WOULD_REJECT_RR` | 开仓 RR 不足 | 48h影子统计 → 校准阈值 |
+| `RR_OUTCOME` | 平仓后回填 | 关联 actual_pnl → 按 RR 区间归因 |
+| `ENTRY_SNAPSHOT.rr_ratio` | 开仓快照 | 跨重启持久化 |
+
+**配置新增** (`.env`):
+```ini
+ALLOW_HEDGE=false       # 禁止同一币种多空对锁
+MIN_RR_RATIO=1.5        # 最小风险回报比 (影子模式)
+SANDBOX_SAFETY=true     # 沙箱启用安全校验
+```
+
+**下一步 (48h 数据收集后)**:
+- WOULD_REJECT_RR 按区间统计 → 确定真正有效的 RR 阈值
+- EXIT_SNAPSHOT × strategy × direction → 定位 LONG 亏损的具体策略组合
+- 如果 counter_trend × LONG 主导亏损 → 关闭该模块的 LONG 方向
+
 ### 日志系统 v4.3 — 新事件类型
 
 **新增 3 种日志事件** (写入 `logs/trades_YYYY-MM-DD.jsonl`):

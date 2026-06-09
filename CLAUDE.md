@@ -1,6 +1,6 @@
-# DeepSeekQuantBot v4.1 — 量化信号 + AI 研究顾问混合交易机器人
+# DeepSeekQuantBot v4.4 — 量化信号 + AI 研究顾问混合交易机器人
 
-> Bitget 沙箱 U本位合约 | 每 5 分钟扫描 | 量化决策引擎 | AI 研究层 (非决策) | 7 时段波动模型 | 纯量化遗传进化
+> Bitget 沙箱 U本位合约 | 每 5 分钟扫描 | 量化决策引擎 | AI 研究层 (非决策) | 7 时段波动模型 | 纯量化遗传进化 | 禁止对锁 | R:R影子模式 | 沙箱风控统一
 
 ## 项目规则
 
@@ -35,9 +35,31 @@
 git add -A
 git commit -m "feat: xxx"
 git push origin main
+```
 
-# 服务器一键部署 (git pull + 优雅重启 + 记录)
-ssh root@8.210.3.197 "bash /root/BitgetBot/deploy.sh"
+### SSH 中文路径修复
+
+Windows 用户名含中文 (`林华俊`) 导致 SSH 创建 `known_hosts` 时路径乱码。
+
+**解决方法**: 显式指定密钥和 known_hosts 路径:
+```bash
+SSH_KEY=/c/Users/林华俊/.ssh/id_ed25519
+KNOWN_HOSTS=/tmp/ssh_known_hosts
+
+# GitHub Push
+GIT_SSH_COMMAND="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS" git push origin main --tags
+
+# 服务器操作
+ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS root@8.210.3.197 "<command>"
+```
+
+### 部署
+```bash
+# 一键: commit → push → 服务器 deploy
+ssh -i /c/Users/林华俊/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/srv_known_hosts root@8.210.3.197 "cd /root/BitgetBot && git pull && echo 'BOT_VERSION='\$(git rev-parse --short HEAD) && bash deploy.sh"
+
+# 仅重启
+ssh ... root@8.210.3.197 "cd /root/BitgetBot && bash deploy.sh"
 ```
 
 ### 回滚
