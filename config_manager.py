@@ -218,6 +218,11 @@ class ConfigManager:
         self.min_rr_ratio = float(os.getenv("MIN_RR_RATIO", "1.5"))
         # 沙箱也启用安全校验 (最小仓位/费后利润检查)
         self.sandbox_safety = os.getenv("SANDBOX_SAFETY", "true").lower() == "true"
+        # v4.4: counter_trend 同质化限制 — 最多同时持有N个counter_trend仓位
+        self.max_counter_trend_positions = int(os.getenv("MAX_COUNTER_TREND_POSITIONS", "1"))
+        # v4.4: counter_trend RSI门槛 — LONG需RSI<=此值才为真正超卖
+        self.ct_rsi_long_max = float(os.getenv("CT_RSI_LONG_MAX", "45"))
+        self.ct_rsi_short_min = float(os.getenv("CT_RSI_SHORT_MIN", "55"))
 
         # ── v3.0: 投资组合管理 ──
         self.portfolio_manager_enabled = os.getenv("PORTFOLIO_MANAGER_ENABLED", "false").lower() == "true"

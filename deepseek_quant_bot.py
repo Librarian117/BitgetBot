@@ -1388,12 +1388,26 @@ class DeepSeekQuantBot:
                 except Exception:
                     pass  # 获取不到成交数据不影响决策
 
-            # ── v4.1: 最低置信度过滤 —— 弱信号不开仓 ──
-            # counter_trend 作为逆势机会可稍低, 趋势策略需更高置信度
-            min_conf = 45 if strategy == "counter_trend" else 55
+            # ── v4.4: 最低置信度过滤 —— 弱信号不开仓 ──
+            # counter_trend 作为逆势反转需更高置信度 + 极端 RSI 确认
+            min_conf = 58 if strategy == "counter_trend" else 55
             # v4.1: EMA-Kalman死锁降级的counter_trend需更高置信度
             if strategy == "counter_trend" and ema_kalman_conflict:
                 min_conf = 65
+            # v4.4: counter_trend 必须处于真正超卖/超买状态 (熊市反弹陷阱拦截)
+            if strategy == "counter_trend":
+                if direction == "LONG" and rsi > self.config.ct_rsi_long_max:
+                    logger.info(
+                        f"🔇 {symbol} counter_trend LONG RSI={rsi:.1f}>"
+                        f"{self.config.ct_rsi_long_max} → 不是真正超卖，拒绝"
+                    )
+                    return None
+                if direction == "SHORT" and rsi < self.config.ct_rsi_short_min:
+                    logger.info(
+                        f"🔇 {symbol} counter_trend SHORT RSI={rsi:.1f}<"
+                        f"{self.config.ct_rsi_short_min} → 不是真正超买，拒绝"
+                    )
+                    return None
             if confidence < min_conf:
                 logger.info(
                     f"🔇 {symbol} {direction} {strategy} 置信度{confidence}<{min_conf}，"
@@ -2207,6 +2221,21 @@ class DeepSeekQuantBot:
                         logger.info(f"  📊 OI仓位系数 {oi_mult:.2f}x (总={pos_mult:.2f}x)")
                 if pos_mult != 1.0:
                     logger.info(f"  📊 排名#{rank}/{total_cands} 总仓位系数 {pos_mult:.2f}x")
+                # v4.4: 同质化限制 — counter_trend 最多同时持有 N 个仓位
+                if strategy == "counter_trend":
+                    ct_count = sum(
+                        1 for s in getattr(self, '_position_strategies', {}).values()
+                        if s == "counter_trend"
+                    )
+                    if ct_count >= self.config.max_counter_trend_positions:
+                        logger.info(
+                            f"⛔ {symbol} counter_trend 同质化限制: "
+                            f"已有{ct_count}个counter_trend仓位 → 拒绝"
+                        )
+                        self.tlogger.log_filter_reject(symbol, "CT_CLUSTER_LIMIT",
+                            f"已有{ct_count}个counter_trend仓位, MAX={self.config.max_counter_trend_positions}",
+                            direction=direction, strategy=strategy)
+                        continue
                 # v4.1: EMA-Kalman死锁降级的counter_trend → 半仓
                 if strategy == "counter_trend":
                     pos_mult *= 0.5
