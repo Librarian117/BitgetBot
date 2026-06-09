@@ -1,5 +1,80 @@
 # Changelog
 
+## 2026-06-09
+
+### 日志系统 v4.3 — 新事件类型
+
+**新增 3 种日志事件** (写入 `logs/trades_YYYY-MM-DD.jsonl`):
+
+#### ENTRY_SNAPSHOT — 开仓完整快照
+```json
+{
+  "event": "ENTRY_SNAPSHOT",
+  "symbol": "ETH", "direction": "SHORT", "strategy": "pullback",
+  "score": 72, "entry_price": 1978.0, "sl": 2010.0, "tp": 1930.0,
+  "ema": 1975.0, "rsi": 68.0, "adx": 42.0,
+  "ema_trend": "BEAR",       // EMA50 vs EMA200: BULL/BEAR/NEUTRAL
+  "kalman_dir": "up",        // Kalman 方向: up/down/flat
+  "kalman_score": 0.75,      // Kalman 信号强度
+  "session": "US_OVERLAP",   // 7 时段标签
+  "market_regime": "TRENDING", // 市场状态
+  "bonuses": ["MACD底背离", "布林下轨"],  // 信号加成
+  "amount_contracts": 5
+}
+```
+
+#### EXIT_SNAPSHOT — 平仓完整快照
+```json
+{
+  "event": "EXIT_SNAPSHOT",
+  "symbol": "ETH", "direction": "SHORT", "strategy": "pullback",
+  "entry_price": 1978.0, "exit_price": 2051.0,
+  "pnl": -99.64, "pnl_pct": -30.0,
+  "exit_reason": "STOP_LOSS",    // STOP_LOSS/TAKE_PROFIT/TIME_EXIT/BREAKEVEN_STOP/MARKET_CLOSE
+  "hold_minutes": 265.0,         // 持仓时长(分钟)
+  "score_at_entry": 72,          // 入场时评分
+  "ema_trend_at_entry": "BEAR",  // 入场时 EMA 趋势
+  "kalman_at_entry": "up",       // 入场时 Kalman 方向
+  "regime_at_entry": "RANGING"   // 入场时市场状态
+}
+```
+
+#### FILTER_STATS — 每周期过滤器统计
+```json
+{
+  "event": "FILTER_STATS",
+  "cycle": 5,
+  "stats": {
+    "EMA_KALMAN_CONFLICT": 17,
+    "ADX_TOO_LOW": 4,
+    "DIRECTION_BLOCK": 2
+  }
+}
+```
+
+#### 出场原因分类 (替代旧的 `DETECTED`)
+| exit_reason | 判定条件 |
+|-------------|---------|
+| `STOP_LOSS` | PnL ≤ -25% |
+| `TAKE_PROFIT` | PnL ≥ 30% |
+| `TIME_EXIT` | 持仓 > 4h 且 |PnL| < 2% |
+| `BREAKEVEN_STOP` | |PnL| < 1% 且持仓 < 10min |
+| `MARKET_CLOSE` | Bitget pos-tpsl 触发 (其他情况) |
+
+#### POSITION_CLOSE 增强
+- 新增 `hold_minutes` 字段 (替代原来永远为 0 的 `holding_hours`)
+- `close_reason` 改为上述分类值
+
+### EMA-Kalman 冲突降分 v4.3
+
+- **EMA_KALMAN_CONFLICT**: 从硬拒绝改为置信度扣分(max 20) + counter_trend 降级
+- **KALMAN_CONFLICT (>0.8)**: 从硬拒绝改为重度扣分(max 25) + counter_trend 降级
+- **趋势偏向放宽**: Kalman 冲突时 `block_long`/`block_short` 不再拦截
+- **新增 KALMAN_VS_EMA 统计事件**: 记录 EMA方向/Kalman方向/当前价格, 用于离线分析谁更准
+
+### Bug 修复
+- **Dashboard SL/TP 双重检测**: 新增 `fetch_open_orders(stop=True)` 计划单兜底, 对齐 `_has_position_tpsl()` 逻辑。沙箱 pos-tpsl 在 `fetch_positions().info` 中不返回 stopLoss, 计划单可补充检测。裸仓从 4 降到 2
+
 ## 2026-06-08
 
 ### 重大变更: Freqtrade 迁移试点
