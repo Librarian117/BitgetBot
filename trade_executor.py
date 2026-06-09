@@ -238,8 +238,8 @@ class TradeExecutor:
                     )
                 else:
                     logger.debug(
-                        f"📊 {symbol} R:R通过: {expected_profit:.4f}/{total_fee_cost:.4f}"
-                        f" = {rr_ratio:.1f}x >= {self.config.min_rr_ratio}x"
+                        f"📊 {symbol} R:R通过: {_rr_expected_profit:.4f}/{total_fee_cost:.4f}"
+                        f" = {_rr_ratio:.1f}x >= {self.config.min_rr_ratio}x"
                     )
 
         # ── v3.0: 实盘安全检查 (v4.4: 沙箱也启用) ──
