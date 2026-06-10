@@ -1634,13 +1634,6 @@ class DeepSeekQuantBot:
                     kalman_dir=factors.get("_kalman_dir", ""),
                     market_regime=factors.get("market_regime", ""),
                 )
-                # 保留旧日志做兼容 (后续可删)
-                self.tlogger.log_position_close(
-                    symbol=base, direction=side, strategy=close_strategy,
-                    entry_price=entry, exit_price=mark,
-                    pnl=pnl, pnl_pct=pnl_pct,
-                    close_reason=exit_reason, holding_hours=round(dur_min / 60, 1),
-                )
                 # v4.1: 累计已实现 PnL (用于审计对账)
                 self._bot_closed_pnl_total += pnl
                 self._bot_closed_trade_count += 1
@@ -2298,21 +2291,24 @@ class DeepSeekQuantBot:
                         "bonuses": sig.get("bonuses", []),
                     }
                     # v4.3: 开仓快照写 JSONL — 含完整入场上下文
-                    factors = self._open_trade_factors[sym_full]
-                    self.tlogger.log_entry_snapshot(
-                        symbol=symbol, direction=direction,
-                        strategy=factors["strategy"], score=factors["confidence"],
-                        entry_price=price, sl=sl_price, tp=tp_price,
-                        ema=factors["ema"], rsi=factors["rsi"], adx=factors["adx"],
-                        ema_trend=factors["ema_trend"],
-                        kalman_dir=factors["_kalman_dir"],
-                        kalman_score=factors["_kalman_score"],
-                        session=factors["session"],
-                        market_regime=factors["market_regime"],
-                        bonuses=factors["bonuses"],
-                        amount=int(result.get("amount", 0)),
-                        rr_ratio=result.get("rr_ratio", 0),  # v4.4: 跨重启持久化
-                    )
+                    try:
+                        factors = self._open_trade_factors[sym_full]
+                        self.tlogger.log_entry_snapshot(
+                            symbol=symbol, direction=direction,
+                            strategy=factors["strategy"], score=factors["confidence"],
+                            entry_price=price, sl=sl_price, tp=tp_price,
+                            ema=factors["ema"], rsi=factors["rsi"], adx=factors["adx"],
+                            ema_trend=factors["ema_trend"],
+                            kalman_dir=factors["_kalman_dir"],
+                            kalman_score=factors["_kalman_score"],
+                            session=factors["session"],
+                            market_regime=factors["market_regime"],
+                            bonuses=factors["bonuses"],
+                            amount=int(result.get("amount", 0)),
+                            rr_ratio=result.get("rr_ratio", 0),
+                        )
+                    except Exception as e:
+                        logger.error(f"❌ ENTRY_SNAPSHOT 写入失败: {e}", exc_info=True)
                     # v4.1: 存储本周期开仓快照 (供 _prev_positions 合并)
                     if not hasattr(self, '_this_cycle_trades'):
                         self._this_cycle_trades = {}
