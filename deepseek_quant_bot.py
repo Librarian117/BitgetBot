@@ -153,6 +153,10 @@ class DeepSeekQuantBot:
         self._market_commentary: str = ""
         # ── v3.6: 仓位开仓时间追踪 (AI持仓审核用) ──
         self._position_open_times: Dict[str, float] = {}
+        # ── v4.5: Regime 切换追踪 — Regime Transition Attribution ──
+        self._regime_current: str = "unknown"
+        self._regime_start_time: float = time.time()
+        self._regime_start_cycle: int = 0
 
         # ── v3.0: 可选特性管理器 ──
         self.grid_manager: Any = None
@@ -1936,6 +1940,22 @@ class DeepSeekQuantBot:
                 tf_context, atr=atr, close=price, adx=adx, vol_ratio=vol_ratio_val,
                 markov_result=markov_sig)
             market_regime = regime_info.get("regime", "unknown")
+            # v4.5: Regime 切换检测 + 日志
+            if market_regime != self._regime_current:
+                duration_h = (time.time() - self._regime_start_time) / 3600.0
+                self.tlogger.log_regime_change(
+                    from_regime=self._regime_current,
+                    to_regime=market_regime,
+                    duration_hours=duration_h,
+                    cycle=self.cycle_count if hasattr(self, 'cycle_count') else 0,
+                )
+                logger.info(
+                    f"📊 Regime切换: {self._regime_current} → {market_regime} "
+                    f"(持续{duration_h:.1f}h)"
+                )
+                self._regime_current = market_regime
+                self._regime_start_time = time.time()
+                self._regime_start_cycle = self.cycle_count if hasattr(self, 'cycle_count') else 0
             # v4.0: 记录当前市场状态，供平仓归因使用
             self._current_regime = market_regime
             trend_aligned, alignment_reason = self._check_trend_alignment(direction, tf_context)
@@ -3053,7 +3073,8 @@ class DeepSeekQuantBot:
         # v4.3: 每周期过滤器统计
         filter_counts = self.tlogger.get_filter_counts()
         if filter_counts:
-            self.tlogger.log_filter_stats(cycle, filter_counts)
+            self.tlogger.log_filter_stats(cycle, filter_counts,
+                current_regime=self._regime_current)
 
     def shutdown(self):
         """优雅退出: 写最终状态、关闭连接、记录停止事件"""

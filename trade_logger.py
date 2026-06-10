@@ -337,12 +337,26 @@ class TradeLogger:
             "regime_at_entry": market_regime,  # 入场时市场状态
         })
 
-    def log_filter_stats(self, cycle: int, stats: dict):
+    def log_filter_stats(self, cycle: int, stats: dict, current_regime: str = ""):
         """P4: 每周期过滤器统计 — 一眼看出各过滤器的拦截次数"""
-        self._write({
+        record = {
             "event": "FILTER_STATS",
             "cycle": cycle,
-            "stats": stats,  # {"EMA_KALMAN_CONFLICT": 17, "ADX_TOO_LOW": 4, ...}
+            "stats": stats,
+        }
+        if current_regime:
+            record["current_regime"] = current_regime  # v4.5: Regime Attribution
+        self._write(record)
+
+    def log_regime_change(self, from_regime: str, to_regime: str,
+                          duration_hours: float, cycle: int):
+        """v4.5: Regime 切换事件 — 用于 Regime Transition Attribution"""
+        self._write({
+            "event": "REGIME_CHANGE",
+            "from": from_regime,
+            "to": to_regime,
+            "duration_hours": round(duration_hours, 1),
+            "cycle": cycle,
         })
 
     # ════════════════════════════════════════════
