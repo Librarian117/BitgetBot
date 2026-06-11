@@ -1,6 +1,58 @@
 # Changelog
 
-## 2026-06-09
+## 2026-06-11
+
+### v4.5: Pullback Confirmation Attribution — 归因驱动的信号质量分层
+
+> **核心原则**: 先归因，后修改。不新增防线。不预设根因。观测期至 06-25。
+
+**背景 — 72h 归因分析 (51 笔平仓)**:
+- 已排除: counter_trend/LONG/Regime/RSI/ADX 作为亏损主因
+- **核心发现**: pullback SHORT 内部混入两种完全不同质量的信号
+  - 类型 A (赚钱): 3连阴 + 强阴线 + MACD空头 (多重确认)，持仓 78min，+698
+  - 类型 B (亏钱): MACD空头单独 或 +布林上轨 (弱确认)，持仓 29min，-1,040
+- RSI/ADX/Confidence 几乎无法区分好坏信号 (差异 <5%)
+- 信号结构 (确认层数) 有显著区分力: 强阴线 +40%, 3连阴 +30%
+
+**新增观测能力 (不改策略行为)**:
+
+#### 1. Regime Attribution 观测日志 (Phase 1)
+- `EXIT_SNAPSHOT.regime_at_entry` 从 `_open_trade_factors.market_regime` 填充
+- 新增 `REGIME_CHANGE` 事件 (from/to/duration_hours/cycle)
+- `FILTER_STATS` 增加 `current_regime` 字段
+- 纯观测，不影响任何交易决策
+
+#### 2. counter_trend 防守强化 (基于熊市反弹陷阱分析)
+- 最低置信度: 45 → **58** (常态), 死锁降级时 **65**
+- **RSI 硬性门槛**: LONG 要求 RSI ≤ `CT_RSI_LONG_MAX`, SHORT 要求 RSI ≥ `CT_RSI_SHORT_MIN`
+- **同质化限制**: `MAX_COUNTER_TREND_POSITIONS` 限制同时持仓数 (CT_CLUSTER_LIMIT)
+- 目的: 拦截熊市中"假超卖→反弹失败"的陷阱信号
+
+#### 3. PnL 跨重启不再累计
+- 从 `_restore_state()` 中移除 `bot_closed_pnl_total` 恢复
+- 启动权益由交易所实际余额决定，不再跨重启累计
+- 消除"bot 预期 vs 实际"审计偏差
+
+#### 4. TPSL 沙箱信任缓存修复
+- 平仓时清除 `_tpsl_cache`，避免仓位已关仍认为有保护
+- 消除误报"裸仓" (盘中检测到缺 SL 但实际已平仓)
+
+#### 5. 日志优化
+- 消除平仓日志重复 (`log_position_close` + `log_exit_snapshot` → 仅后者)
+- `ENTRY_SNAPSHOT` 增加 try/except 异常保护
+- 日亏损锁日志降频 (每小时最多一次，减少噪声)
+
+**新增 .env 配置**:
+```ini
+MAX_COUNTER_TREND_POSITIONS=2   # counter_trend 同时最大持仓数
+CT_RSI_LONG_MAX=35              # counter_trend LONG 最大 RSI (超卖确认)
+CT_RSI_SHORT_MIN=65             # counter_trend SHORT 最小 RSI (超买确认)
+```
+
+**Phase 2 计划 (观测期 06-11 ~ 06-25)**:
+- 收集 100-200 笔样本，验证"确认层数 vs PF"单调性
+- 如果单调性成立 → 为 pullback 信号增加确认层数权重
+- 如果单调性不成立 → 寻找下一个候选因子
 
 ### v4.4: 交易质量守卫 + 归因数据闭环
 

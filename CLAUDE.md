@@ -1,6 +1,6 @@
-# DeepSeekQuantBot v4.4 — 量化信号 + AI 研究顾问混合交易机器人
+# DeepSeekQuantBot v4.5 — 量化信号 + AI 研究顾问混合交易机器人
 
-> Bitget 沙箱 U本位合约 | 每 5 分钟扫描 | 量化决策引擎 | AI 研究层 (非决策) | 7 时段波动模型 | 纯量化遗传进化 | 禁止对锁 | R:R影子模式 | 沙箱风控统一
+> Bitget 沙箱 U本位合约 | 每 5 分钟扫描 | 量化决策引擎 | AI 研究层 (非决策) | 7 时段波动模型 | 纯量化遗传进化 | 禁止对锁 | R:R影子模式 | 沙箱风控统一 | Pullback Confirmation Attribution | Regime 切换观测
 
 ## 项目规则
 
