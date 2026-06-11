@@ -2303,6 +2303,9 @@ class DeepSeekQuantBot:
                         ema_trend = "BEAR"
                     else:
                         ema_trend = "NEUTRAL"
+                    sl_price = result.get("sl", 0)
+                    tp_parts = result.get("tp_info", [])
+                    tp_price = tp_parts[0].get("price", 0) if tp_parts else 0
                     self._open_trade_factors[sym_full] = {
                         "confidence": sig.get("confidence", 50),
                         "strategy": strategy, "direction": direction,
