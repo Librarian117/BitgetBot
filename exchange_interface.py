@@ -19,7 +19,7 @@ class ExchangeInterface:
         self.config = config
         self.exchange: ccxt.Exchange = self._build_exchange()
         self._trading_fees: Dict[str, float] = {}  # unified symbol -> taker fee
-        self._tpsl_cache: Dict[str, Tuple[float, float]] = {}  # v4.5: 沙箱TPSL信任缓存 {symbol: (sl, tp)}
+        self._tpsl_cache: Dict[Tuple[str, str, int], Tuple[float, float, float]] = {}  # v4.5: {(symbol, side, entry_int): (sl, tp, ts)} 含方向+entry+TTL
         self._load_markets()
         self._load_trading_fees()
 
@@ -128,7 +128,10 @@ class ExchangeInterface:
             self._cache_set(cache_key, result)
             return result
         except Exception:
-            return {"free": 10000.0, "total": 10000.0, "used": 0.0}
+            # v4.5: 沙箱允许模拟余额，实盘必须失败
+            if self.config.is_sandbox:
+                return {"free": 10000.0, "total": 10000.0, "used": 0.0}
+            raise
 
     def fetch_usdt_balance(self) -> float:
         """查询 USDT 可用余额（带缓存，沙箱降级：失败时返回模拟余额）"""
@@ -138,16 +141,19 @@ class ExchangeInterface:
             logger.info(f"💰 USDT 可用余额: {free:.2f}")
             return free
         except Exception as e:
-            err_msg = str(e)[:120]
-            logger.warning(f"⚠️  余额查询不可用 ({err_msg})，使用模拟余额 10000 USDT")
-            return 10000.0
+            if self.config.is_sandbox:
+                logger.warning(f"⚠️  余额查询不可用 ({str(e)[:120]})，使用模拟余额 10000 USDT")
+                return 10000.0
+            raise
 
     def fetch_total_balance(self) -> float:
         """查询 USDT 总余额 (带缓存，free + used)"""
         try:
             return self._fetch_balance_dict()["total"]
         except Exception:
-            return self.fetch_usdt_balance()
+            if self.config.is_sandbox:
+                return self.fetch_usdt_balance()
+            raise
 
     def get_account_summary(self) -> Dict[str, Any]:
         """
@@ -271,6 +277,7 @@ class ExchangeInterface:
         amount: float,
         sl_price: float,
         tp_parts: List[Tuple[float, float]],
+        pos_side: str = "",  # v4.5: 显式持仓方向 "long"/"short", 空字符串则从side推导
     ) -> Optional[Dict]:
         """
         下单市价单 + 止损 + 部分止盈 (v2)
@@ -278,15 +285,22 @@ class ExchangeInterface:
         tp_parts: [(tp_price, amount_ratio), ...]
           - 第一批 TP 附带在主单上（原子化）
           - 后续 TP 作为独立 reduceOnly 限价单
+
+        v4.5: side 用于 ccxt (buy/sell), pos_side 用于 TPSL 方向 (long/short)
         """
+        # v4.5: 清除上一轮的 TPSL 致命标志 (防止跨周期残留，在所有return之前)
+        self._tpsl_fatal = None
+
         if not tp_parts:
             logger.error(f"❌ tp_parts 为空 {symbol}")
             return None
 
         try:
+            # v4.5: 推导持仓方向，不再把 buy/sell 传给 TPSL 方法
+            _pos_side = pos_side if pos_side else ("short" if side in ("sell", "SHORT") else "long")
             logger.info(
                 f"🔔 下单(分步SL/TP): {symbol} {side.upper()} | "
-                f"数量={amount}张 | SL={sl_price:.4f}"
+                f"持仓方向={_pos_side} | 数量={amount}张 | SL={sl_price:.4f}"
             )
 
             # ── v3.6 重构: 市价开仓 + place-pos-tpsl 一次设 SL/TP ──
@@ -306,20 +320,58 @@ class ExchangeInterface:
             # v4.0: 使用 tp_parts 中的第一个 TP 价格 (而非硬编码 2%)
             if tp_parts and len(tp_parts) > 0:
                 tp_price = tp_parts[0][0]
-                # 验证 TP 方向 (从成交价重新校验)
-                if side == "SHORT" and tp_price >= fill_price:
-                    tp_price = fill_price * 0.98  # 回退
-                elif side == "buy" and tp_price <= fill_price:
-                    tp_price = fill_price * 1.02  # 回退
+                # v4.5: TP 方向校验基于持仓方向 (不再是 side=="SHORT" 这种永不命中的分支)
+                if _pos_side == "short" and tp_price >= fill_price:
+                    tp_price = fill_price * 0.98  # 做空TP必须 < 入场价
+                    logger.warning(f"⚠️  TP方向修正: SHORT TP>=入场 → {tp_price:.4f}")
+                elif _pos_side == "long" and tp_price <= fill_price:
+                    tp_price = fill_price * 1.02  # 做多TP必须 > 入场价
+                    logger.warning(f"⚠️  TP方向修正: LONG TP<=入场 → {tp_price:.4f}")
             else:
                 # 无 tp_parts 时的回退
-                tp_price = fill_price * 0.98 if side in ("sell", "SHORT") else fill_price * 1.02
-            self.set_position_sl_tp(symbol, side, sl_price, tp_price)
+                tp_price = fill_price * 0.98 if _pos_side == "short" else fill_price * 1.02
+            # v4.5: 显式传 "long"/"short"，不再传 "buy"/"sell"
+            tpsl_ok = self.set_position_sl_tp(symbol, _pos_side, sl_price, tp_price)
+
+            # ── v4.5 CRITICAL: TPSL 失败不允许进入成功持仓状态 ──
+            # 主单已成交但保护单挂载失败 = 裸仓，必须立即处理
+            if not tpsl_ok:
+                logger.error(
+                    f"🚨 {symbol} TPSL挂载失败! pos-tpsl+plan双重失败，复核保护状态..."
+                )
+                # 同步复核 — 3 层检测 (缓存/fetch_positions/fetch_open_orders)
+                has_sl, has_tp = self._has_position_tpsl(symbol, fill_price, _pos_side)
+                if not has_sl:
+                    logger.error(
+                        f"🔥 {symbol} 复核确认无SL保护 → 裸仓风险 → 立即市价平仓!"
+                    )
+                    # v4.5: TPSL 附着失败 → 紧急平仓，不允许裸仓存在
+                    try:
+                        close_order = self.create_market_order_close(
+                            symbol, amount, side, pos_side=_pos_side
+                        )
+                        if close_order:
+                            logger.warning(
+                                f"🛑 {symbol} 紧急平仓成功 (TPSL失败保护) "
+                                f"ID={close_order.get('id','N/A')}"
+                            )
+                    except Exception as close_e:
+                        logger.error(f"💥 {symbol} 紧急平仓也失败: {close_e}")
+                    # v4.5: 设致命标志位 → 通知调用方"市价单已成但TPSL致命失败，禁止重试"
+                    # 防止 safety_manager.place_with_limit_fallback 降级到限价单重开仓
+                    self._tpsl_fatal = symbol
+                    # 无论平仓成功与否，都标记为失败，不进入成功持仓状态
+                    return None
+                else:
+                    # SL 已由交易所端自动挂载（pos-tpsl code=00000 但返回False的边界情况）
+                    logger.info(
+                        f"🛡️  {symbol} 复核确认SL已存在 (可能交易所异步挂载) → 放行"
+                    )
 
             # v4.0: 多级 TP (第2级+) 用独立计划单补充
             if tp_parts and len(tp_parts) > 1:
                 raw_symbol = symbol.split(":")[0].replace("/", "")
-                hold_side = "short" if side in ("sell", "SHORT") else "long"
+                hold_side = _pos_side  # v4.5: 直接用持仓方向
                 for tp_p, ratio in tp_parts[1:]:
                     try:
                         # v4.0 fix: 使用 price_to_precision 适配不同价格精度
@@ -472,22 +524,73 @@ class ExchangeInterface:
         has_sl, has_tp = False, False
 
         # 方法0: v4.5 内存缓存 — 沙箱 set_position_sl_tp 的 code=00000 信任
-        if symbol in self._tpsl_cache:
-            return (True, True)
+        # 缓存键: (symbol, side, entry_int) — 含entry防同方向不同价位的缓存穿越
+        side_norm = "long" if str(side).upper() in ("BUY", "LONG") else "short"
+        _entry_int = int(round(entry_price, 2) * 100) if entry_price > 0 else 0
+        # v4.5: 尝试精确匹配 + entry模糊匹配 (允许±1%的entry偏差)
+        CACHE_TTL = 600  # 10分钟TTL
+        for _offset in (0, -1, 1, -2, 2):  # entry_key 允许轻微偏差
+            _try_key = (symbol, side_norm, _entry_int + _offset)
+            if _try_key in self._tpsl_cache:
+                _, _, cache_ts = self._tpsl_cache[_try_key]
+                if time.time() - cache_ts > CACHE_TTL:
+                    del self._tpsl_cache[_try_key]
+                    continue  # TTL过期, 尝试下一个偏移
+                # 验证持仓仍存在
+                try:
+                    pos_list = self.exchange.fetch_positions([symbol])
+                    has_matching_pos = any(
+                        abs(float(p.get("contracts", 0) or 0)) > 0
+                        for p in pos_list
+                    )
+                    if not has_matching_pos:
+                        del self._tpsl_cache[_try_key]
+                        logger.debug(f"🧹 {symbol} TPSL缓存失效: 持仓已关闭")
+                    else:
+                        return (True, True)
+                except Exception:
+                    return (True, True)
+                break  # 找到了key, 无论是否命中都停止偏移搜索
 
         # 方法1: fetch_positions — 实盘返回 stopLoss/takeProfit
+        # v4.5: 增加方向校验 — 只检查非0值不够, 必须确认 SL/TP 在正确方向
         try:
             pos_list = self.exchange.fetch_positions([symbol])
+            side_is_long = str(side).upper() in ("BUY", "LONG")
             for p in pos_list:
                 if abs(float(p.get("contracts", 0) or 0)) <= 0:
                     continue
                 info = p.get("info", {})
-                sl_val = info.get("stopLoss", info.get("stopLossPrice", ""))
-                tp_val = info.get("takeProfit", info.get("takeProfitPrice", ""))
-                if sl_val and str(sl_val) not in ("0", "", "None"):
-                    has_sl = True
-                if tp_val and str(tp_val) not in ("0", "", "None"):
-                    has_tp = True
+                sl_raw = info.get("stopLoss", info.get("stopLossPrice", ""))
+                tp_raw = info.get("takeProfit", info.get("takeProfitPrice", ""))
+                # 用持仓 mark 价做方向参照 (比 entry_price 更实时)
+                mark_p = float(p.get("markPrice", 0) or 0)
+                if mark_p <= 0:
+                    mark_p = entry_price
+                # SL 方向校验
+                if sl_raw and str(sl_raw) not in ("0", "", "None"):
+                    sl_f = float(sl_raw)
+                    if side_is_long and sl_f < mark_p:
+                        has_sl = True
+                    elif not side_is_long and sl_f > mark_p:
+                        has_sl = True
+                    else:
+                        logger.warning(
+                            f"⚠️  {symbol} SL方向异常: SL={sl_f} mark={mark_p} "
+                            f"side={'LONG' if side_is_long else 'SHORT'} → 视为无效保护"
+                        )
+                # TP 方向校验
+                if tp_raw and str(tp_raw) not in ("0", "", "None"):
+                    tp_f = float(tp_raw)
+                    if side_is_long and tp_f > mark_p:
+                        has_tp = True
+                    elif not side_is_long and tp_f < mark_p:
+                        has_tp = True
+                    else:
+                        logger.warning(
+                            f"⚠️  {symbol} TP方向异常: TP={tp_f} mark={mark_p} "
+                            f"side={'LONG' if side_is_long else 'SHORT'} → 视为无效保护"
+                        )
         except Exception:
             logger.debug("⚠️  静默异常", exc_info=True)
 
@@ -587,10 +690,10 @@ class ExchangeInterface:
             side_lower = side.lower() if isinstance(side, str) else ""
             if side_lower in ("long", "short"):
                 hold_side = side_lower
-            elif side_lower in ("buy",):      # 兼容旧调用: buy=平空仓=hold short
-                hold_side = "short"
-            elif side_lower in ("sell",):     # 兼容旧调用: sell=平多仓=hold long
+            elif side_lower in ("buy",):      # v4.5 fix: buy=开多仓 → hold long (不是平空仓!)
                 hold_side = "long"
+            elif side_lower in ("sell",):     # v4.5 fix: sell=开空仓 → hold short (不是平多仓!)
+                hold_side = "short"
             else:
                 hold_side = "long"  # fallback
 
@@ -643,7 +746,11 @@ class ExchangeInterface:
             if code == "00000":
                 logger.info(f"🛡️🎯 {symbol} SL={sl_str} TP={tp_str} → pos-tpsl OK")
                 # v4.5: 沙箱信任缓存 — _has_position_tpsl 可查此缓存
-                self._tpsl_cache[symbol] = (float(sl_str), float(tp_str))
+                # v4.5: 缓存键 (symbol, side, entry_int) + TTL — 同方向不同entry可区分
+                _entry_key = int(float(mark) * 100) if mark > 0 else 0  # 精度0.01
+                self._tpsl_cache[(symbol, hold_side, _entry_key)] = (
+                    float(sl_str), float(tp_str), time.time()
+                )
                 return True
 
             # v4.0: place-pos-tpsl 失败 → 降级用独立计划单

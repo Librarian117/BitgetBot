@@ -160,7 +160,15 @@ class RiskMonitor:
     def can_trade(self) -> bool:
         """检查是否允许交易 (v4.0: 连续亏损冷却 + 百分比硬兜底)"""
         self._refresh()
+        return self._check_trade_allowed()
 
+    def can_trade_with_data(self, acct: Dict[str, Any]) -> bool:
+        """v4.5: 使用同一份账户快照判断，不再重复 _refresh()"""
+        self._refresh_with_data(acct)
+        return self._check_trade_allowed()
+
+    def _check_trade_allowed(self) -> bool:
+        """v4.5: 不含 _refresh 的纯判断逻辑 — can_trade 和 can_trade_with_data 共用"""
         now = time.time()
 
         # 1. 冷却检查: 冷却期未过?
@@ -191,10 +199,6 @@ class RiskMonitor:
             return False
 
         return True
-
-    def can_trade_with_data(self, acct: Dict[str, Any]) -> bool:
-        self._refresh_with_data(acct)
-        return self.can_trade()  # 共用冷却逻辑 (不重复 refresh)
 
     def get_status(self) -> Dict[str, Any]:
         all_time_pnl = (self.current_equity - self.initial_equity) if self.initial_equity > 0 else 0.0

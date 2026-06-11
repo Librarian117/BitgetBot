@@ -224,8 +224,8 @@ class TradeExecutor:
                 if _rr_ratio < self.config.min_rr_ratio:
                     # 影子模式: 结构化记录, 不拒绝 (48h后数据驱动校准阈值)
                     logger.warning(
-                        f"👻 {symbol} R:R影子: {expected_profit:.4f}/{total_fee_cost:.4f}"
-                        f" = {rr_ratio:.1f}x < {self.config.min_rr_ratio}x (放行)"
+                        f"👻 {symbol} R:R影子: {_rr_expected_profit:.4f}/{total_fee_cost:.4f}"
+                        f" = {_rr_ratio:.1f}x < {self.config.min_rr_ratio}x (放行)"
                     )
                     self.logger.log_rr_shadow(
                         symbol=symbol.split(':')[0].split('/')[0],
@@ -327,9 +327,11 @@ class TradeExecutor:
 
         if direction == "LONG":
             side = "buy"
+            pos_side = "long"     # v4.5: 显式持仓方向，不再把buy/sell传给TPSL
             sl_price = price - sl_dist - slippage
         else:
             side = "sell"
+            pos_side = "short"    # v4.5: 显式持仓方向
             sl_price = price + sl_dist + slippage
 
         if sl_price <= 0:
@@ -358,18 +360,112 @@ class TradeExecutor:
             {"price": round(p, 4), "ratio": r} for p, r in tp_parts
         ]
 
+        # ── v4.5: 按止损风险 sizing (替代纯保证金比例sizing) ──
+        # 核心: amount = risk_usdt / (sl_dist * contract_size)
+        # 保证金上限仅作为第二层约束，不替代 SL 风险控制
+        RISK_PER_TRADE_PCT = getattr(self.config, 'risk_per_trade_pct', 0.02)  # 默认 2%
+        _equity = balance
+        try:
+            _acct = self.exchange.get_account_summary()
+            _equity = _acct.get("equity", balance)
+        except Exception:
+            pass
+        risk_usdt = _equity * RISK_PER_TRADE_PCT
+        loss_per_contract = (sl_dist + slippage) * contract_size
+        _risk_capped = False
+        if loss_per_contract > 0:
+            risk_contracts = risk_usdt / loss_per_contract
+            if risk_contracts < amount_contracts:
+                old_amount = amount_contracts
+                # v4.5: 最小张数超出风险预算 → 硬拒绝, 不强行开仓
+                _min_risk = min_amount * loss_per_contract
+                if _min_risk > risk_usdt:
+                    logger.error(
+                        f"⛔ {symbol} 风险预算拒绝: 最小{min_amount}张 "
+                        f"SL亏损={_min_risk:.2f}U > 风险预算{risk_usdt:.2f}U "
+                        f"({RISK_PER_TRADE_PCT*100:.0f}%权益)"
+                    )
+                    result["_risk_rejected"] = True
+                    return result
+                amount_contracts = max(min_amount, math.floor(risk_contracts))
+                if amount_contracts < old_amount:
+                    position_value = amount_contracts * price * contract_size
+                    margin = position_value / effective_leverage
+                    result["amount"] = amount_contracts
+                    # 重算手续费 (仓位已变)
+                    entry_fee = position_value * taker_fee
+                    exit_fee = position_value * taker_fee * len(self.config.tp_split_ratios)
+                    total_estimated_fee = entry_fee + exit_fee
+                    result["entry_fee"] = entry_fee
+                    result["total_fee"] = total_estimated_fee
+                    _risk_capped = True
+                    logger.info(
+                        f"🔒 {symbol} 风险sizing: {old_amount}→{amount_contracts}张 "
+                        f"(SL亏损={loss_per_contract*amount_contracts:.2f}U ≤ "
+                        f"风险预算={risk_usdt:.2f}U = {RISK_PER_TRADE_PCT*100:.0f}%权益)"
+                    )
+
+        _actual_risk_pct = (loss_per_contract * amount_contracts / _equity * 100) if _equity > 0 else 0
         logger.info(
             f"📏 {symbol} {direction}: 入场≈{price:.4f} | "
-            f"SL={sl_price:.4f} (距离={sl_dist:.4f} + 滑点={slippage:.4f}) | "
+            f"SL={sl_price:.4f} (距离={sl_dist:.4f}+滑点{slippage:.4f}) | "
+            f"风险={loss_per_contract*amount_contracts:.2f}U ({_actual_risk_pct:.1f}%权益)"
+            f"{' ⚠️已截断' if _risk_capped else ''} | "
             f"盈亏比≈1:{self.config.tp_atr_mults[-1]/self.config.sl_atr_mult:.1f} | "
             f"预估手续费={total_estimated_fee:.4f}"
         )
+
+        # ── v4.5: 强平风险预算 (Bitget 维护保证金 / 仓位层级) ──
+        # 硬规则: 预估强平距离 > SL距离 × 安全倍数 (默认1.5x)
+        # 防止极端波动下 SL 未成交仓位已近强平区
+        LIQ_SAFETY_MULTIPLE = 1.5
+        try:
+            mmr = 0.005  # 默认 0.5% 维护保证金率 (USDT 永续标准)
+            if direction == "LONG":
+                est_liq = price * (1.0 - 1.0 / effective_leverage + mmr)
+                liq_dist_pct = (price - est_liq) / price * 100
+            else:
+                est_liq = price * (1.0 + 1.0 / effective_leverage - mmr)
+                liq_dist_pct = (est_liq - price) / price * 100
+
+            sl_dist_pct = abs(sl_price - price) / price * 100
+
+            if sl_dist_pct > 0 and liq_dist_pct < sl_dist_pct * LIQ_SAFETY_MULTIPLE:
+                logger.error(
+                    f"⛔ {symbol} 强平预算拒绝: "
+                    f"预估强平距离={liq_dist_pct:.1f}% < "
+                    f"SL距离={sl_dist_pct:.1f}% × {LIQ_SAFETY_MULTIPLE}x "
+                    f"= {sl_dist_pct * LIQ_SAFETY_MULTIPLE:.1f}%"
+                )
+                result["_liq_rejected"] = True
+                return result
+
+            # 组合保证金率: (现有保证金 + 新仓) / 权益
+            # 25% 预警线 (远低于 50% 硬上限, 为极端波动留缓冲)
+            COMBINED_MARGIN_WARN = 0.25
+            acct2 = self.exchange.get_account_summary()
+            total_margin_after = acct2.get("used_margin", 0) + margin
+            equity2 = acct2.get("equity", balance)
+            if equity2 > 0 and total_margin_after / equity2 > COMBINED_MARGIN_WARN:
+                logger.warning(
+                    f"⚠️  {symbol} 保证金率预警: "
+                    f"{total_margin_after/equity2*100:.1f}% > {COMBINED_MARGIN_WARN*100:.0f}%"
+                )
+
+            logger.info(
+                f"📐 {symbol} 强平预算: estLiq={est_liq:.4f} "
+                f"(距离{liq_dist_pct:.1f}%) | SL距离={sl_dist_pct:.1f}% "
+                f"| 安全倍数={liq_dist_pct/sl_dist_pct if sl_dist_pct > 0 else 99:.1f}x"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️  {symbol} 强平预算异常: {e}")
 
         # ── 6. 下单 (部分止盈) ──
         # ── v3.0: 带限价后备的市价单 (v4.4: 沙箱也启用) ──
         if (not self._skip_safety or self.config.sandbox_safety) and self.safety and self.config.limit_fallback_enabled:
             order = self.safety.place_with_limit_fallback(
-                symbol, side, amount_contracts, sl_price, tp_parts
+                symbol, side, amount_contracts, sl_price, tp_parts,
+                pos_side=pos_side,  # v4.5: 显式持仓方向
             )
         else:
             order = self.exchange.create_market_order_with_partial_tp(
@@ -378,6 +474,7 @@ class TradeExecutor:
                 amount=amount_contracts,
                 sl_price=sl_price,
                 tp_parts=tp_parts,
+                pos_side=pos_side,  # v4.5: 显式持仓方向
             )
 
         if order:

@@ -37,3 +37,4 @@ Thumbs.db
 *.bak
 correlation_cache.json
 scheduled_tasks.lock
+freqtrade/user_data/hyperopt_results/

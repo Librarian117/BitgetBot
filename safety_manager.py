@@ -82,17 +82,29 @@ class SafetyManager:
     def place_with_limit_fallback(
         self, symbol: str, side: str, amount: float,
         sl_price: float, tp_parts: list,
+        pos_side: str = "",  # v4.5: 显式持仓方向
     ) -> Optional[Dict[str, Any]]:
         """先市价单，失败降级限价单 (v3.6: API 文档合规)"""
         try:
             order = self.exchange.create_market_order_with_partial_tp(
                 symbol=symbol, side=side, amount=amount,
                 sl_price=sl_price, tp_parts=tp_parts,
+                pos_side=pos_side,  # v4.5: 传递持仓方向
             )
             if order:
                 return order
         except Exception as e:
             logger.warning(f"⚠️  市价单失败 {symbol}: {e}")
+
+        # v4.5 CRITICAL: TPSL 致命失败时禁止降级到限价单重开仓
+        # create_market_order_with_partial_tp 内部已紧急平仓 + 设 _tpsl_fatal 标志
+        if getattr(self.exchange, '_tpsl_fatal', None):
+            fatal_sym = self.exchange._tpsl_fatal
+            self.exchange._tpsl_fatal = None
+            logger.error(
+                f"⛔ {fatal_sym} TPSL致命失败(已紧急平仓) → 禁止降级限价单重试"
+            )
+            return None
 
         if not self.config.limit_fallback_enabled:
             return None
@@ -119,7 +131,21 @@ class SafetyManager:
                 logger.info(f"✅ 限价单成交 {symbol} {side} @{limit_price:.4f}")
                 if tp_parts:
                     tp_price = tp_parts[0][0]
-                    self.exchange.set_position_sl_tp(symbol, side, sl_price, tp_price)
+                    # v4.5 fix: 显式传持仓方向 "long"/"short"，不再传 "buy"/"sell"
+                    pos_side_s = "long" if side == "buy" else "short"
+                    tpsl_ok = self.exchange.set_position_sl_tp(symbol, pos_side_s, sl_price, tp_price)
+                    # v4.5 CRITICAL: TPSL失败 → 复核+紧急平仓，不允许裸仓
+                    if not tpsl_ok:
+                        fill_price = float(order.get("price") or order.get("average") or sl_price)
+                        has_sl, _ = self.exchange._has_position_tpsl(symbol, fill_price, pos_side_s)
+                        if not has_sl:
+                            logger.error(f"🔥 {symbol} 限价单TPSL失败+复核无保护 → 紧急平仓!")
+                            try:
+                                self.exchange.create_market_order_close(
+                                    symbol, amount, side, pos_side=pos_side_s)
+                            except Exception:
+                                logger.error(f"💥 {symbol} 紧急平仓也失败", exc_info=True)
+                            return None  # 标记失败
             return order
         except Exception as e:
             logger.error(f"❌ 限价单后备失败 {symbol}: {e}")
@@ -160,8 +186,8 @@ class SafetyManager:
         self, current_equity: float,
         equity_history: List[Tuple[float, float]],
     ) -> Tuple[bool, str]:
-        """检查是否需要紧急停止"""
-        if self._is_sandbox:
+        """检查是否需要紧急停止 (v4.5: EMERGENCY_DRY_RUN 时沙箱也检查)"""
+        if self._is_sandbox and not self.config.emergency_dry_run:
             return False, ""
 
         if not self.config.emergency_stop_enabled:
@@ -191,10 +217,15 @@ class SafetyManager:
         """
         v3.6: 使用 close_position API 平掉所有持仓。
         根据 position info holdSide 判断方向。
+        v4.5: EMERGENCY_DRY_RUN=true 时跑完整路径但不真实下单 (沙箱演练)
         """
-        if self._is_sandbox:
-            logger.warning("🚨 沙箱模式：跳过紧急平仓")
+        _dry_run = self._is_sandbox and self.config.emergency_dry_run
+        if self._is_sandbox and not _dry_run:
+            logger.warning("🚨 沙箱模式：跳过紧急平仓 (设置 EMERGENCY_DRY_RUN=true 启用演练)")
             return 0
+
+        if _dry_run:
+            logger.warning("🔥 EMERGENCY DRY RUN: 模拟紧急平仓 (不真实下单)")
 
         closed = 0
         for sym, pos in positions.items():
@@ -211,16 +242,32 @@ class SafetyManager:
                     side = pos.get("side", "long")
                     hold_side = "short" if side == "SHORT" else "long"
 
-                order = self.exchange.create_market_order_close(
-                    symbol=sym, amount=contracts,
-                    side="buy" if hold_side == "short" else "sell",
-                    pos_side=hold_side,
-                )
-                if order:
+                if _dry_run:
+                    # 演练: 记录但不下单
                     closed += 1
-                    self.tlogger.log_risk("EMERGENCY_CLOSE", f"{sym}: {contracts}张平仓")
-                    logger.error(f"🚨 紧急平仓 {sym}: {contracts}张")
+                    self.tlogger.log_risk("EMERGENCY_DRY_RUN",
+                        f"{sym}: {contracts}张 {hold_side} (模拟平仓)")
+                    logger.warning(
+                        f"🔥 DRY-RUN 紧急平仓 {sym}: {contracts}张 {hold_side}"
+                    )
+                else:
+                    order = self.exchange.create_market_order_close(
+                        symbol=sym, amount=contracts,
+                        side="buy" if hold_side == "short" else "sell",
+                        pos_side=hold_side,
+                    )
+                    if order:
+                        closed += 1
+                        self.tlogger.log_risk("EMERGENCY_CLOSE", f"{sym}: {contracts}张平仓")
+                        logger.error(f"🚨 紧急平仓 {sym}: {contracts}张")
             except Exception as e:
                 logger.error(f"❌ 紧急平仓失败 {sym}: {e}")
+                if _dry_run:
+                    self.tlogger.log_risk("EMERGENCY_DRY_RUN_FAIL",
+                        f"{sym}: 模拟失败 {e}")
 
+        if _dry_run:
+            logger.warning(
+                f"🔥 EMERGENCY DRY RUN 完成: {closed}/{len(positions)} 个仓位已记录"
+            )
         return closed

@@ -757,7 +757,8 @@ class DeepSeekQuantBot:
                         if close_o:
                             logger.info(f"✅ 规则平仓 {symbol} {side}: {close_o.get('id', '?')} | {reason}")
                             self.tlogger.log_position_close(
-                                symbol=symbol, direction=side, strategy="pullback",
+                                symbol=symbol, direction=side,
+                                strategy=getattr(self, '_position_strategies', {}).get(symbol, "pullback"),
                                 entry_price=entry, exit_price=mark,
                                 pnl=upl, pnl_pct=roi * 100,
                                 close_reason="RULE_EXIT", holding_hours=holding_hours,
@@ -797,7 +798,10 @@ class DeepSeekQuantBot:
             # ── v4.0: 量化信号增强 (卡尔曼+Hurst+波动率锥) ──
             quant = compute_quant_signals(df)
 
-            latest = df.iloc[-1]
+            # v4.5 fix: 统一使用已闭合K线 (iloc[-2])，避免未完成K线驱动信号
+            # 与高周期 _analyze_tf_context 保持一致的闭合K线策略
+            cidx = -2 if len(df) >= 2 else -1
+            latest = df.iloc[cidx]
             close = float(latest["close"])
             ema   = float(latest["ema"])
             rsi   = float(latest["rsi"])
@@ -837,7 +841,7 @@ class DeepSeekQuantBot:
             # ── ② 成交量确认 (沙箱跳过——量数据不可靠；实盘严格过滤) ──
             if not self.config.is_sandbox:
                 try:
-                    cur_vol = float(df["volume"].iloc[-1])
+                    cur_vol = float(df["volume"].iloc[cidx])  # v4.5: 已闭合K线
                     avg_vol = float(df["volume"].tail(20).mean())
                     vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
                 except Exception:
@@ -855,9 +859,10 @@ class DeepSeekQuantBot:
                 vol_ratio = 1.0  # 沙箱默认通过
 
             # ── v3.6: 趋势方向校验 (EMA50 vs EMA200) ──
-            ema50 = float(df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
-            ema200 = float(df["close"].ewm(span=200, adjust=False).mean().iloc[-1])
-            ema200_prev = float(df["close"].ewm(span=200, adjust=False).mean().iloc[-6])
+            # v4.5: 使用已闭合K线，与信号生成保持一致
+            ema50 = float(df["close"].ewm(span=50, adjust=False).mean().iloc[cidx])
+            ema200 = float(df["close"].ewm(span=200, adjust=False).mean().iloc[cidx])
+            ema200_prev = float(df["close"].ewm(span=200, adjust=False).mean().iloc[cidx - 5])
             is_bearish_trend = ema200 < ema200_prev and ema50 < ema200  # EMA200下降 + 50在200下方
             is_bullish_trend = ema200 > ema200_prev and ema50 > ema200   # EMA200上升 + 50在200上方
 
@@ -919,6 +924,9 @@ class DeepSeekQuantBot:
             # ── ③ 信号初筛 ──
             direction = None
             strategy = "pullback"  # default
+            # v4.5: 记录原始策略，后续降级为counter_trend时可区分"主动逆势"和"被动降级"
+            # 被动降级不应受counter_trend的极端RSI门槛限制
+            _original_strategy = strategy
 
             # 回调策略：趋势中等待回调 (v3.7: 干旱时自适应放宽)
             if close > ema and rsi < effective_oversold:
@@ -932,7 +940,7 @@ class DeepSeekQuantBot:
             if direction is None and self.config.momentum_enabled:
                 # 做多动量：价格>EMA50 + ADX强 + RSI在动量区 + 突破近期高点
                 if close > ema and rsi > self.config.momentum_rsi_min and rsi < self.config.momentum_rsi_max and adx > self.config.momentum_adx_threshold:
-                    momentum_ema = float(df["close"].ewm(span=self.config.momentum_ema_period, adjust=False).mean().iloc[-1])
+                    momentum_ema = float(df["close"].ewm(span=self.config.momentum_ema_period, adjust=False).mean().iloc[cidx])  # v4.5: 已闭合K线
                     if close > momentum_ema:
                         recent_high = float(df["high"].tail(self.config.momentum_breakout_bars).max())
                         if close >= recent_high * 0.998:
@@ -940,7 +948,7 @@ class DeepSeekQuantBot:
                             strategy = "momentum"
                 # v3.2: 做空动量：价格<EMA50 + ADX强 + RSI在弱势动量区 + 跌破近期低点
                 elif close < ema and rsi < (100 - self.config.momentum_rsi_min) and rsi > (100 - self.config.momentum_rsi_max) and adx > self.config.momentum_adx_threshold:
-                    momentum_ema = float(df["close"].ewm(span=self.config.momentum_ema_period, adjust=False).mean().iloc[-1])
+                    momentum_ema = float(df["close"].ewm(span=self.config.momentum_ema_period, adjust=False).mean().iloc[cidx])  # v4.5: 已闭合K线
                     if close < momentum_ema:
                         recent_low = float(df["low"].tail(self.config.momentum_breakout_bars).min())
                         if close <= recent_low * 1.002:
@@ -949,10 +957,10 @@ class DeepSeekQuantBot:
 
             # ── v3.7: ⑤ EMA 交叉策略 —— 快慢线金叉死叉 ──
             if direction is None and self.config.momentum_enabled:
-                ema_fast = float(df["close"].ewm(span=9, adjust=False).mean().iloc[-1])
-                ema_slow = float(df["close"].ewm(span=21, adjust=False).mean().iloc[-1])
-                ema_fast_prev = float(df["close"].ewm(span=9, adjust=False).mean().iloc[-2])
-                ema_slow_prev = float(df["close"].ewm(span=21, adjust=False).mean().iloc[-2])
+                ema_fast = float(df["close"].ewm(span=9, adjust=False).mean().iloc[cidx])       # v4.5: 已闭合K线
+                ema_slow = float(df["close"].ewm(span=21, adjust=False).mean().iloc[cidx])      # v4.5: 已闭合K线
+                ema_fast_prev = float(df["close"].ewm(span=9, adjust=False).mean().iloc[cidx - 1])
+                ema_slow_prev = float(df["close"].ewm(span=21, adjust=False).mean().iloc[cidx - 1])
                 # 金叉: 快线上穿慢线
                 if ema_fast_prev <= ema_slow_prev and ema_fast > ema_slow:
                     # 额外确认: 价格 > EMA200 (多头环境) 或 RSI 不超买
@@ -967,8 +975,8 @@ class DeepSeekQuantBot:
 
             # ── v3.7: ⑥ 布林带均值回归 —— 震荡市触碰轨道反弹 ──
             if direction is None:
-                bb_std = float(df["close"].rolling(20).std().iloc[-1])
-                bb_mid = float(df["close"].rolling(20).mean().iloc[-1])
+                bb_std = float(df["close"].rolling(20).std().iloc[cidx])   # v4.5: 已闭合K线
+                bb_mid = float(df["close"].rolling(20).mean().iloc[cidx])  # v4.5: 已闭合K线
                 bb_upper = bb_mid + 2 * bb_std
                 bb_lower = bb_mid - 2 * bb_std
                 bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
@@ -1073,9 +1081,12 @@ class DeepSeekQuantBot:
                                         f"(RSI={rsi:.1f}<25)")
                             strategy = "counter_trend"
                         else:
-                            # RSI不够极端, 但Kalman冲突 → 不拒绝, 保持pullback, 靠后续降分
-                            logger.info(f"🔓 {symbol} LONG Kalman冲突→保留pullback+降分 "
-                                        f"(RSI={rsi:.1f})")
+                            # v4.5: 删除死分支 "保留pullback+降分"
+                            # 后续 goes_against_ema 段(line 1170)总会把 pullback→counter_trend
+                            # RSI不够极端时直接降级，与真实执行路径一致
+                            logger.info(f"🔓 {symbol} LONG Kalman冲突→counter_trend "
+                                        f"(RSI={rsi:.1f}≥25, 直接降级)")
+                            strategy = "counter_trend"
                             # 不放行counter_trend, 但也不return None — 让后面的评分系统决定
                     elif rsi > effective_oversold * 0.7:
                         self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
@@ -1098,8 +1109,12 @@ class DeepSeekQuantBot:
                                         f"(RSI={rsi:.1f}>75)")
                             strategy = "counter_trend"
                         else:
-                            logger.info(f"🔓 {symbol} SHORT Kalman冲突→保留pullback+降分 "
-                                        f"(RSI={rsi:.1f})")
+                            # v4.5: 删除死分支 "保留pullback+降分"
+                            # 后续 goes_against_ema 段(line 1170)总会把 pullback→counter_trend
+                            # RSI不够极端时直接降级，与真实执行路径一致
+                            logger.info(f"🔓 {symbol} SHORT Kalman冲突→counter_trend "
+                                        f"(RSI={rsi:.1f}≤75, 直接降级)")
+                            strategy = "counter_trend"
                     elif rsi < effective_overbought * 1.2:
                         self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
                             f"牛市禁SHORT RSI={rsi:.1f}<{effective_overbought*1.2:.0f}",
@@ -1173,9 +1188,10 @@ class DeepSeekQuantBot:
                     )
 
             # 1. MACD 背离检测 (值 20 分)
-            macd_hist = float(df["macd_hist"].iloc[-1])
-            macd_prev = float(df["macd_hist"].iloc[-3])
-            price_change = close - float(df["close"].iloc[-6])
+            # v4.5: 统一使用已闭合K线 cidx 及其相对偏移
+            macd_hist = float(df["macd_hist"].iloc[cidx])
+            macd_prev = float(df["macd_hist"].iloc[cidx - 2])
+            price_change = close - float(df["close"].iloc[cidx - 5])
             macd_change = macd_hist - macd_prev
             if direction == "LONG" and price_change < 0 and macd_change > 0:
                 confidence += 20
@@ -1185,8 +1201,8 @@ class DeepSeekQuantBot:
                 bonuses.append("MACD顶背离")
 
             # 2. 布林带极端位 (值 15 分)
-            bb_lower = float(df["bb_lower"].iloc[-1])
-            bb_upper = float(df["bb_upper"].iloc[-1])
+            bb_lower = float(df["bb_lower"].iloc[cidx])
+            bb_upper = float(df["bb_upper"].iloc[cidx])
             if direction == "LONG" and close <= bb_lower * 1.01:
                 confidence += 15
                 bonuses.append("布林下轨")
@@ -1195,13 +1211,13 @@ class DeepSeekQuantBot:
                 bonuses.append("布林上轨")
 
             # 3. 量价确认 (值 10 分)
-            prev_vol = float(df["volume"].iloc[-3])
-            curr_vol = float(df["volume"].iloc[-1])
+            prev_vol = float(df["volume"].iloc[cidx - 2])
+            curr_vol = float(df["volume"].iloc[cidx])
             vol_up = curr_vol > prev_vol * 1.2
-            if direction == "LONG" and close > float(df["close"].iloc[-2]) and vol_up:
+            if direction == "LONG" and close > float(df["close"].iloc[cidx - 1]) and vol_up:
                 confidence += 10
                 bonuses.append("放量上涨")
-            elif direction == "SHORT" and close < float(df["close"].iloc[-2]) and vol_up:
+            elif direction == "SHORT" and close < float(df["close"].iloc[cidx - 1]) and vol_up:
                 confidence += 10
                 bonuses.append("放量下跌")
 
@@ -1214,8 +1230,8 @@ class DeepSeekQuantBot:
                 bonuses.append("RSI深度超买")
 
             # 5. MACD 金叉/死叉 (值 5 分)
-            macd_line = float(df["macd"].iloc[-1])
-            macd_sig = float(df["macd_signal"].iloc[-1])
+            macd_line = float(df["macd"].iloc[cidx])
+            macd_sig = float(df["macd_signal"].iloc[cidx])
             if direction == "LONG" and macd_line > macd_sig and macd_hist > 0:
                 confidence += 5
                 bonuses.append("MACD多头")
@@ -1224,16 +1240,16 @@ class DeepSeekQuantBot:
                 bonuses.append("MACD空头")
 
             # 6. ATR 扩张确认 (值 10 分) — ATR放大说明是真突破不是假晃
-            atr_prev5 = float(df["atr"].iloc[-6:-1].mean())
-            atr_now = float(df["atr"].iloc[-1])
+            atr_prev5 = float(df["atr"].iloc[cidx - 5:cidx].mean())
+            atr_now = float(df["atr"].iloc[cidx])
             if atr_now > atr_prev5 * 1.15:
                 confidence += 10
                 bonuses.append("ATR扩张")
 
             # 7. K线实体比例 (值 10 分) — 阳线实体>影线=买方决心强
-            open_p = float(df["open"].iloc[-1])
-            high_p = float(df["high"].iloc[-1])
-            low_p = float(df["low"].iloc[-1])
+            open_p = float(df["open"].iloc[cidx])
+            high_p = float(df["high"].iloc[cidx])
+            low_p = float(df["low"].iloc[cidx])
             body = abs(close - open_p)
             upper_shadow = high_p - max(close, open_p)
             lower_shadow = min(close, open_p) - low_p
@@ -1245,8 +1261,8 @@ class DeepSeekQuantBot:
                 bonuses.append("强阴线")
 
             # 8. 连续K线确认 (值 10 分) — 前 2 根 K 线也同向=趋势已启动
-            prev1_close = float(df["close"].iloc[-2])
-            prev2_close = float(df["close"].iloc[-3])
+            prev1_close = float(df["close"].iloc[cidx - 1])
+            prev2_close = float(df["close"].iloc[cidx - 2])
             if direction == "LONG" and prev1_close > prev2_close and close > prev1_close:
                 confidence += 10
                 bonuses.append("3连阳")
@@ -1255,9 +1271,9 @@ class DeepSeekQuantBot:
                 bonuses.append("3连阴")
 
             # 9. RSI 背离 (值 15 分) — 价格与RSI方向不一致=反转前兆
-            rsi_now = float(df["rsi"].iloc[-1])
-            rsi_3ago = float(df["rsi"].iloc[-4])
-            price_3ago = float(df["close"].iloc[-4])
+            rsi_now = float(df["rsi"].iloc[cidx])
+            rsi_3ago = float(df["rsi"].iloc[cidx - 3])
+            price_3ago = float(df["close"].iloc[cidx - 3])
             if direction == "LONG" and close < price_3ago and rsi_now > rsi_3ago:
                 confidence += 15
                 bonuses.append("RSI底背离")
@@ -1402,7 +1418,11 @@ class DeepSeekQuantBot:
             if strategy == "counter_trend" and ema_kalman_conflict:
                 min_conf = 65
             # v4.4: counter_trend 必须处于真正超卖/超买状态 (熊市反弹陷阱拦截)
-            if strategy == "counter_trend":
+            # v4.5: 被动降级的pullback不受此限制 — pullback生成时已通过自有RSI门槛
+            # 避免"先放行后必杀": bearish趋势 relaxed overbought=50 生成的 SHORT
+            # 被Kalman降级为counter_trend后, RSI=51 < ct_rsi_short_min=55 → 必杀
+            _is_degraded = (_original_strategy == "pullback" and strategy == "counter_trend")
+            if strategy == "counter_trend" and not _is_degraded:
                 if direction == "LONG" and rsi > self.config.ct_rsi_long_max:
                     logger.info(
                         f"🔇 {symbol} counter_trend LONG RSI={rsi:.1f}>"
@@ -1415,6 +1435,11 @@ class DeepSeekQuantBot:
                         f"{self.config.ct_rsi_short_min} → 不是真正超买，拒绝"
                     )
                     return None
+            elif strategy == "counter_trend" and _is_degraded:
+                logger.info(
+                    f"🔓 {symbol} {direction} 被动降级counter_trend (原pullback) → "
+                    f"跳过极端RSI门槛 (RSI={rsi:.1f}, pullback门槛已满足)"
+                )
             if confidence < min_conf:
                 logger.info(
                     f"🔇 {symbol} {direction} {strategy} 置信度{confidence}<{min_conf}，"
@@ -1426,6 +1451,8 @@ class DeepSeekQuantBot:
                 "symbol": symbol,
                 "direction": direction,
                 "strategy": strategy,
+                # v4.5: 标记是否为被动降级 (pullback被Kalman/方向学习器降级为counter_trend)
+                "_degraded_from_pullback": (_original_strategy == "pullback" and strategy == "counter_trend"),
                 "price": close,
                 "ema": ema,
                 "rsi": rsi,
@@ -1608,8 +1635,10 @@ class DeepSeekQuantBot:
                     dur_min = (close_ts - open_ts) / 60.0
                     if sym in self._position_open_times:
                         del self._position_open_times[sym]
-                    # v4.5: 清 TPSL 信任缓存，避免仓位已关仍认为有保护
-                    self.exchange._tpsl_cache.pop(sym, None)
+                    # v4.5: 清 TPSL 信任缓存 (新键格式含entry, 遍历清理该symbol所有键)
+                    _stale = [k for k in self.exchange._tpsl_cache if k[0] == sym]
+                    for k in _stale:
+                        del self.exchange._tpsl_cache[k]
 
                 # 推断真实出场原因 (不再全写 DETECTED)
                 abs_pnl_pct = abs(pnl_pct)
@@ -1978,14 +2007,15 @@ class DeepSeekQuantBot:
                 f"推荐策略:{regime_info.get('recommended',[])}"
             )
 
-            # ── v4.0: Hurst 策略路由 —— 数量化决定趋势 vs 回归 ──
+            # ── v4.5: Hurst 策略路由 —— 数量化决定趋势 vs 回归 ──
+            # pullback 在 signal_scorer 中归为趋势策略，统一受 Hurst 约束
             sig_hurst = sig.get("_hurst", 0.5)
             if sig_hurst > 0.55 and strategy in ("bollinger", "grid"):
                 self.tlogger.log_filter_reject(symbol, "HURST",
                     f"Hurst={sig_hurst:.3f}>0.55趋-跳过{strategy}", direction=direction, strategy=strategy)
                 logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 趋势市→跳过{strategy}回归策略")
                 continue
-            elif sig_hurst < 0.45 and strategy in ("momentum", "ema_cross"):
+            elif sig_hurst < 0.45 and strategy in ("momentum", "ema_cross", "pullback"):
                 self.tlogger.log_filter_reject(symbol, "HURST",
                     f"Hurst={sig_hurst:.3f}<0.45回-跳过{strategy}", direction=direction, strategy=strategy)
                 logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 回归市→跳过{strategy}趋势策略")
@@ -2010,9 +2040,10 @@ class DeepSeekQuantBot:
                     )
                     continue
 
-            # v4.2: 多TF趋势不一致 → 过滤 (均值回归/回调策略豁免)
-            # pullback 策略本质是趋势回调入场，与 bollinger/counter_trend 同为均值回归类
-            if not trend_aligned and strategy not in ("bollinger", "counter_trend", "pullback"):
+            # v4.5: 多TF趋势不一致 → 过滤 (均值回归策略豁免)
+            # pullback 在 signal_scorer 中归为趋势策略，必须通过多TF一致性检查
+            # 避免在牛市1h/4h偏多时放行 pullback SHORT
+            if not trend_aligned and strategy not in ("bollinger", "counter_trend"):
                 opposing_tfs = [
                     tf for tf in self.config.higher_timeframes
                     if tf_context.get(tf, {}).get("trend", "unknown") not in ("unknown", "")
@@ -2467,9 +2498,8 @@ class DeepSeekQuantBot:
                 ])
             return {"blocked": True, "candidates": [], "btc_change": None, "funding_rates": {}}
 
-        if len(candidates) > max_new:
-            logger.info(f"⏳ 候选信号 {len(candidates)} > 可开仓 {max_new}，取前 {max_new} 个")
-            candidates = candidates[:max_new]
+        # ── v4.5: 截断移至BTC过滤和排名之后 —— 避免前N个被BTC滤掉后后续候选无法补位 ──
+        # 旧位置在BTC过滤之前，导致排在后面的有效 pullback SHORT 被永久截掉
 
         # ── v2.7: BTC 联动过滤 (有候选信号时才查，空信号跳过省API) ──
         btc_change = None
@@ -2588,6 +2618,13 @@ class DeepSeekQuantBot:
             except Exception as e:
                 logger.warning(f"⚠️  投资组合排名失败: {e}")
 
+        # ── v4.5: 截断 —— 在BTC过滤和排名之后执行，避免前N候选被滤后无法补位 ──
+        # 此时 candidates 已经过 BTC 过滤 + 组合排名重排，截断取前 max_new 个是公平的
+        if len(candidates) > max_new:
+            logger.info(f"⏳ 候选信号 {len(candidates)} > 可开仓 {max_new}，取前 {max_new} 个 "
+                        f"(已通过BTC过滤+排名)")
+            candidates = candidates[:max_new]
+
         # ── v2.1: 资金费率获取 ──
         funding_rates: Dict[str, Optional[float]] = {}
         for sig in candidates:
@@ -2607,6 +2644,52 @@ class DeepSeekQuantBot:
                 logger.error(f"🚨 日内亏损 -{abs(self.riskmon.daily_pnl_pct)*100:.1f}% > "
                              f"{self.config.daily_loss_limit*100:.0f}%，硬止损！")
                 self._last_daily_loss_logged = now_ts
+            # v4.5: DAILY_LOSS_CLOSE_ALL=true → 强制清仓, 不只是锁新仓
+            if self.config.daily_loss_close_all and acct.get("positions_detail"):
+                positions = acct["positions_detail"]
+                logger.error(
+                    f"🔥 日损硬止损 + DAILY_LOSS_CLOSE_ALL → "
+                    f"强制平仓 {len(positions)} 个持仓"
+                )
+                closed_count = 0
+                for pos in positions:
+                    try:
+                        sym = f"{pos['symbol']}/USDT:USDT"
+                        pside = "long" if pos.get("side") == "LONG" else "short"
+                        contracts = pos.get("contracts", 0)
+                        if contracts <= 0:
+                            continue
+                        close_o = self.exchange.create_market_order_close(
+                            sym, contracts, "buy" if pside == "long" else "sell",
+                            pos_side=pside
+                        )
+                        if close_o:
+                            closed_count += 1
+                            self.tlogger.log_risk("DAILY_LOSS_CLOSE",
+                                f"{pos['symbol']} {pos['side']} "
+                                f"强平 @{pos.get('mark_price',0):.4f} "
+                                f"浮盈={pos.get('unrealized_pnl',0):+.2f}")
+                            logger.warning(
+                                f"🛑 日损清仓: {pos['symbol']} {pos['side']} "
+                                f"@{pos.get('mark_price',0):.4f}"
+                            )
+                    except Exception as e:
+                        logger.error(f"💥 日损清仓 {pos['symbol']} 失败: {e}")
+                logger.error(
+                    f"🔥 日损清仓完成: {closed_count}/{len(positions)} 个仓位已平"
+                )
+                # v4.5: 全平后复核 — 仍有仓位则重试
+                remaining_positions = self.exchange.get_open_positions()
+                if remaining_positions:
+                    logger.error(
+                        f"🔥 日损清仓复核: 仍有 {len(remaining_positions)} 个残留 → 重试"
+                    )
+                    self.safety.emergency_close_all(remaining_positions)
+                    final_check = self.exchange.get_open_positions()
+                    if final_check:
+                        for sym in list(final_check.keys()):
+                            self.tlogger.log_risk("DAILY_LOSS_FAILED",
+                                f"日损清仓失败残留: {sym}")
             candidates = self.scan_all()
             logger.info(f"📊 本轮候选信号: {len(candidates)} 个（锁定模式，不执行）")
             for sig in candidates:
@@ -2720,11 +2803,27 @@ class DeepSeekQuantBot:
                                                 break
                                 except Exception:
                                     logger.debug("⚠️  静默异常", exc_info=True)
-                                # 取消旧 SL/TP，重新挂载，保留现有 TP
-                                self.exchange.set_position_sl_tp(
-                                    sym_full, side.lower(),
-                                    new_sl, existing_tp
-                                )
+                                # v4.5: 计划单未找到TP → 从交易所持仓 info.takeProfit 读取
+                                if existing_tp <= 0:
+                                    try:
+                                        raw_positions = self.exchange.get_open_positions()
+                                        raw_pos = raw_positions.get(sym_full, {})
+                                        raw_info = raw_pos.get("info", {})
+                                        tp_raw = raw_info.get("takeProfit", raw_info.get("takeProfitPrice", ""))
+                                        if tp_raw and str(tp_raw) not in ("0", "", "None"):
+                                            existing_tp = float(tp_raw)
+                                    except Exception:
+                                        pass
+                                # v4.5: TP仍为0 → 跳过更新, 避免传无效TP破坏现有保护
+                                if existing_tp <= 0:
+                                    logger.warning(
+                                        f"⚠️  {pos_d['symbol']} 移动止损跳过: 无法获取现有TP"
+                                    )
+                                else:
+                                    self.exchange.set_position_sl_tp(
+                                        sym_full, side.lower(),
+                                        new_sl, existing_tp
+                                    )
                         except Exception:
                             logger.debug("⚠️  静默异常", exc_info=True)
                 except Exception:
@@ -2745,10 +2844,9 @@ class DeepSeekQuantBot:
                     try:
                         orders = self.exchange.exchange.fetch_open_orders(sym_full, params={"stop": True}) or []
                         reduce_orders = [o for o in orders if self.exchange._is_reduce_only(o)]
-                        if len(reduce_orders) >= 8:
-                            logger.warning(f"🔒 {pos_d['symbol']} SL/TP堆积({len(reduce_orders)}个)，先清理后锁仓")
-                            for o in reduce_orders:
-                                self.exchange.cancel_order(str(o.get('id','')), sym_full)
+                        _needs_cleanup = len(reduce_orders) >= 8
+                        if _needs_cleanup:
+                            logger.warning(f"🔒 {pos_d['symbol']} SL/TP堆积({len(reduce_orders)}个)")
                         # 重新设置锁仓 TP (移到当前盈利的50%位置)
                         mark = pos_d.get("mark_price", entry)
                         if side == "SHORT":
@@ -2759,7 +2857,17 @@ class DeepSeekQuantBot:
                             lock_sl = round(entry - (entry - mark) * 0.1, 4) if mark < entry else round(mark * 0.995, 4)
                         if lock_tp > 0 and lock_sl > 0 and lock_tp != lock_sl:
                             logger.info(f"🔒 {pos_d['symbol']} 盈利锁仓: ROI={roi*100:.0f}% → TP={lock_tp} SL={lock_sl}")
-                            self.exchange.set_position_sl_tp(sym_full, side.lower(), lock_sl, lock_tp)
+                            # v4.5: 先设新保护，成功后再清理旧单 — 防止"取消后设失败"裸仓
+                            tpsl_ok = self.exchange.set_position_sl_tp(sym_full, side.lower(), lock_sl, lock_tp)
+                            if tpsl_ok and _needs_cleanup:
+                                for o in reduce_orders:
+                                    try:
+                                        self.exchange.cancel_order(str(o.get('id','')), sym_full)
+                                    except Exception:
+                                        pass
+                                logger.info(f"🔒 {pos_d['symbol']} 旧SL/TP已清理 {len(reduce_orders)}个")
+                            elif not tpsl_ok:
+                                logger.error(f"🔒 {pos_d['symbol']} 锁仓TPSL设置失败 → 保留旧保护")
                     except Exception as e:
                         logger.debug(f"🔒 锁仓 {pos_d['symbol']} 失败: {e}")
 
@@ -2789,8 +2897,31 @@ class DeepSeekQuantBot:
                 sym_full = f"{pos_d['symbol']}/USDT:USDT"
                 open_ts = self._position_open_times.get(sym_full)
                 if not open_ts:
-                    continue  # 无开仓时间记录，跳过
-                holding_hours = (time.time() - open_ts) / 3600.0
+                    # v4.5: 本地开仓时间缺失 (重启/外部开仓/状态恢复失败)
+                    # 尝试从交易所持仓数据获取, 拿不到则保守处理: 视为已超 auto_sl_min_hours
+                    try:
+                        raw_positions = self.exchange.get_open_positions()
+                        raw = raw_positions.get(sym_full, {})
+                        pos_ts = raw.get("timestamp") or raw.get("datetime")
+                        if pos_ts:
+                            if isinstance(pos_ts, str):
+                                from datetime import datetime as dt
+                                pos_ts = dt.fromisoformat(pos_ts.replace("Z", "+00:00")).timestamp()
+                            open_ts = float(pos_ts) / 1000.0 if float(pos_ts) > 1e12 else float(pos_ts)
+                            # 补充到本地记录
+                            self._position_open_times[sym_full] = open_ts
+                            logger.info(f"📌 {pos_d['symbol']} 从交易所恢复开仓时间")
+                    except Exception:
+                        pass
+                if not open_ts:
+                    # 保守默认: 视为长持仓, 允许 AUTO_SL 生效
+                    holding_hours = self.config.auto_sl_min_hours + 0.1
+                    logger.warning(
+                        f"⚠️  {pos_d['symbol']} 开仓时间未知 → 保守处理 "
+                        f"(holding_hours={holding_hours:.1f}h, 允许AUTO_SL)"
+                    )
+                else:
+                    holding_hours = (time.time() - open_ts) / 3600.0
                 if holding_hours < self.config.auto_sl_min_hours:
                     continue  # 持仓不足，让正常SL处理
 
@@ -2818,7 +2949,8 @@ class DeepSeekQuantBot:
                         position_value = entry * contracts * csize
                         pnl_pct = (upl / (position_value / self.config.leverage)) * 100 if position_value > 0 else roi * 100
                         self.tlogger.log_position_close(
-                            symbol=sym, direction=side, strategy="pullback",
+                            symbol=sym, direction=side,
+                            strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
                             entry_price=entry, exit_price=mark,
                             pnl=upl, pnl_pct=pnl_pct,
                             close_reason="AUTO_SL", holding_hours=round(holding_hours, 1),
@@ -2861,7 +2993,8 @@ class DeepSeekQuantBot:
                     if close_o:
                         logger.info(f"✅ 僵尸仓平仓 {sym}: {close_o.get('id', '?')}")
                         self.tlogger.log_position_close(
-                            symbol=sym, direction=side, strategy="pullback",
+                            symbol=sym, direction=side,
+                            strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
                             entry_price=pos_d.get("entry_price", 0),
                             exit_price=pos_d.get("mark_price", 0),
                             pnl=upl, pnl_pct=roi * 100,
@@ -3018,8 +3151,34 @@ class DeepSeekQuantBot:
             if triggered:
                 logger.error(f"🚨 紧急停止已触发: {reason}")
                 positions = self.exchange.get_open_positions()
+                _is_dry_run = (getattr(self.config, 'emergency_dry_run', False)
+                               and self.exchange.is_sandbox())
                 closed = self.safety.emergency_close_all(positions)
                 self.tlogger.log_risk("EMERGENCY_STOP", f"已平仓 {closed} 个持仓: {reason}")
+                # v4.5: 全平后复核 — 仍有仓位则重试 (dry-run 时跳过复核)
+                if not _is_dry_run:
+                    for retry in range(2):
+                        remaining = self.exchange.get_open_positions()
+                        if not remaining:
+                            break
+                        logger.error(
+                            f"🔥 紧急平仓复核: 仍有 {len(remaining)} 个残留仓位 "
+                            f"{list(remaining.keys())} → 第{retry+1}次重试"
+                        )
+                        for sym in list(remaining.keys()):
+                            self.tlogger.log_risk("EMERGENCY_REMAINING",
+                                f"残留仓位: {sym} 第{retry+1}次重试")
+                        self.safety.emergency_close_all(remaining)
+                    # 最终确认
+                    final_remaining = self.exchange.get_open_positions()
+                    if final_remaining:
+                        logger.error(
+                            f"💀 紧急平仓未完全清除: {list(final_remaining.keys())} "
+                            f"— 3次尝试后仍残留!"
+                        )
+                        for sym in list(final_remaining.keys()):
+                            self.tlogger.log_risk("EMERGENCY_FAILED",
+                                f"3次平仓失败: {sym}")
                 self.riskmon.cooldown_until = time.time() + 86400  # 紧急停止: 24h 冷却
                 self.riskmon.cooldown_reason = "紧急停止"
                 return {"blocked": True, "session": {}}
@@ -3178,7 +3337,8 @@ class DeepSeekQuantBot:
                                 symbol=base, direction=side,
                                 entry_price=entry, exit_price=mark,
                                 pnl=pnl, pnl_pct=pnl_pct,
-                                strategy="pullback", ai_decision="CONFIRM",
+                                strategy=getattr(self, '_position_strategies', {}).get(sym, "pullback"),
+                                ai_decision="CONFIRM",
                                 reason="停机期间平仓",
                                 market_regime=getattr(self, '_current_regime', 'unknown'),
                             )

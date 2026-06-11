@@ -122,6 +122,10 @@ class ConfigManager:
 
         # ── 日内风控 ──
         self.daily_loss_limit = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
+        # v4.5: 日损触发后是否强制清仓 (默认 true — 真正的 emergency exit)
+        self.daily_loss_close_all = os.getenv("DAILY_LOSS_CLOSE_ALL", "true").lower() == "true"
+        # v4.5: 沙箱 emergency dry-run — 触发完整路径但不真实平仓, 用于演练
+        self.emergency_dry_run = os.getenv("EMERGENCY_DRY_RUN", "false").lower() == "true"
 
         # ── v3.1: 初始资金 (用于计算总盈亏) ──
         self.initial_equity = float(os.getenv("INITIAL_EQUITY", "0"))
@@ -223,6 +227,8 @@ class ConfigManager:
         # v4.4: counter_trend RSI门槛 — LONG需RSI<=此值才为真正超卖
         self.ct_rsi_long_max = float(os.getenv("CT_RSI_LONG_MAX", "45"))
         self.ct_rsi_short_min = float(os.getenv("CT_RSI_SHORT_MIN", "55"))
+        # v4.5: 单笔风险预算 — 按 SL 距离反推仓位，替代纯保证金比例
+        self.risk_per_trade_pct = float(os.getenv("RISK_PER_TRADE_PCT", "0.02"))
 
         # ── v3.0: 投资组合管理 ──
         self.portfolio_manager_enabled = os.getenv("PORTFOLIO_MANAGER_ENABLED", "false").lower() == "true"
