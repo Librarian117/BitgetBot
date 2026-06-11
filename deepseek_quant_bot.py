@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-deepseek_quant_bot.py — 量化信号 + AI 研究顾问混合交易机器人 v4.1
+deepseek_quant_bot.py — 量化信号 + AI 研究顾问混合交易机器人 v4.5
 =====================================================================
 架构：高度模块化，专业风控，DeepSeek V4 AI 研究层
 
@@ -81,7 +81,7 @@ class DeepSeekQuantBot:
 
     def __init__(self):
         logger.info("=" * 60)
-        logger.info("🚀 DeepSeekQuantBot v3.0 启动中 …")
+        logger.info("🚀 DeepSeekQuantBot v4.5 启动中 …")
         logger.info("=" * 60)
 
         # 初始化模块
