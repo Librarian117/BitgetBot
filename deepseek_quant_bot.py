@@ -3131,7 +3131,7 @@ class DeepSeekQuantBot:
             self.analyst.close()
         except Exception:
             logger.debug("⚠️  静默异常", exc_info=True)
-        logger.info("👋 DeepSeekQuantBot v3.0 已停止")
+        logger.info("👋 DeepSeekQuantBot v4.5 已停止")
 
     def _detect_startup_closes(self):
         """v3.4: 启动时对比持久化仓位快照，检测停机期间的平仓"""
@@ -3270,7 +3270,7 @@ class DeepSeekQuantBot:
         with open(pidfile, "w") as f:
             f.write(str(os.getpid()))
 
-        logger.info("\n🎯 DeepSeekQuantBot v3.0 进入主循环 (每 5 分钟)")
+        logger.info("\n🎯 DeepSeekQuantBot v4.5 进入主循环 (每 5 分钟)")
         logger.info("按 Ctrl+C 停止\n")
 
         # ── v3.4: 检测停机期间的平仓 ──
