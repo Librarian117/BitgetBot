@@ -1440,8 +1440,13 @@ class DeepSeekQuantBot:
                 "_hurst": quant.get("hurst", 0.5),
                 "_hurst_regime": quant.get("hurst_regime", "random_walk"),
                 "_kalman_score": quant.get("kalman_score", 0),
+                "_kalman_dir": kalman_dir,  # v4.5: ENTRY_SNAPSHOT 需要
                 "_vol_cone_sl_mult": quant.get("vol_cone_sl_mult", 1.0),
+                "_vol_cone_percentile": quant.get("vol_cone_percentile", 50),
                 "_markov": markov_result,  # v4.0: 传给 _detect_market_regime
+                # v4.5: EMA趋势上下文 (ENTRY_SNAPSHOT ema_trend)
+                "_ema50": round(ema50, 2),
+                "_ema200": round(ema200, 2),
             }
 
         except Exception as e:
