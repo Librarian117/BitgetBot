@@ -1600,6 +1600,8 @@ class DeepSeekQuantBot:
                     dur_min = (close_ts - open_ts) / 60.0
                     if sym in self._position_open_times:
                         del self._position_open_times[sym]
+                    # v4.5: 清 TPSL 信任缓存，避免仓位已关仍认为有保护
+                    self.exchange._tpsl_cache.pop(sym, None)
 
                 # 推断真实出场原因 (不再全写 DETECTED)
                 abs_pnl_pct = abs(pnl_pct)

@@ -19,6 +19,7 @@ class ExchangeInterface:
         self.config = config
         self.exchange: ccxt.Exchange = self._build_exchange()
         self._trading_fees: Dict[str, float] = {}  # unified symbol -> taker fee
+        self._tpsl_cache: Dict[str, Tuple[float, float]] = {}  # v4.5: 沙箱TPSL信任缓存 {symbol: (sl, tp)}
         self._load_markets()
         self._load_trading_fees()
 
@@ -461,7 +462,8 @@ class ExchangeInterface:
         检测持仓是否有 SL/TP 保护。
 
         方法:
-          1. (主力) fetch_positions → info.stopLoss/takeProfit — 支持 pos-tpsl
+          0. (v4.5) 内存缓存 — 沙箱 pos-tpsl 成功但 API 不可见时信任缓存
+          1. (主力) fetch_positions → info.stopLoss/takeProfit — 实盘返回
           2. (兜底) fetch_open_orders(stop=True) — 独立计划单
 
         side: "buy"/"LONG" 或 "sell"/"SHORT"
@@ -469,7 +471,11 @@ class ExchangeInterface:
         """
         has_sl, has_tp = False, False
 
-        # 方法1: fetch_positions — 最可靠，沙箱实测返回 stopLoss/takeProfit
+        # 方法0: v4.5 内存缓存 — 沙箱 set_position_sl_tp 的 code=00000 信任
+        if symbol in self._tpsl_cache:
+            return (True, True)
+
+        # 方法1: fetch_positions — 实盘返回 stopLoss/takeProfit
         try:
             pos_list = self.exchange.fetch_positions([symbol])
             for p in pos_list:
@@ -632,8 +638,8 @@ class ExchangeInterface:
             code = result.get("code", "")
             if code == "00000":
                 logger.info(f"🛡️🎯 {symbol} SL={sl_str} TP={tp_str} → pos-tpsl OK")
-                # v4.0 fix: 沙箱 fetch_position 不返回 stopLoss/takeProfit,
-                # code=00000 就是设成功了，直接信任。不再用 fetch_position 验证。
+                # v4.5: 沙箱信任缓存 — _has_position_tpsl 可查此缓存
+                self._tpsl_cache[symbol] = (float(sl_str), float(tp_str))
                 return True
 
             # v4.0: place-pos-tpsl 失败 → 降级用独立计划单
