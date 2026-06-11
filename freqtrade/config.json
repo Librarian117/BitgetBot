@@ -1,0 +1,75 @@
+{
+    "max_open_trades": 8,
+    "stake_currency": "USDT",
+    "stake_amount": 50,
+    "tradable_balance_ratio": 0.95,
+    "fiat_display_currency": "USD",
+
+    "exchange": {
+        "name": "bitget",
+        "key": "",
+        "secret": "",
+        "password": "",
+        "ccxt_config": {
+            "enableRateLimit": true,
+            "options": {
+                "defaultType": "swap"
+            }
+        },
+        "ccxt_async_config": {
+            "enableRateLimit": true,
+            "rateLimit": 50
+        },
+        "pair_whitelist": [
+            "BTC/USDT:USDT",
+            "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
+            "BNB/USDT:USDT",
+            "XRP/USDT:USDT",
+            "ADA/USDT:USDT",
+            "DOGE/USDT:USDT",
+            "DOT/USDT:USDT",
+            "LINK/USDT:USDT",
+            "LTC/USDT:USDT"
+        ]
+    },
+
+    "pairlists": [
+        {
+            "method": "StaticPairList"
+        }
+    ],
+
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": false,
+        "price_last_balance": 0.0
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": false
+    },
+
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 3
+    },
+
+    "order_types": {
+        "entry": "limit",
+        "exit": "limit",
+        "stoploss": "market",
+        "stoploss_on_exchange": true
+    },
+
+    "bot_name": "BitgetHybridBot",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}

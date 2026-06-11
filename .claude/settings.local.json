@@ -18,7 +18,9 @@
       "Bash(grep -E \"15:3[5-8]|下单|execute|安全|止损|止盈|TP\" /c/Users/林华俊/AppData/Local/Temp/claude/e--BitgetBot/7c738ea5-54e7-4927-a895-6be871e8a54c/tasks/b4g5la68x.output 2>/dev/null | tail -20)",
       "Read(//c/Users/林华俊/AppData/Local/Temp/claude/e--BitgetBot/7c738ea5-54e7-4927-a895-6be871e8a54c/tasks/**)",
       "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
-      "Bash(findstr python *)"
+      "Bash(findstr python *)",
+      "Bash(ssh root@8.210.3.197 *)",
+      "PowerShell(ssh root@8.210.3.197 *)"
     ]
   },
   "hooks": {
@@ -80,11 +82,33 @@
         ]
       },
       {
+        "matcher": "push|deploy|部署|推送|commit|提交|release|发布|workflow|ci",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash e:/BitgetBot/.claude/hooks/pre-push-check.sh",
+            "timeout": 15000
+          }
+        ]
+      },
+      {
         "matcher": "^/bot-learn",
         "hooks": [
           {
             "type": "command",
             "command": "cd e:/BitgetBot && python -c \"from self_learner import SelfLearner; from dotenv import load_dotenv; import os,json; load_dotenv(); from deepseek_quant_bot import ConfigManager; c=ConfigManager(); l=SelfLearner(c,None); w=l.get_wisdom_context(); print(w if w else 'No wisdom yet.'); print(); print('Review trigger:'); trades=[json.loads(line) for line in open('logs/trades.jsonl',encoding='utf-8') if '\"event\":\\\"TRADE\\\"' in line]; s=l.periodic_review(trades[-50:]) if trades else None; [print(f'  [{i[\\\"category\\\"]}] {i[\\\"insight\\\"]} (conf={i.get(\\\"confidence\\\",0):.0%})') for i in (s or [])]; print(); print('Filter diagnosis:'); d=l.analyze_filter_effectiveness(); print(f'  {d}' if d else '  No diagnosis yet (needs 60%+ zero-signal cycles)'); print(); print('Wisdom file:'); [print(f'  {w[\\\"date\\\"]} [{w[\\\"quality\\\"]}] {w[\\\"insight\\\"]}') for w in json.load(open('trading_wisdom.json',encoding='utf-8')).get('wisdom',[])] if os.path.exists('trading_wisdom.json') else print('  No wisdom entries yet.')\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd e:/BitgetBot && python -c \"import subprocess,json; ct=int(subprocess.check_output(['git','log','-1','--format=%ct','--','CLAUDE.md'],stderr=subprocess.DEVNULL).decode().strip()or'0'); pt=int(subprocess.check_output(['git','log','-1','--format=%ct','--','*.py'],stderr=subprocess.DEVNULL).decode().strip()or'0'); print(json.dumps({'systemMessage':'CLAUDE.md 已过时 - 代码已更新但文档未同步。下次会话说 /claude-md 自动更新'})) if pt>ct else None\"",
+            "timeout": 10
           }
         ]
       }
@@ -96,6 +120,11 @@
           {
             "type": "command",
             "command": "bash e:/BitgetBot/.claude/hooks/lint-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash e:/BitgetBot/.claude/hooks/agent-verifier-quick.sh",
+            "timeout": 5000
           }
         ]
       }
