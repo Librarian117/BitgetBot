@@ -104,10 +104,13 @@ class DeepSeekQuantBot:
         # 累计所有 POSITION_CLOSE 的 PnL, 与交易所权益对比
         self._bot_closed_pnl_total: float = 0.0
         self._bot_closed_trade_count: int = 0
+        # v4.5: 仅追踪本次运行期间的盈亏, 跨重启不累计
+        # 启动权益由交易所实际余额决定, 不用配置值
 
         # ── v4.1: 独立资金审计器 —— 账户净值是唯一真相 ──
+        # v4.5: initial_equity 设为 0, 在首次 CYCLE 时用实际交易所权益校准
         self.equity_auditor = EquityAuditor(
-            initial_equity=self.config.initial_equity or 10000.0,
+            initial_equity=self.config.initial_equity or 0.0,
             alarm_threshold=50.0,
         )
 
@@ -2589,7 +2592,13 @@ class DeepSeekQuantBot:
         """交易守卫: 日损锁+周末保护+方向死锁。返回 {"blocked": bool, "reason": str}"""
         # 如果日内亏损已触发锁定，本轮只扫描不交易
         if not self.riskmon.can_trade_with_data(acct):
-            logger.warning("⛔ 日内风控已锁定，本轮仅扫描不执行交易")
+            # v4.5: 每小时只报一次，减少日志噪声
+            now_ts = time.time()
+            last_log = getattr(self, '_last_daily_loss_logged', 0)
+            if now_ts - last_log > 3600:
+                logger.error(f"🚨 日内亏损 -{abs(self.riskmon.daily_pnl_pct)*100:.1f}% > "
+                             f"{self.config.daily_loss_limit*100:.0f}%，硬止损！")
+                self._last_daily_loss_logged = now_ts
             candidates = self.scan_all()
             logger.info(f"📊 本轮候选信号: {len(candidates)} 个（锁定模式，不执行）")
             for sig in candidates:
@@ -3124,19 +3133,10 @@ class DeepSeekQuantBot:
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 prev = json.load(f)
-            # v4.1: 恢复审计累计状态 (跨重启 PnL 追踪)
+            # v4.5: 仅恢复干旱计数器, 不再跨重启累计 PnL
+            # PnL 累计跨重启导致审计偏差 (bot预期 vs 实际不一致)
             audit_state = prev.get("audit", {})
             if audit_state:
-                saved_pnl = audit_state.get("bot_closed_pnl_total", 0)
-                saved_count = audit_state.get("bot_closed_trade_count", 0)
-                saved_fees = audit_state.get("cumulative_fees", 0)
-                if saved_pnl != 0:
-                    self._bot_closed_pnl_total = saved_pnl
-                    self._bot_closed_trade_count = saved_count
-                    logger.info(
-                        f"📋 审计状态恢复: PnL累计={saved_pnl:+.2f} "
-                        f"({saved_count}笔) 手续费={saved_fees:.2f}"
-                    )
                 # v4.1: 恢复干旱计数器，避免重启后 ADX 阈值回弹
                 saved_drought = audit_state.get("drought_cycles", 0)
                 if saved_drought > 0:

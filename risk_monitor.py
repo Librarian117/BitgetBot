@@ -181,10 +181,13 @@ class RiskMonitor:
 
         # 3. 百分比硬兜底 (从 .env 读取, 默认 3%)
         if self.daily_pnl_pct < self.hard_loss_pct:
-            logger.error(
-                f"🚨 日内亏损 {self.daily_pnl_pct*100:.2f}% > "
-                f"{abs(self.hard_loss_pct)*100:.0f}%，硬止损！"
-            )
+            # v4.5: 每小时只报一次，减少日志噪声
+            if now - getattr(self, '_last_hard_loss_log', 0) > 3600:
+                logger.error(
+                    f"🚨 日内亏损 {self.daily_pnl_pct*100:.2f}% > "
+                    f"{abs(self.hard_loss_pct)*100:.0f}%，硬止损！"
+                )
+                self._last_hard_loss_log = now
             return False
 
         return True

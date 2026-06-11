@@ -563,6 +563,10 @@ class ExchangeInterface:
                 amount=amount, params={"tradeSide": "close", "marginMode": "crossed"},
             )
         except Exception as e:
+            err_str = str(e)
+            if "40757" in err_str or "Not enough position" in err_str or "position is not available" in err_str:
+                logger.info(f"📦 {symbol} 仓位已不存在 (pos-tpsl 已平仓)")
+                return {"id": "already_closed", "note": "position already closed by pos-tpsl"}
             logger.error(f"市价平仓失败 {symbol}: {e}")
             return None
 

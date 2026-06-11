@@ -1,0 +1,28 @@
+{
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": false,
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.python",
+    "editor.formatOnSave": false,
+    "editor.rulers": [100],
+    "editor.tabSize": 4
+  },
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  "terminal.integrated.shellIntegration.enabled": true,
+  "terminal.integrated.env.windows": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+"ANTHROPIC_MODEL": "deepseek-v4-pro",
+    "ANTHROPIC_SMALL_FAST_MODEL": "deepseek-v4-pro"
+  },
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+  "files.watcherExclude": {
+    "**/grid_state.json": true,
+    "**/correlation_cache.json": true,
+    "**/status.json": true,
+    "**/logs/**": true
+  },
+  "python.terminal.activateEnvironment": false
+}
