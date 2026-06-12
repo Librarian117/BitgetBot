@@ -135,10 +135,11 @@ class DeepSeekQuantBot:
         self.total_trades = 0
         self.stats = {
             "start_time": now_iso(),
-            "adx_skips": 0,
+            "adx_skips": 0,        # v4.5: ADX硬过滤已移除, 保留统计兼容
             "vol_skips": 0,
             "btc_filters": 0,
             "tf_skips": 0,
+            "direction_skips": 0,  # v4.5: 趋势方向拒绝 (DIRECTION_BLOCK)
             "signals": 0,
             "ai_confirms": 0,
             "ai_rejects": 0,
@@ -370,10 +371,11 @@ class DeepSeekQuantBot:
                 if self.stats["signals"] > 0 else None
             ),
             "filters": {
-                "adx": self.stats["adx_skips"],
+                "adx": self.stats["adx_skips"],        # v4.5: ADX硬过滤已移除, 此处应为0
                 "vol": self.stats["vol_skips"],
                 "btc": self.stats["btc_filters"],
                 "tf": self.stats["tf_skips"],
+                "direction": self.stats["direction_skips"],  # v4.5: DIRECTION_BLOCK 计数
             },
             "market": {
                 "fng": self.market_ctx.fng_cache.get("value"),
@@ -483,6 +485,81 @@ class DeepSeekQuantBot:
                 aligned = False
 
         return aligned, "; ".join(reasons) if reasons else "无TF数据"
+
+    @staticmethod
+    def _resolve_kalman(direction: str, strategy: str,
+                        kalman_dir: str, kalman_score: float,
+                        ema_kalman_conflict: bool,
+                        is_bearish_trend: bool, is_bullish_trend: bool) -> Dict[str, Any]:
+        """v4.5: Kalman 单一决策 — 一次计算，一次消费。
+
+        替代旧逻辑中 Kalman 同时做四件事的分散架构:
+          ① 改策略 (pullback→counter_trend)
+          ② 扣 confidence
+          ③ 提 required_score (通过 kalman_conflict_for_scorer)
+          ④ 改方向门槛 (通过 kalman_ema_disagree)
+
+        返回统一结果，下游只读取一次:
+          action: "allow" | "penalize" | "downgrade"
+          new_strategy: None (保持) 或 "counter_trend"
+          confidence_penalty: 扣分值
+          kalman_conflict_for_scorer: 传递给 SignalScorer 提升门槛
+        """
+        result = {
+            "action": "allow",
+            "new_strategy": None,
+            "confidence_penalty": 0,
+            "kalman_conflict_for_scorer": False,
+        }
+
+        # ── 检查1: Kalman 方向 vs 信号方向冲突 ──
+        kalman_signal_conflict = (
+            kalman_dir != "flat"
+            and ((direction == "SHORT" and kalman_dir == "up")
+                 or (direction == "LONG" and kalman_dir == "down"))
+        )
+
+        if kalman_signal_conflict:
+            score = abs(kalman_score)
+            if score > 0.8:
+                result["action"] = "downgrade"
+                result["new_strategy"] = "counter_trend"
+                result["confidence_penalty"] = int(score * 25)
+                result["kalman_conflict_for_scorer"] = True
+            elif score > 0.5:
+                result["action"] = "downgrade"
+                result["new_strategy"] = "counter_trend"
+                result["confidence_penalty"] = int(score * 20)
+                result["kalman_conflict_for_scorer"] = True
+            elif score > 0.2:
+                result["action"] = "penalize"
+                result["confidence_penalty"] = int(score * 25)
+            # score <= 0.2: Kalman 噪声 → 忽略
+            return result
+
+        # ── 检查2: EMA-Kalman 分歧 (信号逆EMA趋势) ──
+        # v4.5: 弱 Kalman (score≤0.5) 仅降级不扣分 (匹配旧 Phase B 行为)
+        #       强 Kalman (score>0.5) 降级+扣分+提门槛 (匹配旧 Phase B+D 行为)
+        if ema_kalman_conflict:
+            goes_against_ema = (
+                (direction == "LONG" and is_bearish_trend)
+                or (direction == "SHORT" and is_bullish_trend)
+            )
+            strong_kalman = abs(kalman_score) > 0.5
+            if goes_against_ema and strategy == "pullback":
+                result["action"] = "downgrade"
+                result["new_strategy"] = "counter_trend"
+                if strong_kalman:
+                    result["confidence_penalty"] = min(int(abs(kalman_score) * 20), 20)
+                    result["kalman_conflict_for_scorer"] = True
+            elif goes_against_ema:
+                if strong_kalman:
+                    result["action"] = "penalize"
+                    result["confidence_penalty"] = min(int(abs(kalman_score) * 20), 20)
+            # goes_against_ema=False: EMA趋势与信号同向 → 不干预
+            return result
+
+        return result
 
     def _audit_snapshot(self, acct: Dict[str, Any]):
         """v4.1: 独立资金审计快照 (在所有返回路径都调用)
@@ -660,16 +737,40 @@ class DeepSeekQuantBot:
                 regime = "bear"
                 recommended = ["pullback", "counter_trend"]
 
-        # ── 8. 量比调整 ──
+        # ── 8. 允许方向 (v4.5: 吸收 _check_trend_alignment，统一趋势过滤) ──
+        # 每个 TF 仅在 trending 时约束方向；ranging TF 不投票
+        # 例如: 1h=bearish(trending) + 4h=bullish(trending) → 两个方向都被禁止
+        #       1h=bearish(trending) + 4h=ranging → 仅禁止 LONG
+        allowed_long = True
+        allowed_short = True
+        for tf in self.config.higher_timeframes:
+            ctx = tf_context.get(tf, {})
+            trend_tf = ctx.get("trend", "unknown")
+            regime_tf = ctx.get("regime", "unknown")
+            if regime_tf == "ranging" or trend_tf == "unknown":
+                continue  # 震荡TF不约束方向
+            if trend_tf == "bearish":
+                allowed_long = False
+            elif trend_tf == "bullish":
+                allowed_short = False
+        allowed_directions = []
+        if allowed_long:
+            allowed_directions.append("LONG")
+        if allowed_short:
+            allowed_directions.append("SHORT")
+        if not allowed_directions:
+            detail_parts.append("⚠️双向禁止-仅平仓")
+
+        # ── 9. 量比调整 ──
         if vol_ratio > 2.0:
             detail_parts.append(f"放量{vol_ratio:.1f}x")
         elif vol_ratio < 0.5 and vol_ratio > 0:
             detail_parts.append("缩量-谨慎")
 
-        # ── 9. 置信度 ──
+        # ── 10. 置信度 ──
         confidence = 70 if consensus >= 1.0 else (55 if consensus >= 0.5 else 40)
-        if adx_tier == "strong":
-            confidence += 10
+        # v4.5: ADX 不再独立加分 — trend_strength 已通过 Regime 分类和推荐策略体现
+        # 三重冗余修复: 移除 (1)信号层硬过滤 (2)此处的 Confidence 加分, 保留 (3)Regime 分类
         if volatility == "extreme":
             confidence = 85
 
@@ -681,6 +782,7 @@ class DeepSeekQuantBot:
             "atr_pct": round(atr_pct, 3),
             "consensus": round(consensus, 2),
             "recommended": recommended,
+            "allowed_directions": allowed_directions,  # v4.5: 统一方向过滤
             "confidence": min(100, confidence),
             "detail": " | ".join(detail_parts),
             "markov_bias": round(markov_bias, 3),
@@ -812,31 +914,12 @@ class DeepSeekQuantBot:
                 logger.debug(f"{symbol} 指标未就绪 (NaN)，跳过")
                 return None
 
-            # ── ① ADX 震荡过滤 (v3.6: 移除沙箱绕过，让过滤真正生效) ──
+            # v4.5: ADX 不再作为全局硬过滤器 → 趋势强度由 Regime 统一管理
+            # ADX 信息通过 Regime.trend_strength 传递到评分系统，避免三重冗余：
+            #  (1) 信号层硬过滤 (已移除) (2) Regime 分类 (保留) (3) Confidence 加分 (已移除)
+            # 各策略如需 ADX 阈值，在自身逻辑中检查（momentum 已有 momentum_adx_threshold）
             session = SessionManager.get_session(
                 self.config.adx_threshold, self.config.vol_ratio_threshold)
-            # v4.0: 沙箱ADX阈值 — floor降到6, 与自动调参floor一致
-            effective_adx = session["adx_threshold"]
-            if self.config.is_sandbox:
-                effective_adx = max(6, effective_adx - 4)  # 沙箱模式放宽但不全跳
-            # v4.1: ADX干旱自适应 — 连续无信号时逐步降低ADX门槛
-            drought = getattr(self, '_drought_cycles', 0)
-            if drought >= 10:
-                adx_relax = min(6, (drought - 10) // 5)  # 每5轮降1, 最多降6
-                effective_adx = max(6, effective_adx - adx_relax)
-                if drought % 10 == 0:
-                    logger.info(f"🌵 ADX干旱自适应: 阈值-{adx_relax} → {effective_adx} "
-                                f"(干旱{drought}轮, 基础={session['adx_threshold']})")
-            if adx < effective_adx:
-                logger.debug(
-                    f"{symbol} ADX={adx:.2f} < {effective_adx} "
-                    f"({session['label']}阈值, 基础={self.config.adx_threshold})，跳过"
-                )
-                self.tlogger.log_adx_skip(symbol, adx)
-                self.tlogger.log_filter_reject(symbol, "ADX_TOO_LOW",
-                    f"ADX={adx:.2f}<{effective_adx}", direction="")
-                self.stats["adx_skips"] += 1
-                return None
 
             # ── ② 成交量确认 (沙箱跳过——量数据不可靠；实盘严格过滤) ──
             if not self.config.is_sandbox:
@@ -998,59 +1081,32 @@ class DeepSeekQuantBot:
                 )
                 return None
 
-            # ── v4.1: Kalman 方向确认 —— 信号方向与 Kalman 趋势冲突时拒绝 ──
-            _kalman_penalty = 0  # 延迟扣分，在置信度计算后应用
-            # Kalman 滤波器零滞后，能提前捕捉趋势反转。当 EMA 说"熊市做空"
-            # 但 Kalman 说"反弹中"时，拒绝 SHORT 信号，避免在反弹中被止损。
-            # v4.1: Kalman 方向确认 —— 分级拦截，避免无差别拒绝
-            # 统计显示 Kalman 系列占 80.5% 杀伤力，阈值过严导致信号枯竭
-            # 新分级: <0.2忽略 | 0.2-0.5扣分 | 0.5-0.8降级counter_trend | >0.8硬拦截
-            if kalman_dir != "flat":
-                kalman_conflict = (
-                    (direction == "SHORT" and kalman_dir == "up")
-                    or (direction == "LONG" and kalman_dir == "down")
+            # ── v4.5: Kalman 统一决策 (替代分散的四重干预) ──
+            # 旧逻辑: Kalman 同时做 ①改策略 ②扣confidence ③提required_score ④改方向门槛
+            # 新逻辑: _resolve_kalman() 返回单一 action，下游只消费一次
+            kalman_result = self._resolve_kalman(
+                direction=direction, strategy=strategy,
+                kalman_dir=kalman_dir, kalman_score=kalman_score,
+                ema_kalman_conflict=ema_kalman_conflict,
+                is_bearish_trend=is_bearish_trend, is_bullish_trend=is_bullish_trend)
+            _kalman_action = kalman_result["action"]
+            if _kalman_action == "downgrade":
+                strategy = kalman_result["new_strategy"] or "counter_trend"
+                _kalman_penalty = kalman_result["confidence_penalty"]
+                logger.info(
+                    f"🔓 {symbol} {direction} Kalman→{_kalman_action}: "
+                    f"策略={strategy} 扣{_kalman_penalty}分 "
+                    f"(Kalman={kalman_dir} score={kalman_score:.2f})"
                 )
-                if kalman_conflict:
-                    score = abs(kalman_score)
-                    # v4.3: 统一改为降分+降级, 不再硬拒绝
-                    # 旧逻辑: >0.8 return None (硬拒) — 导致信号枯竭
-                    # 新逻辑: 全部降分+可选降级, 让评分系统决定
-                    if score > 0.8:
-                        # 强冲突 → 重度扣分 + counter_trend 半仓
-                        _kalman_penalty = int(score * 25)
-                        strategy = "counter_trend"
-                        self.tlogger.log_filter_reject(symbol, "KALMAN_CONFLICT",
-                            f"信号{direction} vs Kalman={kalman_dir}({kalman_score:.2f}) "
-                            f"强冲突→counter_trend扣{_kalman_penalty}分",
-                            direction=direction, strategy=strategy)
-                        logger.info(
-                            f"🔓 {symbol} {direction} Kalman强冲突→降级 "
-                            f"(score={kalman_score:.2f}>0.8) 扣{_kalman_penalty}分"
-                        )
-                    elif score > 0.5:
-                        strategy = "counter_trend"
-                        _kalman_penalty = int(score * 20)
-                        logger.info(
-                            f"🔓 {symbol} {direction} Kalman中冲突 "
-                            f"(score={kalman_score:.2f}) → counter_trend 半仓 扣{_kalman_penalty}分"
-                        )
-                    elif score > 0.2:
-                        _kalman_penalty = int(score * 25)
-                        logger.info(
-                            f"🔓 {symbol} {direction} Kalman弱冲突 "
-                            f"(score={kalman_score:.2f}) → 待扣{_kalman_penalty}分"
-                        )
-                    # score <= 0.2: Kalman 噪声 → 忽略，不干预信号
-                    # score <= 0.2: Kalman 噪声 → 忽略，不干预信号
-                elif ema_kalman_conflict:
-                    # v4.1: EMA-Kalman死锁时 — 降级为counter_trend而非直接拒绝
-                    # 死锁场景: EMA=熊市(只允许SHORT) + Kalman=涨(拒绝SHORT) → 0候选
-                    logger.info(
-                        f"🔓 {symbol} {direction} EMA-Kalman死锁 → "
-                        f"降级为counter_trend (Kalman={kalman_dir} vs EMA)"
-                    )
-                    strategy = "counter_trend"
-                    # 不return, 继续评分 — 后续confidence>=65才放行
+            elif _kalman_action == "penalize":
+                _kalman_penalty = kalman_result["confidence_penalty"]
+                logger.info(
+                    f"🔓 {symbol} {direction} Kalman→{_kalman_action}: "
+                    f"扣{_kalman_penalty}分 (Kalman={kalman_dir} score={kalman_score:.2f})"
+                )
+            else:  # "allow"
+                _kalman_penalty = 0
+            _kalman_conflict_for_scorer = kalman_result["kalman_conflict_for_scorer"]
 
             # ── v4.1: 币种止损冷却 —— 同币种止损后 30 分钟内禁止重新开仓 ──
             sym_cool = getattr(self, '_symbol_cooldowns', {})
@@ -1068,27 +1124,11 @@ class DeepSeekQuantBot:
                     del sym_cool[sym_key]  # 冷却过期, 清除
 
             # ── v4.1: 趋势方向校验先于方向阻止 — counter_trend 允许逆势通过 ──
-            # 原来 block_long/block_short 在这里直接 return None，导致 counter_trend
-            # 逃生逻辑(原 line 2681)永远走不到。现在把趋势校验提到 block 之前，
-            # 深度超卖/超买的逆势信号标记为 counter_trend 并放行。
+            # v4.5: Kalman 冲突已由 _resolve_kalman() 统一处理 (改策略/扣分/提门槛)
+            # Phase C 不再包含 Kalman 分支 — 死代码已移除
             if direction == "LONG" and strategy == "pullback":
                 if is_bearish_trend:
-                    # v4.3: Kalman 冲突时放宽 RSI 门槛 — 不硬拒绝, 让评分系统决定
-                    if kalman_ema_disagree:
-                        # Kalman说涨 → 有反弹可能, 仅要求RSI不过分(不接飞刀)
-                        if rsi < 25:  # 极端超卖 → 可以尝试逆势
-                            logger.info(f"🔓 {symbol} LONG Kalman冲突→counter_trend "
-                                        f"(RSI={rsi:.1f}<25)")
-                            strategy = "counter_trend"
-                        else:
-                            # v4.5: 删除死分支 "保留pullback+降分"
-                            # 后续 goes_against_ema 段(line 1170)总会把 pullback→counter_trend
-                            # RSI不够极端时直接降级，与真实执行路径一致
-                            logger.info(f"🔓 {symbol} LONG Kalman冲突→counter_trend "
-                                        f"(RSI={rsi:.1f}≥25, 直接降级)")
-                            strategy = "counter_trend"
-                            # 不放行counter_trend, 但也不return None — 让后面的评分系统决定
-                    elif rsi > effective_oversold * 0.7:
+                    if rsi > effective_oversold * 0.7:
                         self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
                             f"熊市禁LONG RSI={rsi:.1f}>{effective_oversold*0.7:.0f}",
                             direction="LONG", strategy="pullback")
@@ -1096,26 +1136,14 @@ class DeepSeekQuantBot:
                             f"⛔ {symbol} LONG-pullback 被拦截: 下跌趋势(EMA50<EMA200) "
                             f"且RSI={rsi:.1f}不够超卖(需<{effective_oversold:.0f})"
                         )
-                        self.stats["adx_skips"] += 1
+                        self.stats["direction_skips"] += 1  # v4.5: DIRECTION_BLOCK, 非ADX
                         return None
                     else:
                         logger.info(f"⚠️  {symbol} LONG-counter_trend 逆势通过 (RSI={rsi:.1f}深度超卖)")
                         strategy = "counter_trend"
             elif direction == "SHORT" and strategy == "pullback":
                 if is_bullish_trend:
-                    if kalman_ema_disagree:
-                        if rsi > 75:  # 极端超买 → 可以尝试逆势
-                            logger.info(f"🔓 {symbol} SHORT Kalman冲突→counter_trend "
-                                        f"(RSI={rsi:.1f}>75)")
-                            strategy = "counter_trend"
-                        else:
-                            # v4.5: 删除死分支 "保留pullback+降分"
-                            # 后续 goes_against_ema 段(line 1170)总会把 pullback→counter_trend
-                            # RSI不够极端时直接降级，与真实执行路径一致
-                            logger.info(f"🔓 {symbol} SHORT Kalman冲突→counter_trend "
-                                        f"(RSI={rsi:.1f}≤75, 直接降级)")
-                            strategy = "counter_trend"
-                    elif rsi < effective_overbought * 1.2:
+                    if rsi < effective_overbought * 1.2:
                         self.tlogger.log_filter_reject(symbol, "DIRECTION_BLOCK",
                             f"牛市禁SHORT RSI={rsi:.1f}<{effective_overbought*1.2:.0f}",
                             direction="SHORT", strategy="pullback")
@@ -1123,7 +1151,7 @@ class DeepSeekQuantBot:
                             f"⛔ {symbol} SHORT-pullback 被拦截: 上涨趋势(EMA50>EMA200) "
                             f"且RSI={rsi:.1f}不够超买(需>{effective_overbought:.0f})"
                         )
-                        self.stats["adx_skips"] += 1
+                        self.stats["direction_skips"] += 1  # v4.5: DIRECTION_BLOCK, 非ADX
                         return None
                     else:
                         logger.info(f"⚠️  {symbol} SHORT-counter_trend 逆势通过 (RSI={rsi:.1f}深度超买)")
@@ -1164,28 +1192,8 @@ class DeepSeekQuantBot:
             confidence = 50  # 基础分
             bonuses = []
 
-            # ── v4.3: EMA-Kalman 冲突降分 + 降级 ──
-            # 当 EMA 说熊市(禁LONG) 但 Kalman 说涨 → 不硬拒绝, 改为扣分+降级
-            if kalman_ema_disagree:
-                goes_against_ema = (
-                    (direction == "LONG" and is_bearish_trend) or
-                    (direction == "SHORT" and is_bullish_trend)
-                )
-                if goes_against_ema:
-                    # 第2步: 冲突降分 (硬拒绝 → 扣15分)
-                    kalman_penalty = int(abs(kalman_score) * 20)
-                    kalman_penalty = min(kalman_penalty, 20)  # 最多扣20
-                    confidence -= kalman_penalty
-                    bonuses.append(f"Kalman冲突-{kalman_penalty}")
-                    # 第3步: counter_trend 降级 (半仓+高置信度门槛由执行层处理)
-                    if strategy == "pullback":
-                        strategy = "counter_trend"
-                        bonuses.append("→counter_trend")
-                    logger.info(
-                        f"🔓 {symbol} {direction} EMA-Kalman冲突放行: "
-                        f"EMA={'熊' if is_bearish_trend else '牛'} Kalman={kalman_dir} "
-                        f"扣{kalman_penalty}分 | 策略={strategy}"
-                    )
+            # v4.5: EMA-Kalman 冲突处理已由 _resolve_kalman() 统一处理
+            # 不再在此处单独扣分+改策略 (消除 Kalman 四重干预)
 
             # 1. MACD 背离检测 (值 20 分)
             # v4.5: 统一使用已闭合K线 cidx 及其相对偏移
@@ -1222,12 +1230,18 @@ class DeepSeekQuantBot:
                 bonuses.append("放量下跌")
 
             # 4. RSI 极端位 (值 10 分)
+            # v4.5: pullback 已由 RSI 触发入场 → 不重复加分 (拆分RSI角色: 入场vs评分)
+            # RSI深度对 pullback 只是入场条件的程度差异, 非独立新信息
+            # 继续对 pullback 加分等于"RSI越极端越加分", 容易在趋势延续中接飞刀/摸顶
+            # 其他策略 (momentum/ema_cross/bollinger) 不依赖 RSI 入场 → 保留完整加分
             if direction == "LONG" and rsi < 30:
-                confidence += 10
-                bonuses.append("RSI深度超卖")
+                if strategy != "pullback":
+                    confidence += 10
+                    bonuses.append("RSI深度超卖")
             elif direction == "SHORT" and rsi > 70:
-                confidence += 10
-                bonuses.append("RSI深度超买")
+                if strategy != "pullback":
+                    confidence += 10
+                    bonuses.append("RSI深度超买")
 
             # 5. MACD 金叉/死叉 (值 5 分)
             macd_line = float(df["macd"].iloc[cidx])
@@ -1311,41 +1325,12 @@ class DeepSeekQuantBot:
                     except Exception:
                         logger.debug("⚠️  静默异常", exc_info=True)
 
-                # 构建简化的 regime_info (单TF近似，供评分器使用)
-                # 后续 run_once 中的多TF分析会做更精确的6状态分类
+                # v4.5: 扫描期不再构建单TF regime_info — 单TF分类不可靠
+                # 执行期多TF Regime 已统一处理方向+策略路由
+                # 单TF regime 的 recommended 会在 scorer 里提前惩罚策略，
+                # 随后执行期又用多TF Regime 再路由一次 → 同类信息双重消费
+                # 现在扫描期 scorer 收到 regime_info=None → regime 维度返回中性 50
                 regime_info = None
-                try:
-                    atr_pct = atr / close if close > 0 else 0
-                    # v4.0: 6状态简化版 — 基于单TF趋势+ADX
-                    if atr_pct >= 0.025:  # >2.5% = 极端波动
-                        regime_label = "panic"
-                        recommended = []
-                    elif adx > 25 and is_bullish_trend:
-                        regime_label = "strong_bull"
-                        recommended = ["momentum", "pullback", "ema_cross"]
-                    elif adx > 25 and is_bearish_trend:
-                        regime_label = "strong_bear"
-                        recommended = ["momentum", "pullback", "ema_cross"]
-                    elif is_bullish_trend:
-                        regime_label = "bull"
-                        recommended = ["pullback", "ema_cross"]
-                    elif is_bearish_trend:
-                        regime_label = "bear"
-                        recommended = ["pullback", "ema_cross"]
-                    else:
-                        regime_label = "range"
-                        recommended = ["bollinger", "grid", "pullback"]
-                    atr_tier = "extreme" if atr_pct >= 0.025 else ("high" if atr_pct > 0.01 else "normal")
-                    regime_info = {
-                        "regime": regime_label,
-                        "recommended": recommended,
-                        "confidence": 60 if adx > 25 else 45,
-                        "volatility": atr_tier,
-                        "trend_strength": "strong" if adx > 25 else ("weak" if adx < 20 else "moderate"),
-                        "detail": f"单TF:{regime_label} ADX={adx:.1f} ATR%={atr_pct*100:.2f}",
-                    }
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
 
                 score_result = self.scorer.score(
                     sig={"direction": direction, "strategy": strategy,
@@ -1355,19 +1340,17 @@ class DeepSeekQuantBot:
                     flow_signal=flow_signal,
                     markov_result=markov_result,
                     learner=self.learner,
+                    strategy=strategy,  # v4.5: 策略感知门槛
+                    kalman_conflict=_kalman_conflict_for_scorer,  # v4.5: Kalman统一决策
                 )
                 confidence = score_result["score"]
                 tier = score_result["tier"]
+                required_score = score_result.get("required_score", 50)  # v4.5: 统一门槛
 
                 logger.info(
                     f"💡 {symbol} {direction} [{strategy}] "
                     f"→ {score_result['summary']}"
                 )
-
-                # 三层决策: <50 拒绝
-                if tier == "REJECT":
-                    logger.info(f"⛔ {symbol} 评分{confidence}<{self.scorer.AI_THRESHOLD} → 自动拒绝")
-                    return None
 
                 # v4.0: 完美信号强制AI审核 — bonus全满的"假突破"最危险
                 bonus_count = len([b for b in bonuses if b != "无加成"])
@@ -1379,13 +1362,7 @@ class DeepSeekQuantBot:
                     )
             else:
                 tier = "AI"  # 无评分器 → 回退 AI 审核
-
-            logger.info(
-                f"💡 {symbol} 触发 {direction} 信号 [{strategy}]! "
-                f"置信度={confidence} ({bonus_str}) "
-                f"price={close:.4f} EMA={ema:.4f} RSI={rsi:.2f} ADX={adx:.2f} "
-                f"ATR={atr:.4f} VolRatio={vol_ratio:.2f}"
-            )
+                required_score = 50
 
             # ── v4.0: CVD 成交量背离检测 (仅实盘, 沙箱 fetch_trades 不可用) ──
             if not self.config.is_sandbox:
@@ -1411,16 +1388,17 @@ class DeepSeekQuantBot:
                 except Exception:
                     pass  # 获取不到成交数据不影响决策
 
-            # ── v4.4: 最低置信度过滤 —— 弱信号不开仓 ──
-            # counter_trend 作为逆势反转需更高置信度 + 极端 RSI 确认
-            min_conf = 58 if strategy == "counter_trend" else 55
-            # v4.1: EMA-Kalman死锁降级的counter_trend需更高置信度
-            if strategy == "counter_trend" and ema_kalman_conflict:
-                min_conf = 65
-            # v4.4: counter_trend 必须处于真正超卖/超买状态 (熊市反弹陷阱拦截)
-            # v4.5: 被动降级的pullback不受此限制 — pullback生成时已通过自有RSI门槛
-            # 避免"先放行后必杀": bearish趋势 relaxed overbought=50 生成的 SHORT
-            # 被Kalman降级为counter_trend后, RSI=51 < ct_rsi_short_min=55 → 必杀
+            # ── v4.5: 统一门槛 (替代旧 tier=="REJECT" + min_conf 双重检查) ──
+            # SignalScorer 按策略返回 required_score，执行层只检查一次，不再单独维护 min_conf
+            if confidence < required_score:
+                logger.info(
+                    f"⛔ {symbol} {direction} {strategy} 评分{confidence}<门槛{required_score}"
+                    f" → 拒绝 (加成: {bonus_str})"
+                )
+                return None
+
+            # ── v4.4: counter_trend RSI 门槛 (非置信度阈值, 保留硬性RSI检查) ──
+            # 真正的 counter_trend 信号必须处于超卖/超买极端区域
             _is_degraded = (_original_strategy == "pullback" and strategy == "counter_trend")
             if strategy == "counter_trend" and not _is_degraded:
                 if direction == "LONG" and rsi > self.config.ct_rsi_long_max:
@@ -1440,12 +1418,6 @@ class DeepSeekQuantBot:
                     f"🔓 {symbol} {direction} 被动降级counter_trend (原pullback) → "
                     f"跳过极端RSI门槛 (RSI={rsi:.1f}, pullback门槛已满足)"
                 )
-            if confidence < min_conf:
-                logger.info(
-                    f"🔇 {symbol} {direction} {strategy} 置信度{confidence}<{min_conf}，"
-                    f"拒绝 (加成: {bonus_str})"
-                )
-                return None
 
             return {
                 "symbol": symbol,
@@ -1462,6 +1434,7 @@ class DeepSeekQuantBot:
                 "vol_ratio": round(vol_ratio, 2),
                 "confidence": confidence,
                 "tier": tier,
+                "required_score": required_score,  # v4.5: 后置检查用 (VaR/方向集中扣分后重验)
                 "bonuses": bonuses,
                 # v4.0: 量化信号
                 "_hurst": quant.get("hurst", 0.5),
@@ -1997,10 +1970,13 @@ class DeepSeekQuantBot:
                 self._regime_start_cycle = self.cycle_count if hasattr(self, 'cycle_count') else 0
             # v4.0: 记录当前市场状态，供平仓归因使用
             self._current_regime = market_regime
-            trend_aligned, alignment_reason = self._check_trend_alignment(direction, tf_context)
+            # v4.5: _check_trend_alignment 已吸收到 Regime.allowed_directions
+            # 趋势对齐不再单独检查，统一由下方 Regime 统一过滤处理
+            allowed_dirs = regime_info.get("allowed_directions", ["LONG", "SHORT"])
+            recommended = regime_info.get("recommended", [])
 
             logger.info(
-                f"📊 多TF分析 [{symbol}]: {alignment_reason} | "
+                f"📊 多TF分析 [{symbol}]: 允许方向={allowed_dirs} | "
                 f"市场: {market_regime} ({regime_info.get('detail','')}) "
                 f"波动:{regime_info.get('volatility','?')} "
                 f"趋势:{regime_info.get('trend_strength','?')} "
@@ -2021,44 +1997,31 @@ class DeepSeekQuantBot:
                 logger.info(f"🔧 {symbol} Hurst={sig_hurst:.3f} 回归市→跳过{strategy}趋势策略")
                 continue
 
-            # ── v3.7: 策略路由 —— 根据市场状态过滤不匹配策略 ──
-            # v4.0: bollinger/counter_trend 是均值回归/反转策略, 不受趋势约束
-            recommended = regime_info.get("recommended", [])
-            if recommended and strategy not in recommended:
-                if strategy in ("bollinger", "counter_trend"):
-                    logger.info(
-                        f"🔄 {symbol} {strategy} 策略不受市场状态限制 "
-                        f"(市场: {market_regime})，放行"
-                    )
-                else:
-                    self.tlogger.log_filter_reject(symbol, "STRATEGY_ROUTE",
-                        f"{strategy}不在推荐{recommended}(市场:{market_regime})",
-                        direction=direction, strategy=strategy)
-                    logger.info(
-                        f"🔄 {symbol} 策略路由: {strategy} 不在推荐列表 "
-                        f"{recommended} (市场: {market_regime})，跳过"
-                    )
-                    continue
-
-            # v4.5: 多TF趋势不一致 → 过滤 (均值回归策略豁免)
-            # pullback 在 signal_scorer 中归为趋势策略，必须通过多TF一致性检查
-            # 避免在牛市1h/4h偏多时放行 pullback SHORT
-            if not trend_aligned and strategy not in ("bollinger", "counter_trend"):
-                opposing_tfs = [
-                    tf for tf in self.config.higher_timeframes
-                    if tf_context.get(tf, {}).get("trend", "unknown") not in ("unknown", "")
-                    and tf_context.get(tf, {}).get("regime", "unknown") != "ranging"
-                ]
-                if len(opposing_tfs) >= 1:
-                    self.tlogger.log_filter_reject(symbol, "TF_MISMATCH",
-                        f"多TF不一致:{alignment_reason}", direction=direction, strategy=strategy)
-                    logger.warning(
-                        f"⛔ {symbol} {direction} 信号与大趋势不一致，过滤 "
-                        f"({alignment_reason})"
-                    )
-                    self.tlogger.log_tf_skip(symbol, direction, alignment_reason, tf_context)
+            # ── v4.5: Regime 统一过滤 (替代原 STRATEGY_ROUTE + TF_MISMATCH 双重检查) ──
+            # 两个旧过滤器来源相同 (tf_context→Regime)，容易让同一趋势证据连续筛掉信号
+            # 现在 Regime 输出 allowed_directions + recommended，执行层只检查一次
+            # 均值回归策略 (bollinger, counter_trend) 豁免方向/趋势约束
+            if strategy not in ("bollinger", "counter_trend"):
+                reject_reason = None
+                if direction not in allowed_dirs:
+                    reject_reason = f"方向{direction}不在Regime允许{allowed_dirs}"
                     self.stats["tf_skips"] += 1
+                elif recommended and strategy not in recommended:
+                    reject_reason = f"{strategy}不在推荐{recommended}({market_regime})"
+                if reject_reason:
+                    reject_type = "TF_MISMATCH" if "方向" in reject_reason else "STRATEGY_ROUTE"
+                    self.tlogger.log_filter_reject(symbol, reject_type,
+                        reject_reason, direction=direction, strategy=strategy)
+                    logger.warning(f"⛔ {symbol} Regime统一过滤: {reject_reason}")
+                    if "方向" in reject_reason:
+                        self.tlogger.log_tf_skip(symbol, direction,
+                            f"Regime禁止:{allowed_dirs}", tf_context)
                     continue
+            elif strategy in ("bollinger", "counter_trend"):
+                logger.info(
+                    f"🔄 {symbol} {strategy} 均值回归策略不受Regime方向约束 "
+                    f"(市场: {market_regime})，放行"
+                )
 
             # ── v2.1: 资金费率 ──
             funding_rate = funding_rates.get(symbol)
@@ -2209,10 +2172,15 @@ class DeepSeekQuantBot:
                         f"⚠️  {symbol} {direction} 方向占比{max(long_pct,100-long_pct):.0f}%过高，"
                         f"置信度降至{sig['confidence']}"
                     )
-                    # 如果降低后 < AI 阈值，且没有 AUTO 豁免 → 跳过
-                    if sig["confidence"] < 45:
-                        logger.info(f"⛔ {symbol} 方向集中+置信度过低 → 跳过")
-                        continue
+                    # v4.5: 不再单独检查 → 统一由下方后置校验处理
+
+            # ── v4.5: 统一后置校验 — VaR/方向集中扣分后重新检查 required_score ──
+            # 扫描阶段已通过门槛，但后续 VaR/方向集中可能再次扣分
+            # 确保信号在最终下单前仍满足策略感知的 required_score
+            _req = sig.get("required_score", 50)
+            if sig.get("confidence", 50) < _req:
+                logger.info(f"⛔ {symbol} 后置扣分后{sig['confidence']}<门槛{_req} → 跳过")
+                continue
 
             # 3. 最小开仓间隔 (同一周期最多开 1 仓，60s 冷却)
             last_trade_ts = getattr(self, '_last_trade_ts', 0)
@@ -2589,7 +2557,7 @@ class DeepSeekQuantBot:
                 candidates = self.portfolio.rank_candidates(candidates, tf_ctxs)
                 logger.info(f"📊 投资组合排名完成 ({len(candidates)} 个候选)")
 
-                # v2.0: 用组合排名重新评分
+                # v2.0: 用组合排名重新评分 (仅算组合维度得分, 不改 confidence)
                 total = len(candidates)
                 if self.scorer:
                     for sig in candidates:
@@ -2604,12 +2572,8 @@ class DeepSeekQuantBot:
                             learner=self.learner,
                         )
                         sig["_portfolio_score"] = result["score"]
-                        # 组合排名信号注入 confidence
-                        result["breakdown"].get("portfolio", {}).get("score", 50)
-                        if rank <= 2:
-                            sig["confidence"] = min(100, sig.get("confidence", 50) + 5)
-                        elif rank > total * 0.7:
-                            sig["confidence"] = max(30, sig.get("confidence", 50) - 10)
+                        # v4.5: 组合排名不再改写 confidence — 只影响仓位系数 (get_position_multiplier)
+                        # 低排名减分会导致刚好过线的信号跌穿 required_score 门槛
 
                 # v2.0: 组合摘要 (供 AI context)
                 sym_bases = [s["symbol"] for s in candidates[:5]]

@@ -31,22 +31,34 @@ class SignalScorer:
     """统一加权评分引擎"""
 
     # 权重配置 (可调, sum MUST = 1.0)
-    # v4.1: 新增 quant 维度 (Kalman+Hurst+VolCone)
+    # v4.5: 移除 quant 维度 — Kalman/Hurst/VolCone 字段未被传入 scorer，
+    # 该维度始终返回中性分(~50)，浪费 9% 权重并造成归因误读。
+    # Kalman 已由主流程 _resolve_kalman() 统一处理。
     WEIGHTS = {
-        "technical":    0.25,   # 技术面 (MACD/RSI/布林/趋势)
-        "regime":       0.11,   # 市场状态 (趋势强度+波动率)
-        "sentiment":    0.11,   # 情绪量化 (F&G+新闻)
-        "oi_flow":      0.10,   # 订单流 (OI背离)
-        "markov":       0.10,   # 马可夫状态
-        "strategy":     0.09,   # 策略权重 (历史表现)
-        "direction":    0.09,   # 方向开关 (历史胜率)
-        "portfolio":    0.06,   # v2.0: 组合排名
-        "quant":        0.09,   # v4.1: 量化特征 (Kalman+Hurst+VolCone)
+        "technical":    0.27,   # 技术面 (MACD/RSI/布林/趋势)
+        "regime":       0.12,   # 市场状态 (趋势强度+波动率)
+        "sentiment":    0.12,   # 情绪量化 (F&G+新闻)
+        "oi_flow":      0.11,   # 订单流 (OI背离)
+        "markov":       0.11,   # 马可夫状态
+        "strategy":     0.10,   # 策略权重 (历史表现)
+        "direction":    0.10,   # 方向开关 (历史胜率)
+        "portfolio":    0.07,   # v2.0: 组合排名
     }
 
     # 决策阈值
     AUTO_THRESHOLD = 70     # >70 自动开仓
-    AI_THRESHOLD = 50       # 50-70 AI 审核
+
+    @staticmethod
+    def get_required_score(strategy: str = "pullback",
+                           kalman_conflict: bool = False) -> int:
+        """v4.5: 统一门槛 — 策略感知的最低置信度。
+
+        替代分散在 deepseek_quant_bot.py 中的 min_conf 变量。
+        执行层只读 score() 返回的 required_score 和 tier，不再单独维护阈值。
+        """
+        if strategy == "counter_trend":
+            return 65 if kalman_conflict else 58
+        return 50  # pullback, momentum, ema_cross, bollinger, grid
 
     def score(self, sig: Dict[str, Any],
               regime_info: Optional[Dict] = None,
@@ -55,7 +67,9 @@ class SignalScorer:
               markov_result: Optional[Dict] = None,
               learner: Any = None,
               portfolio_rank: int = 1,
-              portfolio_total: int = 1) -> Dict[str, Any]:
+              portfolio_total: int = 1,
+              strategy: str = "",
+              kalman_conflict: bool = False) -> Dict[str, Any]:
         """
         统一评分入口 v2.0。
 
@@ -143,22 +157,19 @@ class SignalScorer:
         }
         total += port_score * self.WEIGHTS["portfolio"]
 
-        # ── 9. 量化特征 (9%) v4.1: Kalman + Hurst + VolCone ──
-        quant_score = self._score_quant(sig)
-        breakdown["quant"] = {
-            "score": quant_score,
-            "detail": f"Kalman={sig.get('_kalman_dir','?')} Hurst={sig.get('_hurst_regime','?')}",
-        }
-        total += quant_score * self.WEIGHTS["quant"]
+        # v4.5: quant 维度已移除 — Kalman 由主流程 _resolve_kalman() 统一处理
 
         # ── 最终分数 ──
         final_score = int(round(total))
         final_score = max(0, min(100, final_score))
 
-        # ── 决策层级 ──
+        # ── v4.5: 策略感知决策层级 (统一门槛) ──
+        # 替代旧的固定 AI_THRESHOLD=50 + deepseek_quant_bot.py 中分散的 min_conf
+        eff_strategy = strategy or sig.get("strategy", "pullback")
+        required = self.get_required_score(eff_strategy, kalman_conflict)
         if final_score > self.AUTO_THRESHOLD:
             tier = "AUTO"
-        elif final_score >= self.AI_THRESHOLD:
+        elif final_score >= required:
             tier = "AI"
         else:
             tier = "REJECT"
@@ -170,6 +181,7 @@ class SignalScorer:
         return {
             "score": final_score,
             "tier": tier,
+            "required_score": required,  # v4.5: 统一门槛值
             "breakdown": breakdown,
             "summary": summary,
         }
@@ -361,42 +373,6 @@ class SignalScorer:
         else:
             return 15
 
-    @staticmethod
-    def _score_quant(sig: Dict[str, Any]) -> int:
-        """v4.1: 量化特征评分 — Kalman + Hurst + VolCone"""
-        score = 50
-        direction = sig.get("direction", "LONG")
-        strategy = sig.get("strategy", "pullback")
-
-        # Kalman 方向确认 (±25)
-        kalman_dir = sig.get("_kalman_dir", "flat")
-        kalman_score = sig.get("_kalman_score", 0)
-        if kalman_dir != "flat":
-            aligned = (direction == "LONG" and kalman_dir == "up") or \
-                      (direction == "SHORT" and kalman_dir == "down")
-            if aligned:
-                score += min(25, int(abs(kalman_score) * 30))
-            elif abs(kalman_score) > 0.3:
-                score -= 25
-            else:
-                score -= 10
-
-        # Hurst 策略匹配 (±15)
-        hurst_regime = sig.get("_hurst_regime", "random_walk")
-        trend_strategies = ("pullback", "momentum", "ema_cross")
-        mean_rev_strategies = ("bollinger", "counter_trend")
-        if strategy in trend_strategies and hurst_regime == "trending":
-            score += 15
-        elif strategy in mean_rev_strategies and hurst_regime == "mean_reverting":
-            score += 15
-        elif strategy in trend_strategies and hurst_regime == "mean_reverting":
-            score -= 10
-
-        # 波动率锥 (±10)
-        vol_percentile = sig.get("_vol_cone_percentile", 50)
-        if vol_percentile > 85:
-            score -= 10
-        elif vol_percentile < 15:
-            score += 5
-
-        return max(0, min(100, score))
+    # v4.5: _score_quant 已移除 — Kalman/Hurst/VolCone 字段未被传入 scorer
+    # Kalman 由主流程 _resolve_kalman() 统一处理，Hurst 在 _phase_execute 策略路由中使用
+    # 原有的 9% 权重已按比例重新分配给其余 8 个维度
