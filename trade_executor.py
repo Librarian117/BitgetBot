@@ -486,6 +486,25 @@ class TradeExecutor:
             )
 
         if order:
+            # P0修复: TPSL fatal close → 传播 close context 给调用方 finalize
+            if isinstance(order, dict) and order.get("tpsl_fatal_close"):
+                result["tpsl_fatal_close"] = True
+                result["entry_order"] = order.get("entry_order")
+                result["close_order"] = order.get("close_order")
+                result["entry_price"] = order.get("entry_price", price)
+                result["amount"] = order.get("amount", amount_contracts)
+                result["pos_side"] = order.get("pos_side", pos_side)
+                result["margin_ratio_used"] = margin_ratio
+                self.logger.log_trade(
+                    symbol=symbol, direction=direction, price=price,
+                    sl=sl_price, tp_info=result["tp_info"],
+                    amount=amount_contracts,
+                    order_id=None, success=False,
+                    entry_fee=entry_fee, total_estimated_fee=total_estimated_fee,
+                    margin_ratio_used=margin_ratio,
+                )
+                return result
+
             # ── v3.0: 订单成交确认 (v4.4: 沙箱也启用) ──
             if (not self._skip_safety or self.config.sandbox_safety) and self.safety and self.config.order_confirmation_enabled:
                 confirmed, _ = self.safety.confirm_order_fill(

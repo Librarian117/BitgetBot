@@ -645,6 +645,7 @@ class DeepSeekQuantBot:
             "pnl_source": trade.get("pnl_source", "FALLBACK"),
             "fee": round(trade.get("fee", 0), 4),
             "funding": round(trade.get("funding", 0), 4),
+            "net_profit": round(trade.get("net_profit", 0), 4),  # P0: 审计字段
             "close_reason": trade.get("close_reason", "UNKNOWN"),
             "open_ts": int(trade.get("open_ts", 0)),
             "close_ts": int(trade.get("close_ts", time.time())),
@@ -723,14 +724,16 @@ class DeepSeekQuantBot:
                 pnl_source = "API"
                 exit_price = real_pnl.get("exit_price", 0) or mark_price
                 api_fee = real_pnl.get("fee", 0) + real_pnl.get("open_fee", 0)
-                api_funding = real_pnl.get("funding_fee", 0)
-                funding_fee = api_funding  # API totalPnl 已含 funding, 此处仅记录
+                api_funding = real_pnl.get("funding_fee", 0)  # P0修复: adapter 现在返回 totalFunding
+                api_net_profit = real_pnl.get("net_profit", 0)  # P0: 审计口径
+                funding_fee = api_funding  # Bitget totalFunding 字段
             else:
                 est_fee = entry * abs(contracts) * csize * taker_fee * 2
                 pnl = upl - est_fee
                 pnl_source = "FALLBACK"
                 exit_price = 0
                 api_fee = est_fee
+                api_net_profit = 0  # P0: FALLBACK 无 netProfit
                 # FALLBACK: 尝试从持仓 API 获取 funding fee
                 try:
                     funding_fee = self.exchange.fetch_position_funding_fee(sym_full)
@@ -742,10 +745,12 @@ class DeepSeekQuantBot:
                 )
 
             # ── STEP 3: 记录费用 (仅此一处写入 cumulative_fees) ──
-            if api_fee > 0:
-                self.riskmon.record_trade_fees(api_fee)
+            # P0修复: Bitget fee 字段为负值 (openFee/closeFee < 0 = 支出),
+            # 原 > 0 判断导致 API 路径从不记录手续费
+            if api_fee != 0:
+                self.riskmon.record_trade_fees(abs(api_fee))
             if funding_fee != 0:
-                self.riskmon.record_funding_fees(funding_fee)
+                self.riskmon.record_funding_fees(abs(funding_fee))
 
             # ── STEP 4: PnL% ──
             pnl_pct = (pnl / margin) * 100 if margin > 0 else 0.0
@@ -834,6 +839,7 @@ class DeepSeekQuantBot:
                 "entry": entry, "exit": final_exit_price,
                 "pnl": pnl, "pnl_pct": pnl_pct,
                 "fee": api_fee, "funding": funding_fee,
+                "net_profit": api_net_profit if pnl_source == "API" else 0,
                 "close_reason": close_reason, "pnl_source": pnl_source,
                 "open_ts": open_ts, "close_ts": time.time(),
                 "duration_min": dur_min,
@@ -870,11 +876,33 @@ class DeepSeekQuantBot:
             taker_fee = self.exchange.get_taker_fee(sym_full)
             est_fee = entry * abs(contracts) * csize * taker_fee * 2
             fallback_pnl = upl - est_fee
-            fallback = {"pnl": fallback_pnl, "pnl_pct": 0, "pnl_source": "FALLBACK",
+            # P0修复: pnl_source 区分正常 FALLBACK 和异常回退
+            fallback = {"pnl": fallback_pnl, "pnl_pct": 0, "pnl_source": "FALLBACK_EXCEPTION",
                         "funding_fee": 0, "fees": est_fee, "trade_id": dedup_key,
                         "already_processed": False}
             self._closed_trades_cache[dedup_key] = fallback
             self._position_open_times.pop(sym_full, None)
+            # P0修复: 异常回退必须写最小 ledger (防止静默财务黑洞)
+            exc_dur_min = 0.0
+            if open_ts > 0:
+                exc_dur_min = (time.time() - open_ts) / 60.0
+            try:
+                self._write_trade_ledger({
+                    "symbol": base, "side": side, "strategy": strategy,
+                    "entry": entry, "exit": mark_price,
+                    "pnl": fallback_pnl, "pnl_pct": 0,
+                    "fee": est_fee, "funding": 0,
+                    "close_reason": close_reason + "_EXCEPTION",
+                    "pnl_source": "FALLBACK_EXCEPTION",
+                    "open_ts": open_ts, "close_ts": time.time(),
+                    "duration_min": exc_dur_min,
+                })
+            except Exception:
+                pass  # 连 ledger 写入也失败时, 至少 dedup key 已缓存
+            try:
+                self._persist_closed_key(dedup_key)
+            except Exception:
+                pass
             return fallback
 
     def _audit_snapshot(self, acct: Dict[str, Any]):
@@ -2480,6 +2508,33 @@ class DeepSeekQuantBot:
                                                position_multiplier=pos_mult,
                                                market_regime=market_regime,
                                                vol_cone_sl_mult=sig.get("_vol_cone_sl_mult", 1.0))
+                # P0修复: TPSL fatal close → finalize 已发生的 round-trip trade
+                if result.get("tpsl_fatal_close"):
+                    sym_full = f"{symbol}/USDT:USDT"
+                    entry_price = result.get("entry_price", price)
+                    contracts = result.get("amount", 0)
+                    pos_side = result.get("pos_side", "long" if direction == "LONG" else "short")
+                    # 估算保证金 (使用 ADX 公式近似)
+                    est_margin = entry_price * abs(contracts) * self.exchange.get_contract_size(sym_full) / self.config.leverage
+                    logger.error(
+                        f"📋 {symbol} TPSL致命失败 → 记录 round-trip 到 finalize: "
+                        f"entry={entry_price:.4f} contracts={contracts} margin≈{est_margin:.2f}"
+                    )
+                    self._finalize_closed_position(
+                        symbol=sym_full,
+                        side="LONG" if pos_side == "long" else "SHORT",
+                        entry=entry_price,
+                        contracts=contracts,
+                        margin=max(est_margin, 1.0),
+                        upl=0,
+                        close_reason="TPSL_FAILURE_PROTECTIVE_CLOSE",
+                        open_ts=time.time(),
+                        strategy=strategy,
+                        close_order_result=result.get("close_order"),
+                        mark_price=entry_price,
+                    )
+                    self.stats["ai_rejects"] += 1
+                    continue
                 if result["success"]:
                     self.total_trades += 1
                     trades_this_cycle += 1

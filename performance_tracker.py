@@ -34,6 +34,9 @@ class PerformanceTracker:
         self._path = os.path.join(script_dir, self.PERFORMANCE_FILE)
         self.trades: List[Dict[str, Any]] = []
         self._load()
+        # P1 Commit 2: ledger 缓存 — 避免每次 get_metrics() 重读文件
+        self._ledger_mtime: float = 0.0
+        self._ledger_trades_cache: Optional[List[Dict[str, Any]]] = None
 
     # ════════════════════════════════════════════
     # 记录
@@ -61,6 +64,9 @@ class PerformanceTracker:
         if len(self.trades) > self.MAX_TRADES_KEPT:
             self.trades = self.trades[-self.MAX_TRADES_KEPT:]
         self._save()
+        # P1 Commit 2: 新交易已写入 ledger+performance.json, 使缓存失效
+        self._ledger_mtime = 0.0
+        self._ledger_trades_cache = None
         logger.info(
             f"📊 {symbol} {direction} pnl={pnl:+.2f} ({pnl_pct:+.2f}%) "
             f"{duration_minutes:.0f}min [{strategy}]"
@@ -71,8 +77,15 @@ class PerformanceTracker:
     # ════════════════════════════════════════════
 
     def get_metrics(self, trades: Optional[List[Dict]] = None) -> Dict[str, Any]:
-        """计算核心绩效指标。传入 trades 子集可得到子集指标。"""
-        tlist = trades or self.trades
+        """计算核心绩效指标。传入 trades 子集可得到子集指标。
+
+        P1 Commit 2: 当未显式传入 trades 时，优先从 trade_ledger.jsonl 读取
+        (crash-safe source)。ledger 缺失/为空时 fallback 到内存 self.trades。
+        显式传入 trades 参数时保持原有行为不变。
+        """
+        tlist = trades
+        if tlist is None:
+            tlist = self._get_trades_from_ledger_or_memory()
         if not tlist:
             return self._empty_metrics()
 
@@ -147,6 +160,33 @@ class PerformanceTracker:
             "best_trade": round(max(pnls), 2) if pnls else 0,
             "worst_trade": round(min(pnls), 2) if pnls else 0,
         }
+
+    def _get_trades_from_ledger_or_memory(self) -> List[Dict[str, Any]]:
+        """P1 Commit 2: 优先从 trade_ledger.jsonl 读取 trades。
+
+        缓存策略: 若 ledger 文件 mtime 未变则复用缓存, 避免每周期重读。
+        ledger 缺失/为空时 fallback 到 self.trades (performance.json 路径)。
+        使用 getattr 兼容 object.__new__ 创建的临时实例 (测试用)。
+
+        Returns:
+            与 self.trades 格式兼容的 dict 列表
+        """
+        ledger_path = self.LEDGER_FILE
+        cache = getattr(self, '_ledger_trades_cache', None)
+        cached_mtime = getattr(self, '_ledger_mtime', 0.0)
+        try:
+            mtime = os.path.getmtime(ledger_path)
+        except OSError:
+            mtime = 0.0
+        if mtime > 0 and mtime != cached_mtime:
+            trades = self.load_trades_from_ledger(ledger_path)
+            self._ledger_trades_cache = trades
+            self._ledger_mtime = mtime
+            cache = trades
+        if cache:
+            return cache
+        # Fallback: ledger 从未加载或为空 → 用内存 trades
+        return getattr(self, 'trades', [])
 
     # ════════════════════════════════════════════
     # 多维拆分
@@ -256,3 +296,106 @@ class PerformanceTracker:
                 )
         except Exception:
             self.trades = []
+
+    # ════════════════════════════════════════════
+    # P1: Ledger 重建能力 (additive, 不修改现有路径)
+    # ════════════════════════════════════════════
+
+    LEDGER_FILE = "logs/trade_ledger.jsonl"
+
+    @staticmethod
+    def _trade_from_ledger_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """将一条 TRADE_CLOSE ledger 记录转换为 performance trade dict。
+        返回 None 表示该行无法转换（缺关键字段/非 TRADE_CLOSE 事件）。
+        """
+        if record.get("event") != "TRADE_CLOSE":
+            return None
+        # 最小必需字段校验 — 缺 symbol/side/pnl 的记录视为无效
+        symbol = str(record.get("symbol", "")).strip()
+        side = str(record.get("side", "")).strip()
+        if not symbol or not side:
+            return None
+        try:
+            pnl = float(record.get("pnl", 0) or 0)
+            close_ts = int(record.get("close_ts", 0) or 0)
+            # 时间戳: Unix 秒 → 本地时间 ISO 字符串 (与 record_trade 的 now_iso() 口径一致)
+            from datetime import datetime
+            if close_ts > 0:
+                dt = datetime.fromtimestamp(close_ts)
+                timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                date = dt.strftime("%Y-%m-%d")
+            else:
+                timestamp = ""
+                date = ""
+            return {
+                "timestamp": timestamp,
+                "date": date,
+                "symbol": symbol,
+                "direction": side,
+                "entry": round(float(record.get("entry", 0) or 0), 4),
+                "exit": round(float(record.get("exit", 0) or 0), 4),
+                "pnl": round(pnl, 4),
+                "pnl_pct": round(float(record.get("pnl_pct", 0) or 0), 4),
+                "strategy": str(record.get("strategy", "pullback")),
+                "duration_min": round(float(record.get("duration_min", 0) or 0), 1),
+                "win": pnl > 0,
+            }
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    @classmethod
+    def load_trades_from_ledger(cls, ledger_path: str = None) -> List[Dict[str, Any]]:
+        """从 trade_ledger.jsonl 重建 trades 列表 (不改变 self.trades)。
+
+        只处理 event == "TRADE_CLOSE" 的行。
+        坏行/缺字段 → 安全跳过。
+
+        Args:
+            ledger_path: ledger 文件路径, 默认 logs/trade_ledger.jsonl
+
+        Returns:
+            与 self.trades 格式兼容的 dict 列表
+        """
+        path = ledger_path or cls.LEDGER_FILE
+        if not os.path.exists(path):
+            logger.warning(f"📊 Ledger 文件不存在: {path}")
+            return []
+        trades = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                trade = cls._trade_from_ledger_record(record)
+                if trade is not None:
+                    trades.append(trade)
+        # 保留最近 MAX_TRADES_KEPT 笔
+        if len(trades) > cls.MAX_TRADES_KEPT:
+            trades = trades[-cls.MAX_TRADES_KEPT:]
+        return trades
+
+    @classmethod
+    def get_metrics_from_ledger(cls, ledger_path: str = None) -> Dict[str, Any]:
+        """从 trade_ledger.jsonl 直接计算指标 (不依赖 self.trades)。
+
+        这是一个纯读取路径，用于对比验证：
+        - ledger 是否能独立重建 performance metrics
+        - 与 performance.json 的指标是否一致
+
+        Args:
+            ledger_path: ledger 文件路径, 默认 logs/trade_ledger.jsonl
+
+        Returns:
+            get_metrics() 格式的 dict (若 ledger 为空则返回 _empty_metrics)
+        """
+        trades = cls.load_trades_from_ledger(ledger_path)
+        if not trades:
+            return cls._empty_metrics()
+        # 创建临时实例来计算指标（复用 get_metrics 逻辑）
+        tmp = object.__new__(cls)
+        tmp.trades = trades
+        return tmp.get_metrics()

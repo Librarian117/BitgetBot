@@ -85,6 +85,7 @@ class SafetyManager:
         pos_side: str = "",  # v4.5: 显式持仓方向
     ) -> Optional[Dict[str, Any]]:
         """先市价单，失败降级限价单 (v3.6: API 文档合规)"""
+        order = None  # P0: 防止 except 后 NameError
         try:
             order = self.exchange.create_market_order_with_partial_tp(
                 symbol=symbol, side=side, amount=amount,
@@ -98,6 +99,13 @@ class SafetyManager:
 
         # v4.5 CRITICAL: TPSL 致命失败时禁止降级到限价单重开仓
         # create_market_order_with_partial_tp 内部已紧急平仓 + 设 _tpsl_fatal 标志
+        # P0修复: 如果是 tpsl_fatal_close dict, 直接传播给调用方, 不吞掉 close context
+        if isinstance(order, dict) and order.get("tpsl_fatal_close"):
+            self.exchange._tpsl_fatal = None
+            logger.error(
+                f"⛔ {symbol} TPSL致命失败(已紧急平仓) → 返回 close context 供 finalize"
+            )
+            return order
         if getattr(self.exchange, '_tpsl_fatal', None):
             fatal_sym = self.exchange._tpsl_fatal
             self.exchange._tpsl_fatal = None
@@ -140,12 +148,23 @@ class SafetyManager:
                         has_sl, _ = self.exchange._has_position_tpsl(symbol, fill_price, pos_side_s)
                         if not has_sl:
                             logger.error(f"🔥 {symbol} 限价单TPSL失败+复核无保护 → 紧急平仓!")
+                            close_order = None
                             try:
-                                self.exchange.create_market_order_close(
+                                close_order = self.exchange.create_market_order_close(
                                     symbol, amount, side, pos_side=pos_side_s)
                             except Exception:
                                 logger.error(f"💥 {symbol} 紧急平仓也失败", exc_info=True)
-                            return None  # 标记失败
+                            # P0修复: 返回 close context 供 bot 层 finalize
+                            return {
+                                "tpsl_fatal_close": True,
+                                "entry_order": order,
+                                "close_order": close_order,
+                                "entry_price": fill_price,
+                                "amount": amount,
+                                "side": side,
+                                "pos_side": pos_side_s,
+                                "sl_price": sl_price,
+                            }
             return order
         except Exception as e:
             logger.error(f"❌ 限价单后备失败 {symbol}: {e}")

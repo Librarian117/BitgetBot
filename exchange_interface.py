@@ -344,6 +344,7 @@ class ExchangeInterface:
                         f"🔥 {symbol} 复核确认无SL保护 → 裸仓风险 → 立即市价平仓!"
                     )
                     # v4.5: TPSL 附着失败 → 紧急平仓，不允许裸仓存在
+                    close_order = None
                     try:
                         close_order = self.create_market_order_close(
                             symbol, amount, side, pos_side=_pos_side
@@ -358,8 +359,18 @@ class ExchangeInterface:
                     # v4.5: 设致命标志位 → 通知调用方"市价单已成但TPSL致命失败，禁止重试"
                     # 防止 safety_manager.place_with_limit_fallback 降级到限价单重开仓
                     self._tpsl_fatal = symbol
+                    # P0修复: 返回 close context 供 bot 层 finalize, 避免静默财务黑洞
                     # 无论平仓成功与否，都标记为失败，不进入成功持仓状态
-                    return None
+                    return {
+                        "tpsl_fatal_close": True,
+                        "entry_order": order,
+                        "close_order": close_order,
+                        "entry_price": fill_price,
+                        "amount": amount,
+                        "side": side,
+                        "pos_side": _pos_side,
+                        "sl_price": sl_price,
+                    }
                 else:
                     # SL 已由交易所端自动挂载（pos-tpsl code=00000 但返回False的边界情况）
                     logger.info(
@@ -447,7 +458,10 @@ class ExchangeInterface:
 
         symbol: "BTC/USDT:USDT"
         since:   Unix 时间戳 (秒), 查询此后平仓的仓位
-        Returns: {"pnl": float, "exit_price": float, "fee": float, "open_fee": float}
+        Returns: {"pnl": float, "net_profit": float, "funding_fee": float,
+                  "exit_price": float, "fee": float, "open_fee": float,
+                  "position_id": str, "holding_ms": int}
+        P0: 新增 net_profit (净利润), funding_fee (totalFunding), position_id
         """
         try:
             params = {
@@ -466,9 +480,12 @@ class ExchangeInterface:
                 latest = records[0]
                 return {
                     "pnl": float(latest.get("pnl", 0) or 0),
+                    "net_profit": float(latest.get("netProfit", 0) or 0),    # P0: 净利润 (已扣 fee+funding)
+                    "funding_fee": float(latest.get("totalFunding", 0) or 0), # P0: 累计资金费率
                     "exit_price": float(latest.get("closeAvgPrice", 0) or 0),
                     "fee": float(latest.get("closeFee", 0) or 0),
                     "open_fee": float(latest.get("openFee", 0) or 0),
+                    "position_id": latest.get("positionId", ""),              # P0: 仓位 ID (审计追溯)
                     "holding_ms": int(latest.get("holdTime", 0) or 0),
                 }
             # V2 返回非 00000 (非错误情况: 无记录等)
@@ -683,10 +700,12 @@ class ExchangeInterface:
             if pos_side and hasattr(self.exchange, 'close_position'):
                 return self.exchange.close_position(symbol, pos_side)
 
-            # 回退: v2 API 双向模式参数
-            # pos_side="long" → close long → side=buy, tradeSide=close
-            # pos_side="short" → close short → side=sell, tradeSide=close
-            close_side_map = {"long": "sell", "short": "buy"}  # 平多=卖出, 平空=买回
+            # 回退: v2 API 双向模式参数 (P0修复: 对齐 Bitget 官方 Place Order 文档)
+            # Bitget hedge mode tradeSide=close 规则:
+            #   - Close long:  side=buy,  tradeSide=close
+            #   - Close short: side=sell, tradeSide=close
+            # 参考: https://www.bitget.com/api-doc/contract/trade/Place-Order
+            close_side_map = {"long": "buy", "short": "sell"}
             close_side = close_side_map.get(pos_side, side)
             return self.exchange.create_order(
                 symbol=symbol, type="market", side=close_side,
