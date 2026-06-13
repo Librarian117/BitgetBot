@@ -103,13 +103,15 @@ class TradeLogger:
                   market_regime: str = "",
                   equity: float = 0.0, unrealized_pnl: float = 0.0,
                   initial_equity: float = 0.0, all_time_pnl: float = 0.0):
-        """记录每轮扫描摘要 (v3.1: 初始资金 + 总盈亏)"""
+        """记录每轮扫描摘要 (v3.1: 初始资金 + 总盈亏)
+        v4.5→Phase2: balance 参数实为 current_equity, JSON 字段改为 cycle_equity
+        """
         self._write({
             "event": "CYCLE",
             "cycle": cycle,
             "candidates": candidates,
             "trades_this_cycle": trades,
-            "balance": round(balance, 2),
+            "cycle_equity": round(balance, 2),      # v4.5→Phase2: 原 balance→cycle_equity (实为权益)
             "equity": round(equity, 2),
             "unrealized_pnl": round(unrealized_pnl, 4),
             "daily_pnl_pct": round(pnl, 4),
@@ -182,7 +184,7 @@ class TradeLogger:
     def log_position_close(self, symbol: str, direction: str, strategy: str,
                            entry_price: float, exit_price: float,
                            pnl: float, pnl_pct: float, close_reason: str,
-                           holding_hours: float = 0):
+                           holding_hours: float = 0, funding_fee: float = 0.0):
         """记录平仓事件（自学习核心数据源）"""
         self._write({
             "event": "POSITION_CLOSE",
@@ -195,6 +197,7 @@ class TradeLogger:
             "pnl_pct": round(pnl_pct, 2),
             "close_reason": close_reason,  # TP / SL / MANUAL / ROTATION
             "holding_hours": round(holding_hours, 1),
+            "funding_fee": round(funding_fee, 4),  # v4.5→Phase2: 持仓期间累计资金费率
         })
 
     def log_signal_full(self, symbol: str, direction: str, strategy: str,
@@ -318,7 +321,8 @@ class TradeLogger:
                           score: int = 0,
                           ema_trend: str = "",
                           kalman_dir: str = "",
-                          market_regime: str = ""):
+                          market_regime: str = "",
+                          funding_fee: float = 0.0):     # v4.5→Phase2: 持仓期间累计资金费率
         """P1+P4: 平仓完整快照 — 含时间戳、出场原因细分、入场上下文"""
         self._write({
             "event": "EXIT_SNAPSHOT",
@@ -335,6 +339,7 @@ class TradeLogger:
             "ema_trend_at_entry": ema_trend,   # 入场时 EMA 趋势
             "kalman_at_entry": kalman_dir,     # 入场时 Kalman 方向
             "regime_at_entry": market_regime,  # 入场时市场状态
+            "funding_fee": round(funding_fee, 4),  # v4.5→Phase2: 累计资金费率
         })
 
     def log_filter_stats(self, cycle: int, stats: dict, current_regime: str = ""):

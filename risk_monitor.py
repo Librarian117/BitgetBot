@@ -46,6 +46,7 @@ class RiskMonitor:
         self.daily_pnl_pct: float = 0.0
         self._current_date: str = ""
         self.cumulative_fees: float = 0.0
+        self.cumulative_funding_fees: float = 0.0  # v4.5→Phase2: 累计资金费率追踪
         self.initial_equity: float = config.initial_equity
 
         # v4.0: 从配置读取硬止损百分比 (默认 3%)
@@ -100,6 +101,7 @@ class RiskMonitor:
         if today != self._current_date:
             self._current_date = today
             self.cumulative_fees = 0.0
+            self.cumulative_funding_fees = 0.0  # v4.5→Phase2: 每日重置
             self.day_start_equity = equity
             self.current_equity = equity
             self.daily_pnl_pct = 0.0
@@ -112,7 +114,12 @@ class RiskMonitor:
                 )
 
     def record_trade_fees(self, fees: float):
+        """记录实际已发生的手续费（仅在平仓时从 API 获取后调用）"""
         self.cumulative_fees += fees
+
+    def record_funding_fees(self, fees: float):
+        """v4.5→Phase2: 记录累计资金费率"""
+        self.cumulative_funding_fees += fees
 
     def record_closed_trade(self, pnl: float, symbol: str = ""):
         """v4.0: 记录已平仓交易 PnL, 追踪连续亏损"""
@@ -217,6 +224,7 @@ class RiskMonitor:
             "all_time_pnl_pct": round(all_time_pnl_pct, 2),
             "blocked": blocked,
             "cumulative_fees": round(self.cumulative_fees, 4),
+            "cumulative_funding_fees": round(self.cumulative_funding_fees, 4),  # v4.5→Phase2
             # v4.0
             "consecutive_losses": self.consecutive_losses,
             "consecutive_wins": self.consecutive_wins,

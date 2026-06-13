@@ -42,10 +42,12 @@ class EquityAuditor:
                  bot_fees: float,               # bot 统计的累计手续费
                  open_positions: int = 0,
                  extra: Optional[Dict] = None,
+                 bot_funding_fees: float = 0.0,  # v4.5→Phase2: 累计资金费率
                  ) -> Dict:
         """记录当前资金快照, 返回对账结果"""
         now = time.time()
-        expected_equity = self.initial_equity + bot_realized_pnl - bot_fees
+        # v4.5→Phase2: 资金费率纳入对账 (totalFee 可为正=支付/负=收取)
+        expected_equity = self.initial_equity + bot_realized_pnl - bot_fees - bot_funding_fees
         deviation = exchange_equity - expected_equity
 
         entry = {
@@ -56,6 +58,7 @@ class EquityAuditor:
             "exchange_upl": round(exchange_upl, 2),
             "bot_realized_pnl": round(bot_realized_pnl, 2),
             "bot_fees": round(bot_fees, 2),
+            "bot_funding_fees": round(bot_funding_fees, 4),  # v4.5→Phase2
             "expected_equity": round(expected_equity, 2),
             "deviation": round(deviation, 2),
             "open_positions": open_positions,

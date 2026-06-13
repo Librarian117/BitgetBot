@@ -478,6 +478,21 @@ class ExchangeInterface:
             logger.debug(f"📊 获取 {symbol} 平仓历史失败: {e}")
             return None
 
+    def fetch_position_funding_fee(self, symbol: str) -> float:
+        """
+        v4.5→Phase2: 从持仓 API 获取当前累计资金费率 (totalFee 字段)
+        Bitget 持仓 API 返回 totalFee = 持仓期间累计资金费率 (USDT)
+        Returns: 累计资金费率 (正数=收取, 负数=支付)
+        """
+        try:
+            pos = self.exchange.fetch_position(symbol)
+            if pos and pos.get("info"):
+                total_fee = float(pos["info"].get("totalFee", 0) or 0)
+                return total_fee
+        except Exception:
+            logger.debug(f"⚠️ 获取 {symbol} 资金费率历史失败")
+        return 0.0
+
     def fetch_btc_change(self, timeframe: str = "1h") -> Optional[float]:
         """获取 BTC 在指定周期的涨跌幅 (v2.1 新增)"""
         try:

@@ -575,6 +575,7 @@ class DeepSeekQuantBot:
                 exchange_upl=acct.get("unrealized_pnl", 0),
                 bot_realized_pnl=self._bot_closed_pnl_total,  # 日志累计 PnL
                 bot_fees=self.riskmon.cumulative_fees,
+                bot_funding_fees=self.riskmon.cumulative_funding_fees,  # v4.5→Phase2
                 open_positions=len(acct.get("positions_detail", [])),
                 extra={
                     "bot_trade_count": self._bot_closed_trade_count,
@@ -1570,25 +1571,41 @@ class DeepSeekQuantBot:
 
                 # v4.0: 从 Bitget API 获取真实已实现 PnL (不再估算)
                 real_pnl = self.exchange.fetch_closed_position_pnl(sym)
+                # v4.5→Phase2: 追踪持仓期间的 funding fee
+                funding_fee = self.exchange.fetch_position_funding_fee(sym)
+                if funding_fee != 0:
+                    self.riskmon.record_funding_fees(funding_fee)
+
                 if real_pnl and abs(real_pnl["pnl"]) > 0.01:
                     pnl = real_pnl["pnl"]
                     mark = real_pnl.get("exit_price", mark)
-                    # v4.1: 记录实际平仓费用
+                    # v4.5→Phase2: 仅在平仓时记录实际手续费 (API totalPnl 已含费)
+                    # 手续费取自 API closeFee + openFee，仅累计一次，消除双重计入
                     close_fee = real_pnl.get("fee", 0)
-                    if close_fee > 0:
-                        self.riskmon.record_trade_fees(close_fee)
+                    open_fee = real_pnl.get("open_fee", 0)
+                    actual_total_fee = close_fee + open_fee
+                    if actual_total_fee > 0:
+                        self.riskmon.record_trade_fees(actual_total_fee)
                     logger.info(
                         f"📊 {base} 真实PnL={pnl:+.2f} USDT "
-                        f"(交易所数据, exit={mark:.4f}, 平仓费={close_fee:.4f})"
+                        f"(交易所数据, exit={mark:.4f}, 手续费={actual_total_fee:.4f}, funding={funding_fee:.4f})"
                     )
                 else:
-                    # 回退: API 不可用时用估算
+                    # 回退: API 不可用时用估算 + 扣除估算手续费
                     mark = float(old_pos.get("markPrice", 0) or 0)
                     csize = self.exchange.get_contract_size(sym)
                     pnl = (mark - entry) * contracts * csize if side == "LONG" else (entry - mark) * contracts * csize
+                    # v4.5→Phase2: 回退路径也扣除估算手续费 (taker fee × 2)
+                    est_fee = entry * abs(contracts) * csize * self.exchange.get_taker_fee(sym) * 2
+                    pnl -= est_fee
+                    self.riskmon.record_trade_fees(est_fee)
                     last_upnl = float(old_pos.get("unrealizedPnl", 0) or 0)
                     if abs(last_upnl) > abs(pnl) * 0.5 and abs(last_upnl) > 1:
                         pnl = last_upnl
+                    logger.info(
+                        f"📊 {base} 估算PnL={pnl:+.2f} USDT "
+                        f"(API不可用, exit≈{mark:.4f}, 估费={est_fee:.4f}, funding={funding_fee:.4f})"
+                    )
 
                 position_value = entry * contracts * (self.exchange.get_contract_size(sym))
                 margin = float(old_pos.get("margin", position_value / self.config.leverage))
@@ -1649,6 +1666,7 @@ class DeepSeekQuantBot:
                     ema_trend=factors.get("ema_trend", ""),
                     kalman_dir=factors.get("_kalman_dir", ""),
                     market_regime=factors.get("market_regime", ""),
+                    funding_fee=funding_fee,
                 )
                 # v4.1: 累计已实现 PnL (用于审计对账)
                 self._bot_closed_pnl_total += pnl
@@ -2277,8 +2295,9 @@ class DeepSeekQuantBot:
                     trades_this_cycle += 1
                     self.stats["trades"] += 1
                     self._last_trade_ts = time.time()  # v4.0: 开仓间隔
-                    # 记录手续费到风控
-                    self.riskmon.record_trade_fees(result["total_fee"])
+                    # v4.5→Phase2: 手续费不再在开仓时记录到 cumulative_fees
+                    # 平仓时从 Bitget API 获取实际手续费统一记录，避免双重计入
+                    # 估算费仅保存在 result["total_fee"] 中供日志参考
                     # ── v3.6: 记录仓位开仓时间 ──
                     sym_full = f"{symbol}/USDT:USDT"
                     if sym_full not in self._position_open_times:
