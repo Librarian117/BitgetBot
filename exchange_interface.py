@@ -34,8 +34,8 @@ class ExchangeInterface:
             },
             "enableRateLimit": True,
         })
-        # ★ 关键：开启沙箱模式
-        ex.set_sandbox_mode(True)
+        # ★ v4.5→Phase2: 沙箱模式由 config 控制（BITGET_SANDBOX=true/false）
+        ex.set_sandbox_mode(self.config.is_sandbox)
         return ex
 
     def _load_markets(self):
@@ -231,9 +231,7 @@ class ExchangeInterface:
                     if pos and float(pos.get("contracts", 0) or 0) != 0:
                         positions[sym] = pos
                 except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
-
-        if positions:
+                    logger.warning("⚠️ 单个持仓查询失败 — 持仓同步可能不完整", exc_info=True)
             logger.info(f"📊 当前持仓: {list(positions.keys())}")
         # v4.1 fix: 仅 API 成功时缓存 (防止空结果污染30秒缓存)
         if api_ok:
@@ -406,6 +404,7 @@ class ExchangeInterface:
             market = self.exchange.market(symbol)
             return float(market.get("contractSize", 1.0))
         except Exception:
+            logger.warning(f"⚠️ 获取 {symbol} contract_size 失败，回退到 1.0 — 仓位计算可能严重错误!")
             return 1.0
 
     def get_min_amount(self, symbol: str) -> float:
@@ -414,7 +413,20 @@ class ExchangeInterface:
             market = self.exchange.market(symbol)
             return float(market["limits"]["amount"]["min"])
         except Exception:
+            logger.warning(f"⚠️ 获取 {symbol} min_amount 失败，回退到 1.0 — 可能下单被拒")
             return 1.0
+
+    def get_min_notional(self, symbol: str) -> float:
+        """获取交易所最小下单额 (USDT)，用于实盘小额资金保护"""
+        try:
+            market = self.exchange.market(symbol)
+            # Bitget USDT-M 最小下单额，通常 5 USDT
+            min_cost = market.get("limits", {}).get("cost", {}).get("min")
+            if min_cost is not None:
+                return float(min_cost)
+        except Exception:
+            pass
+        return 5.0  # 保守默认 5 USDT
 
     def fetch_funding_rate(self, symbol: str) -> Optional[float]:
         """获取当前资金费率 (v2.1 新增)"""
@@ -703,9 +715,25 @@ class ExchangeInterface:
                 tp_str = self.exchange.price_to_precision(symbol, tp_price)
                 sl_val = float(sl_str)
             except Exception:
-                sl_str = str(round(sl_price, 2))
-                tp_str = str(round(tp_price, 2))
+                # v4.5→Phase2: 回退时从 market 查询精度而非盲目 round(price,2)
+                try:
+                    market = self.exchange.market(symbol)
+                    precision = market.get("precision", {}).get("price", 0.01)
+                    if precision < 1:
+                        # 小数值精度（如 0.001），计算小数位数
+                        import math
+                        decimals = max(0, int(-math.log10(precision)))
+                    else:
+                        decimals = 2  # 保守默认
+                except Exception:
+                    decimals = 2
+                sl_str = str(round(sl_price, decimals))
+                tp_str = str(round(tp_price, decimals))
                 sl_val = float(sl_str)
+                logger.warning(
+                    f"⚠️ {symbol} price_to_precision 失败，回退到 {decimals}位小数 "
+                    f"(SL={sl_str}, TP={tp_str}) — 请验证交易所是否接受"
+                )
 
             # 验证 SL/TP 方向并修正 (v4.0: 加 TP 校验)
             try:

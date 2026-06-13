@@ -4,26 +4,25 @@ import json
 import os
 
 import ccxt
+from dotenv import load_dotenv
 
-# Load .env
-env = {}
-with open('/root/BitgetBot/.env') as f:
-    for line in f:
-        line = line.strip()
-        if line and not line.startswith('#') and '=' in line:
-            k, v = line.split('=', 1)
-            env[k.strip()] = v.strip().strip('"')
+load_dotenv()
+
+is_sandbox = os.getenv("BITGET_SANDBOX", "true").lower() == "true"
 
 ex = ccxt.bitget({
-    'apiKey': env.get('BITGET_API_KEY', ''),
-    'secret': env.get('BITGET_SECRET', ''),
-    'password': env.get('BITGET_PASSPHRASE', ''),
-    'options': {'defaultType': 'swap', 'sandbox': True},
+    'apiKey': os.getenv('BITGET_API_KEY', ''),
+    'secret': os.getenv('BITGET_SECRET', ''),
+    'password': os.getenv('BITGET_PASSPHRASE', ''),
+    'options': {'defaultType': 'swap'},
 })
+# v4.5→Phase2: 沙箱模式由 BITGET_SANDBOX 环境变量控制
+ex.set_sandbox_mode(is_sandbox)
 
 bal = ex.fetch_balance()
 usdt = bal.get('USDT', {})
-print("=== Bitget 沙箱真实数据 ===")
+label = "Bitget 沙箱" if is_sandbox else "Bitget 实盘"
+print(f"=== {label}真实数据 ===")
 print(f"USDT 可用余额: {usdt.get('free', 0):.2f}")
 print(f"USDT 总权益:   {usdt.get('total', 0):.2f}")
 print(f"已用保证金:    {usdt.get('used', 0):.2f}")

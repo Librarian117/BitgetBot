@@ -30,7 +30,8 @@ def get_exchange():
         "options": {"defaultType": "swap"},
         "enableRateLimit": True,
     })
-    ex.set_sandbox_mode(True)
+    is_sandbox = os.getenv("BITGET_SANDBOX", "true").lower() == "true"
+    ex.set_sandbox_mode(is_sandbox)
     ex.load_markets()
     return ex
 

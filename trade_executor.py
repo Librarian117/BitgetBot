@@ -249,6 +249,14 @@ class TradeExecutor:
             if not ok:
                 logger.warning(f"⛔ 安全校验未通过 {symbol}: {reason}")
                 return result
+            # v4.5→Phase2: 交易所最小下单额检查 (min_notional)
+            min_notional = self.exchange.get_min_notional(symbol)
+            if position_value < min_notional:
+                logger.warning(
+                    f"⛔ {symbol} 仓位价值 {position_value:.2f} USDT < "
+                    f"交易所最小 {min_notional} USDT，跳过"
+                )
+                return result
             # 费后利润
             tp1_mult = self.config.tp_atr_mults[0] if self.config.tp_atr_mults else 2.0
             ok, reason = self.safety.check_profit_after_fees(

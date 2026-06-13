@@ -1,5 +1,6 @@
 # 密钥 — 绝对不能提交
 .env
+.env.live
 
 # Python
 __pycache__/
