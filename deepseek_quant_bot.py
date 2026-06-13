@@ -104,6 +104,9 @@ class DeepSeekQuantBot:
         # 累计所有 POSITION_CLOSE 的 PnL, 与交易所权益对比
         self._bot_closed_pnl_total: float = 0.0
         self._bot_closed_trade_count: int = 0
+        # v4.5→Phase2: 统一平仓出口 — 幂等缓存 + 去重
+        self._closed_trades_cache: Dict[str, Any] = {}  # {dedup_key: result_dict}
+        self._symbol_cooldowns: Dict[str, float] = {}    # {symbol: cooldown_until_ts}
         # v4.5: 仅追踪本次运行期间的盈亏, 跨重启不累计
         # 启动权益由交易所实际余额决定, 不用配置值
 
@@ -561,6 +564,276 @@ class DeepSeekQuantBot:
 
         return result
 
+    # ==================================================================
+    # v4.5→Phase2: 统一平仓出口 — 所有平仓路径的唯一记录点
+    # ==================================================================
+
+    @staticmethod
+    def _build_dedup_key(close_order_result: Optional[Dict], symbol: str,
+                         open_ts: float, contracts: float) -> str:
+        """构造平仓去重键 (三级优先级)
+
+        1. 交易所订单 ID (最可靠)
+        2. 时间戳 + symbol + 张数
+        3. 当前时间 (启动同步回退)
+        """
+        # 优先级 1: 交易所平仓订单 ID
+        if close_order_result:
+            oid = (close_order_result.get("id")
+                   or close_order_result.get("orderId")
+                   or close_order_result.get("order_id"))
+            if oid:
+                return f"order:{oid}"
+        # 优先级 2: 时间戳 + symbol + 张数
+        if open_ts > 0:
+            close_ts = int(time.time())
+            return f"ts:{symbol}:{int(open_ts)}:{close_ts}:{int(contracts)}"
+        # 优先级 3: 仅当前时间
+        close_ts = int(time.time())
+        return f"ts:{symbol}:{close_ts}:{int(contracts)}"
+
+    def _write_trade_ledger(self, trade: Dict[str, Any]):
+        """v4.5→Phase2: 写入唯一交易账本 (单一数据源)
+
+        logs/trade_ledger.jsonl — 每笔平仓仅一条记录
+        后续 performance_tracker / equity_auditor 可统一从此读取
+        """
+        import json as _json
+        trade_id = (f"{trade['symbol']}-{trade['side']}-"
+                     f"{int(trade.get('open_ts', time.time()))}")
+        record = {
+            "event": "TRADE_CLOSE",
+            "trade_id": trade_id,
+            "symbol": trade["symbol"],
+            "side": trade["side"],
+            "strategy": trade.get("strategy", "pullback"),
+            "entry": round(trade.get("entry", 0), 4),
+            "exit": round(trade.get("exit", 0), 4),
+            "pnl": round(trade["pnl"], 4),
+            "pnl_pct": round(trade.get("pnl_pct", 0), 2),
+            "pnl_source": trade.get("pnl_source", "FALLBACK"),
+            "fee": round(trade.get("fee", 0), 4),
+            "funding": round(trade.get("funding", 0), 4),
+            "close_reason": trade.get("close_reason", "UNKNOWN"),
+            "open_ts": int(trade.get("open_ts", 0)),
+            "close_ts": int(trade.get("close_ts", time.time())),
+            "duration_min": round(trade.get("duration_min", 0), 1),
+        }
+        try:
+            with open("logs/trade_ledger.jsonl", "a", encoding="utf-8") as f:
+                f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.error("❌ Trade Ledger 写入失败", exc_info=True)
+
+    def _finalize_closed_position(self,
+        symbol: str,
+        side: str,
+        entry: float,
+        contracts: float,
+        margin: float,
+        upl: float,
+        close_reason: str,
+        open_ts: float = 0,
+        strategy: str = "pullback",
+        close_order_result: dict = None,
+        is_emergency: bool = False,
+        mark_price: float = 0,
+    ) -> Dict[str, Any]:
+        """统一平仓出口 — 所有平仓路径的唯一记录点 (幂等)
+
+        约束:
+        1. 幂等: 同一 dedup_key 多次调用 → 返回缓存结果
+        2. PnL 来源标记: "API" | "FALLBACK" — 禁止混算
+        3. 单一写入: 所有 _bot_closed_pnl_total / perf / riskmon / learner 仅在此写入
+
+        Returns:
+            {pnl, pnl_pct, pnl_source, funding_fee, fees, trade_id, already_processed}
+        """
+        base = symbol.replace("/USDT:USDT", "")
+        sym_full = symbol if "/" in symbol else f"{symbol}/USDT:USDT"
+
+        # ── STEP 0: 幂等检查 ──
+        dedup_key = self._build_dedup_key(close_order_result, sym_full, open_ts, contracts)
+        if dedup_key in self._closed_trades_cache:
+            cached = self._closed_trades_cache[dedup_key]
+            if cached != "PROCESSING":
+                cached["already_processed"] = True
+                return cached
+            else:
+                logger.warning(f"⚠️ 递归调用 _finalize_closed_position 已防御: {dedup_key}")
+                return {"pnl": upl, "pnl_pct": 0, "pnl_source": "FALLBACK",
+                        "funding_fee": 0, "fees": 0, "trade_id": dedup_key,
+                        "already_processed": True}
+
+        self._closed_trades_cache[dedup_key] = "PROCESSING"
+
+        try:
+            # ── STEP 1: 获取真实 PnL (API 优先 + 重试) ──
+            since_ts = open_ts if open_ts > 0 else time.time() - 3600
+            max_retries = 2 if is_emergency else 4
+            delays = [0.5, 1.0, 2.0, 3.0][:max_retries]
+
+            real_pnl = None
+            for delay in delays:
+                time.sleep(delay)
+                try:
+                    real_pnl = self.exchange.fetch_closed_position_pnl(sym_full, since=since_ts)
+                except Exception:
+                    real_pnl = None
+                if real_pnl and abs(real_pnl.get("pnl", 0)) > 0.001:
+                    break
+
+            # ── STEP 2: 确定 PnL 来源 (禁止混算) ──
+            csize = self.exchange.get_contract_size(sym_full)
+            taker_fee = self.exchange.get_taker_fee(sym_full)
+
+            if real_pnl and abs(real_pnl.get("pnl", 0)) > 0.001:
+                pnl = real_pnl["pnl"]
+                pnl_source = "API"
+                exit_price = real_pnl.get("exit_price", 0) or mark_price
+                api_fee = real_pnl.get("fee", 0) + real_pnl.get("open_fee", 0)
+                api_funding = real_pnl.get("funding_fee", 0)
+                funding_fee = api_funding  # API totalPnl 已含 funding, 此处仅记录
+            else:
+                est_fee = entry * abs(contracts) * csize * taker_fee * 2
+                pnl = upl - est_fee
+                pnl_source = "FALLBACK"
+                exit_price = 0
+                api_fee = est_fee
+                # FALLBACK: 尝试从持仓 API 获取 funding fee
+                try:
+                    funding_fee = self.exchange.fetch_position_funding_fee(sym_full)
+                except Exception:
+                    funding_fee = 0
+                logger.warning(
+                    f"⚠️ {base} PnL回退: API不可用, upl={upl:+.2f} → "
+                    f"pnl={pnl:+.2f} (已扣估费{est_fee:.4f})"
+                )
+
+            # ── STEP 3: 记录费用 (仅此一处写入 cumulative_fees) ──
+            if api_fee > 0:
+                self.riskmon.record_trade_fees(api_fee)
+            if funding_fee != 0:
+                self.riskmon.record_funding_fees(funding_fee)
+
+            # ── STEP 4: PnL% ──
+            pnl_pct = (pnl / margin) * 100 if margin > 0 else 0.0
+
+            # ── STEP 5: 清理 TPSL 缓存 ──
+            try:
+                _stale = [k for k in self.exchange._tpsl_cache if k[0] == sym_full]
+                for k in _stale:
+                    del self.exchange._tpsl_cache[k]
+            except Exception:
+                pass
+
+            # ── STEP 6: 取消残留计划单 ──
+            try:
+                for o in (self.exchange.exchange.fetch_open_orders(
+                    sym_full, params={"stop": True}) or []):
+                    if self.exchange._is_reduce_only(o):
+                        self.exchange.cancel_order(str(o.get('id', '')), sym_full)
+            except Exception:
+                pass
+
+            # ── STEP 7: 单一写入入口 ──
+            dur_min = 0.0
+            if open_ts > 0:
+                dur_min = (time.time() - open_ts) / 60.0
+
+            final_exit_price = exit_price if exit_price > 0 else mark_price
+
+            # 7a. 风险监控
+            self.riskmon.record_closed_trade(pnl, base)
+
+            # 7b. 绩效跟踪
+            if self.perf:
+                try:
+                    self.perf.record_trade(
+                        symbol=base, direction=side, entry=entry,
+                        exit_price=final_exit_price, pnl=pnl, pnl_pct=pnl_pct,
+                        strategy=strategy, duration_minutes=dur_min,
+                    )
+                except Exception:
+                    logger.debug("⚠️ perf.record_trade 失败", exc_info=True)
+
+            # 7c. 权益累加
+            self._bot_closed_pnl_total += pnl
+            self._bot_closed_trade_count += 1
+
+            # 7d. 自学习
+            try:
+                self.learner.learn_from_closed_trade(
+                    symbol=sym_full, direction=side,
+                    entry_price=entry, exit_price=final_exit_price,
+                    pnl=pnl, pnl_pct=pnl_pct,
+                    strategy=strategy, ai_decision="CONFIRM",
+                    market_regime=getattr(self, '_current_regime', 'unknown'),
+                )
+            except Exception:
+                logger.debug("⚠️ learner 失败", exc_info=True)
+
+            # 7e. 日志
+            self.tlogger.log_position_close(
+                symbol=base, direction=side, strategy=strategy,
+                entry_price=entry, exit_price=final_exit_price,
+                pnl=pnl, pnl_pct=pnl_pct, close_reason=close_reason,
+                holding_hours=dur_min / 60.0, funding_fee=funding_fee,
+            )
+
+            factors = self._open_trade_factors.pop(sym_full, {}) if hasattr(self, '_open_trade_factors') else {}
+            self.tlogger.log_exit_snapshot(
+                symbol=base, direction=side,
+                strategy=factors.get("strategy", strategy),
+                entry_price=entry, exit_price=final_exit_price,
+                pnl=pnl, pnl_pct=pnl_pct,
+                exit_reason=close_reason,
+                hold_minutes=dur_min,
+                score=factors.get("confidence", 0),
+                ema_trend=factors.get("ema_trend", ""),
+                kalman_dir=factors.get("_kalman_dir", ""),
+                market_regime=factors.get("market_regime", ""),
+                funding_fee=funding_fee,
+                pnl_source=pnl_source,
+            )
+
+            # 7f. Trade Ledger
+            self._write_trade_ledger({
+                "symbol": base, "side": side, "strategy": strategy,
+                "entry": entry, "exit": final_exit_price,
+                "pnl": pnl, "pnl_pct": pnl_pct,
+                "fee": api_fee, "funding": funding_fee,
+                "close_reason": close_reason, "pnl_source": pnl_source,
+                "open_ts": open_ts, "close_ts": time.time(),
+                "duration_min": dur_min,
+            })
+
+            # ── STEP 8: 清理 ──
+            self._position_open_times.pop(sym_full, None)
+
+            # ── STEP 9: 币种冷却 ──
+            if pnl < 0:
+                self._symbol_cooldowns[base] = time.time() + 300
+
+            # ── STEP 10: 缓存结果 ──
+            result = {
+                "pnl": pnl, "pnl_pct": pnl_pct, "pnl_source": pnl_source,
+                "funding_fee": funding_fee, "fees": api_fee,
+                "trade_id": dedup_key, "already_processed": False,
+            }
+            self._closed_trades_cache[dedup_key] = result
+            return result
+
+        except Exception as e:
+            logger.error(f"💥 _finalize_closed_position 异常: {e}", exc_info=True)
+            # 回退: 至少记录 PnL 不丢失
+            fallback = {"pnl": upl, "pnl_pct": 0, "pnl_source": "FALLBACK",
+                        "funding_fee": 0, "fees": 0, "trade_id": dedup_key,
+                        "already_processed": False}
+            self._closed_trades_cache[dedup_key] = fallback
+            self._position_open_times.pop(sym_full, None)
+            return fallback
+
     def _audit_snapshot(self, acct: Dict[str, Any]):
         """v4.1: 独立资金审计快照 (在所有返回路径都调用)
 
@@ -829,15 +1102,20 @@ class DeepSeekQuantBot:
 
                 # ── v4.0: 规则引擎优先 — 不依赖 AI 做出场决策 ──
                 # v4.1: 即时亏损熔断 + 异常检测/市场评论已开启
-                decision, reason = "HOLD", ""
+                # v4.5→Phase2: reason 仅用于日志, close_reason 用于统一出口标记
+                decision, reason, rule_exit_reason = "HOLD", "", ""
                 if roi > 0.40:
                     decision, reason = "CLOSE", f"止盈规则-盈利{roi*100:.0f}%"
+                    rule_exit_reason = "RULE_TP"
                 elif roi < -0.50:
                     decision, reason = "CLOSE", f"紧急熔断-亏损{roi*100:.0f}%"
+                    rule_exit_reason = "RULE_EMERGENCY"
                 elif roi < -0.25 and holding_hours > 1.0:
                     decision, reason = "CLOSE", f"止损规则-亏损{roi*100:.0f}%超1h"
+                    rule_exit_reason = "RULE_SL"
                 elif holding_hours > 6.0 and abs(roi) < 0.03:
                     decision, reason = "CLOSE", f"僵尸仓规则-持仓{holding_hours:.0f}h"
+                    rule_exit_reason = "RULE_STALE"
 
                 # ── v4.1: 规则引擎决策 (AI 出场审核已移除 —— 全部解析失败) ──
                 self.tlogger.log_rule_exit_review(
@@ -847,7 +1125,7 @@ class DeepSeekQuantBot:
                     roi=roi, holding_hours=holding_hours,
                 )
 
-                # ── 执行平仓 ──
+                # ── 执行平仓 → v4.5→Phase2: 统一出口 ──
                 if decision == "CLOSE":
                     logger.info(f"🔔 规则平仓 {symbol} {side}: {reason}")
                     try:
@@ -859,12 +1137,15 @@ class DeepSeekQuantBot:
                         )
                         if close_o:
                             logger.info(f"✅ 规则平仓 {symbol} {side}: {close_o.get('id', '?')} | {reason}")
-                            self.tlogger.log_position_close(
-                                symbol=symbol, direction=side,
-                                strategy=getattr(self, '_position_strategies', {}).get(symbol, "pullback"),
-                                entry_price=entry, exit_price=mark,
-                                pnl=upl, pnl_pct=roi * 100,
-                                close_reason="RULE_EXIT", holding_hours=holding_hours,
+                            open_ts = self._position_open_times.get(sym_full, 0)
+                            self._finalize_closed_position(
+                                symbol=symbol, side=side,
+                                entry=entry, contracts=cts, margin=margin,
+                                upl=upl, close_reason=rule_exit_reason,
+                                open_ts=open_ts,
+                                strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
+                                close_order_result=close_o,
+                                mark_price=mark,
                             )
                         else:
                             logger.warning(f"⚠️  规则平仓 {symbol} 返回空 (可能已平仓)")
@@ -1561,151 +1842,26 @@ class DeepSeekQuantBot:
             for sym, old_pos in closed.items():
                 entry = float(old_pos.get("entryPrice", 0) or 0)
                 contracts = abs(float(old_pos.get("contracts", 0) or 0))
-                self._closed_positions_done.add((sym, round(entry, 4), int(contracts), today_str()))  # v4.1: 合约数防误跳
                 mark = float(old_pos.get("markPrice", 0) or 0)
                 side = "LONG" if str(old_pos.get("side") or old_pos.get("info", {}).get("holdSide", "")).lower() == "long" else "SHORT"
+                margin = float(old_pos.get("margin", 0) or 0)
+                upl = float(old_pos.get("unrealizedPnl", 0) or 0)
 
                 base = sym.replace("/USDT:USDT", "")
-                # v4.1: 获取真实策略名
                 close_strategy = getattr(self, '_position_strategies', {}).get(sym, "pullback")
+                open_ts = self._position_open_times.get(sym, 0)
 
-                # v4.0: 从 Bitget API 获取真实已实现 PnL (不再估算)
-                real_pnl = self.exchange.fetch_closed_position_pnl(sym)
-                # v4.5→Phase2: 追踪持仓期间的 funding fee
-                funding_fee = self.exchange.fetch_position_funding_fee(sym)
-                if funding_fee != 0:
-                    self.riskmon.record_funding_fees(funding_fee)
-
-                if real_pnl and abs(real_pnl["pnl"]) > 0.01:
-                    pnl = real_pnl["pnl"]
-                    mark = real_pnl.get("exit_price", mark)
-                    # v4.5→Phase2: 仅在平仓时记录实际手续费 (API totalPnl 已含费)
-                    # 手续费取自 API closeFee + openFee，仅累计一次，消除双重计入
-                    close_fee = real_pnl.get("fee", 0)
-                    open_fee = real_pnl.get("open_fee", 0)
-                    actual_total_fee = close_fee + open_fee
-                    if actual_total_fee > 0:
-                        self.riskmon.record_trade_fees(actual_total_fee)
-                    logger.info(
-                        f"📊 {base} 真实PnL={pnl:+.2f} USDT "
-                        f"(交易所数据, exit={mark:.4f}, 手续费={actual_total_fee:.4f}, funding={funding_fee:.4f})"
-                    )
-                else:
-                    # 回退: API 不可用时用估算 + 扣除估算手续费
-                    mark = float(old_pos.get("markPrice", 0) or 0)
-                    csize = self.exchange.get_contract_size(sym)
-                    pnl = (mark - entry) * contracts * csize if side == "LONG" else (entry - mark) * contracts * csize
-                    # v4.5→Phase2: 回退路径也扣除估算手续费 (taker fee × 2)
-                    est_fee = entry * abs(contracts) * csize * self.exchange.get_taker_fee(sym) * 2
-                    pnl -= est_fee
-                    self.riskmon.record_trade_fees(est_fee)
-                    last_upnl = float(old_pos.get("unrealizedPnl", 0) or 0)
-                    if abs(last_upnl) > abs(pnl) * 0.5 and abs(last_upnl) > 1:
-                        pnl = last_upnl
-                    logger.info(
-                        f"📊 {base} 估算PnL={pnl:+.2f} USDT "
-                        f"(API不可用, exit≈{mark:.4f}, 估费={est_fee:.4f}, funding={funding_fee:.4f})"
-                    )
-
-                position_value = entry * contracts * (self.exchange.get_contract_size(sym))
-                margin = float(old_pos.get("margin", position_value / self.config.leverage))
-                pnl_pct = (pnl / margin) * 100 if margin > 0 else 0.0
-                # v3.5: 取消残留计划单
-                try:
-                    for o in (self.exchange.exchange.fetch_open_orders(sym, params={"stop": True}) or []):
-                        if self.exchange._is_reduce_only(o):
-                            self.exchange.cancel_order(str(o.get('id','')), sym)
-                except Exception:
-                    logger.debug("⚠️  静默异常", exc_info=True)
-                # ── v4.3: 出场原因分类 ──
-                dur_min = 0.0
-                open_ts = self._position_open_times.get(sym)
-                close_ts = time.time()
-                if open_ts:
-                    dur_min = (close_ts - open_ts) / 60.0
-                    if sym in self._position_open_times:
-                        del self._position_open_times[sym]
-                    # v4.5: 清 TPSL 信任缓存 (新键格式含entry, 遍历清理该symbol所有键)
-                    _stale = [k for k in self.exchange._tpsl_cache if k[0] == sym]
-                    for k in _stale:
-                        del self.exchange._tpsl_cache[k]
-
-                # 推断真实出场原因 (不再全写 DETECTED)
-                abs_pnl_pct = abs(pnl_pct)
-                if pnl_pct <= -25:
-                    exit_reason = "STOP_LOSS"
-                elif pnl_pct >= 30:
-                    exit_reason = "TAKE_PROFIT"
-                elif dur_min > 240 and abs_pnl_pct < 2:
-                    exit_reason = "TIME_EXIT"
-                elif abs_pnl_pct < 1 and dur_min < 10:
-                    exit_reason = "BREAKEVEN_STOP"
-                else:
-                    exit_reason = "MARKET_CLOSE"  # Bitget pos-tpsl 触发
-
-                # v4.0: 风险监控
-                self.riskmon.record_closed_trade(pnl, base)
-                if self.perf:
-                    self.perf.record_trade(
-                        symbol=base, direction=side,
-                        entry=entry, exit_price=mark,
-                        pnl=pnl, pnl_pct=pnl_pct,
-                        strategy=close_strategy, duration_minutes=dur_min,
-                    )
-
-                # v4.3: 写出场快照 — 含入场上下文 + 出场原因 + 持仓时长
-                factors = getattr(self, '_open_trade_factors', {}).pop(sym, {})
-                self.tlogger.log_exit_snapshot(
-                    symbol=base, direction=side,
-                    strategy=factors.get("strategy", close_strategy),
-                    entry_price=entry, exit_price=mark,
-                    pnl=pnl, pnl_pct=pnl_pct,
-                    exit_reason=exit_reason,
-                    hold_minutes=dur_min,
-                    score=factors.get("confidence", 0),
-                    ema_trend=factors.get("ema_trend", ""),
-                    kalman_dir=factors.get("_kalman_dir", ""),
-                    market_regime=factors.get("market_regime", ""),
-                    funding_fee=funding_fee,
+                # v4.5→Phase2: 统一平仓出口 (pos-tpsl 检测 — 无 close_order_result)
+                self._finalize_closed_position(
+                    symbol=sym, side=side,
+                    entry=entry, contracts=contracts, margin=margin,
+                    upl=upl, close_reason="MARKET_CLOSE",
+                    open_ts=open_ts, strategy=close_strategy,
+                    close_order_result=None, mark_price=mark,
                 )
-                # v4.1: 累计已实现 PnL (用于审计对账)
-                self._bot_closed_pnl_total += pnl
-                self._bot_closed_trade_count += 1
-                self.learner.learn_from_closed_trade(
-                    symbol=sym, direction=side,
-                    entry_price=entry, exit_price=mark,
-                    pnl=pnl, pnl_pct=pnl_pct,
-                    strategy=close_strategy, ai_decision="CONFIRM",
-                    market_regime=getattr(self, '_current_regime', 'unknown'),
-                )
-                # ── v4.1: 因子归因 —— 记录开仓特征 vs 实际 PnL ──
-                factors = getattr(self, '_open_trade_factors', {}).pop(sym, None)
-                if factors and self.learner:
-                    factor_scores = {
-                        "technical": factors.get("confidence", 50),
-                        "quant": int(50 + factors.get("_kalman_score", 0) * 30),
-                    }
-                    self.learner.tracker.record_factors(
-                        symbol=base, direction=side,
-                        strategy=factors.get("strategy", "pullback"),
-                        pnl=pnl, factor_scores=factor_scores,
-                    )
 
-                # ── v4.1: 币种止损冷却 + SL 归因 ──
-                if pnl < 0:
-                    if not hasattr(self, '_symbol_cooldowns'):
-                        self._symbol_cooldowns = {}
-                    self._symbol_cooldowns[base] = time.time() + 1800
-                    logger.info(
-                        f"⏳ {base} 亏损 {pnl:+.2f}U → 冷却 30min "
-                        f"(防止重复踩坑)"
-                    )
-                    # SL 归因: 记录止损时价格, 供后续分析止损是否太紧
-                    self.tlogger.log_sl_attribution(
-                        symbol=base, direction=side,
-                        exit_price=mark, pnl=pnl, pnl_pct=pnl_pct,
-                        strategy=close_strategy,
-                    )
+                # v4.5→Phase2: _finalize_closed_position 已包含所有后处理，以下仅保留去重注册
+                self._closed_positions_done.add((sym, round(entry, 4), int(contracts), today_str()))
         # v4.0: 每日清理平仓记录 (防止内存泄漏)
         if getattr(self, '_closed_date', '') != today_str():
             self._closed_positions_done = set()
@@ -2445,12 +2601,24 @@ class DeepSeekQuantBot:
                         w_cts = int(worst.get("contracts", 0))
                         w_hold = "short" if worst.get("side") == "SHORT" else "long"
                         if w_cts > 0:
-                            # v3.6 fix: 用 close_position API (遵守 Bitget v2 文档)
                             close_o = self.exchange.create_market_order_close(
                                 sym_full, w_cts, w_side, w_hold
                             )
                             logger.info(f"🔄 平仓 {worst_symbol}: {close_o.get('id', '?') if close_o else 'CANCELLED'}")
                             rotated += 1
+                            # v4.5→Phase2: 统一出口
+                            w_entry = worst.get("entry_price", 0)
+                            w_mark = worst.get("mark_price", 0)
+                            w_margin = worst.get("margin", 0)
+                            w_side2 = worst.get("side", "LONG")
+                            self._finalize_closed_position(
+                                symbol=sym_full, side=w_side2,
+                                entry=w_entry, contracts=w_cts, margin=w_margin,
+                                upl=worst_upl, close_reason="ROTATION_CLOSE",
+                                open_ts=self._position_open_times.get(sym_full, 0),
+                                strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
+                                close_order_result=close_o, mark_price=w_mark,
+                            )
                             self.tlogger.log_risk("ROTATION_CLOSE",
                                 f"平{worst_symbol}浮亏{worst_upl:+.2f}→开{sig['symbol']}")
                             num_existing = self.exchange.count_open_positions()
@@ -2648,6 +2816,21 @@ class DeepSeekQuantBot:
                         )
                         if close_o:
                             closed_count += 1
+                            # v4.5→Phase2: 统一出口
+                            dl_side = pos.get("side", "LONG")
+                            dl_entry = pos.get("entry_price", 0)
+                            dl_mark = pos.get("mark_price", 0)
+                            dl_margin = pos.get("margin", 0)
+                            dl_upl = pos.get("unrealized_pnl", 0)
+                            self._finalize_closed_position(
+                                symbol=sym, side=dl_side,
+                                entry=dl_entry, contracts=contracts, margin=dl_margin,
+                                upl=dl_upl, close_reason="DAILY_LOSS_CLOSE",
+                                open_ts=self._position_open_times.get(sym, 0),
+                                strategy=getattr(self, '_position_strategies', {}).get(sym, "pullback"),
+                                close_order_result=close_o, mark_price=dl_mark,
+                                is_emergency=True,  # 减少重试
+                            )
                             self.tlogger.log_risk("DAILY_LOSS_CLOSE",
                                 f"{pos['symbol']} {pos['side']} "
                                 f"强平 @{pos.get('mark_price',0):.4f} "
@@ -2919,7 +3102,6 @@ class DeepSeekQuantBot:
                     f"持仓{holding_hours:.1f}h | 浮亏{upl:+.2f}"
                 )
                 try:
-                    # v3.6 fix: 使用 close_position API 正确平仓
                     close_side = "buy" if side == "SHORT" else "sell"
                     pos_side = "short" if side == "SHORT" else "long"
                     close_o = self.exchange.create_market_order_close(
@@ -2927,16 +3109,15 @@ class DeepSeekQuantBot:
                     )
                     if close_o:
                         logger.info(f"✅ 浮亏止损平仓 {sym}: {close_o.get('id', '?')}")
-                        # 计算 PnL%
-                        csize = self.exchange.get_contract_size(sym_full)
-                        position_value = entry * contracts * csize
-                        pnl_pct = (upl / (position_value / self.config.leverage)) * 100 if position_value > 0 else roi * 100
-                        self.tlogger.log_position_close(
-                            symbol=sym, direction=side,
+                        # v4.5→Phase2: 统一出口
+                        margin = pos_d.get("margin", 0)
+                        self._finalize_closed_position(
+                            symbol=sym_full, side=side,
+                            entry=entry, contracts=contracts, margin=margin,
+                            upl=upl, close_reason="AUTO_SL",
+                            open_ts=open_ts,
                             strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
-                            entry_price=entry, exit_price=mark,
-                            pnl=upl, pnl_pct=pnl_pct,
-                            close_reason="AUTO_SL", holding_hours=round(holding_hours, 1),
+                            close_order_result=close_o, mark_price=mark,
                         )
                     else:
                         logger.warning(f"⚠️  浮亏止损平仓 {sym} 返回空 (可能已平仓)")
@@ -2975,14 +3156,16 @@ class DeepSeekQuantBot:
                         sym_full, contracts, close_side, pos_side)
                     if close_o:
                         logger.info(f"✅ 僵尸仓平仓 {sym}: {close_o.get('id', '?')}")
-                        self.tlogger.log_position_close(
-                            symbol=sym, direction=side,
+                        # v4.5→Phase2: 统一出口
+                        entry = pos_d.get("entry_price", 0)
+                        mark = pos_d.get("mark_price", 0)
+                        self._finalize_closed_position(
+                            symbol=sym_full, side=side,
+                            entry=entry, contracts=contracts, margin=margin,
+                            upl=upl, close_reason="STALE_EXIT",
+                            open_ts=open_ts,
                             strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
-                            entry_price=pos_d.get("entry_price", 0),
-                            exit_price=pos_d.get("mark_price", 0),
-                            pnl=upl, pnl_pct=roi * 100,
-                            close_reason="STALE_EXIT",
-                            holding_hours=round(holding_hours, 1),
+                            close_order_result=close_o, mark_price=mark,
                         )
                 except Exception as e:
                     logger.warning(f"🧟 僵尸仓平仓 {sym} 失败: {e}")
@@ -3136,9 +3319,39 @@ class DeepSeekQuantBot:
                 positions = self.exchange.get_open_positions()
                 _is_dry_run = (getattr(self.config, 'emergency_dry_run', False)
                                and self.exchange.is_sandbox())
-                closed = self.safety.emergency_close_all(positions)
+                closed = 0
+                # v4.5→Phase2: 紧急平仓逐个调用统一出口
+                for sym, pos in positions.items():
+                    try:
+                        contracts = abs(float(pos.get("contracts", 0) or 0))
+                        if contracts <= 0:
+                            continue
+                        hold_side = pos.get("info", {}).get("holdSide", "").lower()
+                        if not hold_side:
+                            hold_side = "short" if str(pos.get("side", "")).upper() == "SHORT" else "long"
+                        w_side = "buy" if hold_side == "short" else "sell"
+                        close_o = self.exchange.create_market_order_close(
+                            sym, contracts, w_side, hold_side)
+                        if close_o:
+                            closed += 1
+                            em_side = "LONG" if hold_side == "long" else "SHORT"
+                            em_entry = float(pos.get("entryPrice", 0) or 0)
+                            em_mark = float(pos.get("markPrice", 0) or 0)
+                            em_margin = float(pos.get("initialMargin", 0) or 0)
+                            em_upl = float(pos.get("unrealizedPnl", 0) or 0)
+                            self._finalize_closed_position(
+                                symbol=sym, side=em_side,
+                                entry=em_entry, contracts=contracts, margin=em_margin,
+                                upl=em_upl, close_reason="EMERGENCY_STOP",
+                                open_ts=self._position_open_times.get(sym, 0),
+                                strategy=getattr(self, '_position_strategies', {}).get(sym, "pullback"),
+                                close_order_result=close_o, mark_price=em_mark,
+                                is_emergency=True,
+                            )
+                    except Exception as e:
+                        logger.error(f"❌ 紧急平仓失败 {sym}: {e}")
                 self.tlogger.log_risk("EMERGENCY_STOP", f"已平仓 {closed} 个持仓: {reason}")
-                # v4.5: 全平后复核 — 仍有仓位则重试 (dry-run 时跳过复核)
+                # v4.5: 全平后复核 — 仍有仓位则重试
                 if not _is_dry_run:
                     for retry in range(2):
                         remaining = self.exchange.get_open_positions()
@@ -3148,10 +3361,17 @@ class DeepSeekQuantBot:
                             f"🔥 紧急平仓复核: 仍有 {len(remaining)} 个残留仓位 "
                             f"{list(remaining.keys())} → 第{retry+1}次重试"
                         )
-                        for sym in list(remaining.keys()):
+                        for sym2 in list(remaining.keys()):
                             self.tlogger.log_risk("EMERGENCY_REMAINING",
-                                f"残留仓位: {sym} 第{retry+1}次重试")
-                        self.safety.emergency_close_all(remaining)
+                                f"残留仓位: {sym2} 第{retry+1}次重试")
+                            try:
+                                rp = remaining[sym2]
+                                rc = abs(float(rp.get("contracts", 0) or 0))
+                                rh = rp.get("info", {}).get("holdSide", "").lower() or "long"
+                                rs = "buy" if rh == "short" else "sell"
+                                self.exchange.create_market_order_close(sym2, rc, rs, rh)
+                            except Exception:
+                                pass
                     # 最终确认
                     final_remaining = self.exchange.get_open_positions()
                     if final_remaining:
@@ -3159,9 +3379,9 @@ class DeepSeekQuantBot:
                             f"💀 紧急平仓未完全清除: {list(final_remaining.keys())} "
                             f"— 3次尝试后仍残留!"
                         )
-                        for sym in list(final_remaining.keys()):
+                        for sym3 in list(final_remaining.keys()):
                             self.tlogger.log_risk("EMERGENCY_FAILED",
-                                f"3次平仓失败: {sym}")
+                                f"3次平仓失败: {sym3}")
                 self.riskmon.cooldown_until = time.time() + 86400  # 紧急停止: 24h 冷却
                 self.riskmon.cooldown_reason = "紧急停止"
                 return {"blocked": True, "session": {}}
@@ -3302,31 +3522,19 @@ class DeepSeekQuantBot:
                     mark = float(old_pos.get("markPrice", 0) or 0)
                     contracts = abs(float(old_pos.get("contracts", 0) or 0))
                     side = "LONG" if str(old_pos.get("side") or old_pos.get("info", {}).get("holdSide", "")).lower() == "long" else "SHORT"
-                    csize = self.exchange.get_contract_size(sym)
-                    pnl = (mark - entry) * contracts * csize if side == "LONG" else (entry - mark) * contracts * csize
-                    position_value = entry * contracts * csize
-                    pnl_pct = (pnl / (position_value / self.config.leverage)) * 100 if position_value > 0 else 0
-                    logger.info(
-                        f"📋 检测到停机期平仓: {sym} {side} "
-                        f"入场{entry:.4f} 估算pnl={pnl:+.2f} ({pnl_pct:+.1f}%)"
+                    pv = entry * contracts * self.exchange.get_contract_size(sym)
+                    margin = float(old_pos.get("margin", pv / self.config.leverage))
+
+                    # v4.5→Phase2: 统一出口 (启动同步 — 无 API 数据，依赖回退)
+                    self._finalize_closed_position(
+                        symbol=sym, side=side,
+                        entry=entry, contracts=contracts, margin=margin,
+                        upl=float(old_pos.get("unrealizedPnl", 0) or 0),
+                        close_reason="STARTUP_SYNC",
+                        open_ts=0,  # 启动时无准确开仓时间
+                        strategy=getattr(self, '_position_strategies', {}).get(sym, "pullback"),
+                        close_order_result=None, mark_price=mark,
                     )
-                    # v4.1 fix: 停机期 PnL 也要计入审计累计
-                    self._bot_closed_pnl_total += pnl
-                    self._bot_closed_trade_count += 1
-                    if self.learner:
-                        base = sym.replace("/USDT:USDT", "")
-                        try:
-                            self.learner.learn_from_closed_trade(
-                                symbol=base, direction=side,
-                                entry_price=entry, exit_price=mark,
-                                pnl=pnl, pnl_pct=pnl_pct,
-                                strategy=getattr(self, '_position_strategies', {}).get(sym, "pullback"),
-                                ai_decision="CONFIRM",
-                                reason="停机期间平仓",
-                                market_regime=getattr(self, '_current_regime', 'unknown'),
-                            )
-                        except Exception:
-                            logger.debug("⚠️  静默异常", exc_info=True)
         except Exception as e:
             logger.warning(f"⚠️  启动平仓检测异常: {e}")
 

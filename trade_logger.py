@@ -316,13 +316,14 @@ class TradeLogger:
     def log_exit_snapshot(self, symbol: str, direction: str, strategy: str,
                           entry_price: float, exit_price: float,
                           pnl: float, pnl_pct: float,
-                          exit_reason: str,              # STOP_LOSS / TAKE_PROFIT / TRAILING_STOP / TIME_EXIT / RULE_EXIT
+                          exit_reason: str,
                           hold_minutes: float,
                           score: int = 0,
                           ema_trend: str = "",
                           kalman_dir: str = "",
                           market_regime: str = "",
-                          funding_fee: float = 0.0):     # v4.5→Phase2: 持仓期间累计资金费率
+                          funding_fee: float = 0.0,
+                          pnl_source: str = "FALLBACK"):  # v4.5→Phase2: PnL来源标记
         """P1+P4: 平仓完整快照 — 含时间戳、出场原因细分、入场上下文"""
         self._write({
             "event": "EXIT_SNAPSHOT",
@@ -335,11 +336,12 @@ class TradeLogger:
             "pnl_pct": round(pnl_pct, 1),
             "exit_reason": exit_reason,
             "hold_minutes": round(hold_minutes, 1),
-            "score_at_entry": score,           # 入场时评分
-            "ema_trend_at_entry": ema_trend,   # 入场时 EMA 趋势
-            "kalman_at_entry": kalman_dir,     # 入场时 Kalman 方向
-            "regime_at_entry": market_regime,  # 入场时市场状态
-            "funding_fee": round(funding_fee, 4),  # v4.5→Phase2: 累计资金费率
+            "score_at_entry": score,
+            "ema_trend_at_entry": ema_trend,
+            "kalman_at_entry": kalman_dir,
+            "regime_at_entry": market_regime,
+            "funding_fee": round(funding_fee, 4),
+            "pnl_source": pnl_source,  # v4.5→Phase2: "API" | "FALLBACK"
         })
 
     def log_filter_stats(self, cycle: int, stats: dict, current_regime: str = ""):
