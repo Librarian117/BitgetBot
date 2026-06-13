@@ -519,8 +519,8 @@ class SelfLearner:
     5. 学习成果直接反馈到交易决策
     """
 
-    WISDOM_FILE = "trading_wisdom.json"
-    TRACKER_FILE = "strategy_performance.json"
+    WISDOM_FILE = "data/trading_wisdom.json"
+    TRACKER_FILE = "data/strategy_performance.json"
     REVIEW_INTERVAL_HOURS = 4  # 每 4 小时做一次宏观回顾
     EMERGENCY_REVIEW_LOSSES = 2  # v3.7: 连续亏损 N 笔 → 紧急回顾
     EMERGENCY_COOLDOWN_MINUTES = 30  # v3.7: 紧急回顾冷却时间

@@ -28,7 +28,7 @@ logger = logging.getLogger("QuantBot")
 class HealthMonitor:
     """全链路健康检查器 v3.6"""
 
-    HEALTH_FILE = "health.json"
+    HEALTH_FILE = "data/health.json"
 
     # ── 阈值 ──
     MAX_PLAN_ORDERS_PER_POS = 4     # 每仓计划单上限 (正常 2: SL+TP)

@@ -153,7 +153,7 @@ class DeepSeekQuantBot:
             "short_trades": 0,
         }
         self._status_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "status.json"
+            os.path.dirname(os.path.abspath(__file__)), "data", "status.json"
         )
         # ── v2.7: 多TF分析缓存 (同一周期内复用，避免重复拉取1h/4h K线) ──
         self._tf_cache: Dict[str, Dict[str, Any]] = {}
@@ -1943,7 +1943,7 @@ class DeepSeekQuantBot:
                         "drought_cycles": getattr(self, '_drought_cycles', 0),
                     },
                 }, f, ensure_ascii=False)
-            os.replace(tmp, "positions_state.json")
+            os.replace(tmp, "data/positions_state.json")
         except Exception:
             logger.debug("⚠️  静默异常", exc_info=True)
 
@@ -3576,7 +3576,7 @@ class DeepSeekQuantBot:
 
     def _detect_startup_closes(self):
         """v3.4: 启动时对比持久化仓位快照，检测停机期间的平仓"""
-        state_file = "positions_state.json"
+        state_file = "data/positions_state.json"
         if not os.path.exists(state_file):
             return
         try:
