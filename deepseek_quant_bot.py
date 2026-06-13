@@ -568,6 +568,39 @@ class DeepSeekQuantBot:
     # v4.5→Phase2: 统一平仓出口 — 所有平仓路径的唯一记录点
     # ==================================================================
 
+    # ── 去重键持久化 (崩溃恢复) ──
+    _CLOSED_KEYS_FILE = "data/closed_trades_keys.txt"
+
+    def _persist_closed_key(self, key: str):
+        """追加去重键到持久化文件 (崩溃恢复用)"""
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(self._CLOSED_KEYS_FILE, "a", encoding="utf-8") as f:
+                f.write(key + "\n")
+        except Exception:
+            pass
+
+    def _restore_closed_keys(self):
+        """启动时恢复去重键到内存缓存 (防止 _detect_startup_closes 重复处理)"""
+        if not os.path.exists(self._CLOSED_KEYS_FILE):
+            return
+        try:
+            restored = 0
+            with open(self._CLOSED_KEYS_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    key = line.strip()
+                    if key and key not in self._closed_trades_cache:
+                        self._closed_trades_cache[key] = {
+                            "pnl": 0, "pnl_pct": 0, "pnl_source": "RESTORED",
+                            "funding_fee": 0, "fees": 0, "trade_id": key,
+                            "already_processed": True,
+                        }
+                        restored += 1
+            if restored > 0:
+                logger.info(f"📥 恢复 {restored} 个已平仓去重键 (防崩溃重复)")
+        except Exception:
+            logger.debug("⚠️ 去重键恢复失败", exc_info=True)
+
     @staticmethod
     def _build_dedup_key(close_order_result: Optional[Dict], symbol: str,
                          open_ts: float, contracts: float) -> str:
@@ -584,13 +617,11 @@ class DeepSeekQuantBot:
                    or close_order_result.get("order_id"))
             if oid:
                 return f"order:{oid}"
-        # 优先级 2: 时间戳 + symbol + 张数
+        # 优先级 2: 开仓时间戳 + symbol + 张数 (不含 close_ts — 避免 race condition)
         if open_ts > 0:
-            close_ts = int(time.time())
-            return f"ts:{symbol}:{int(open_ts)}:{close_ts}:{int(contracts)}"
-        # 优先级 3: 仅当前时间
-        close_ts = int(time.time())
-        return f"ts:{symbol}:{close_ts}:{int(contracts)}"
+            return f"ts:{symbol}:{int(open_ts)}:{int(contracts)}"
+        # 优先级 3: symbol + 张数 (启动同步回退)
+        return f"ts:{symbol}:0:{int(contracts)}"
 
     def _write_trade_ledger(self, trade: Dict[str, Any]):
         """v4.5→Phase2: 写入唯一交易账本 (单一数据源)
@@ -808,6 +839,9 @@ class DeepSeekQuantBot:
                 "duration_min": dur_min,
             })
 
+            # v4.5→Phase2: 持久化去重键 — 防止崩溃后重启时 _detect_startup_closes 重复处理
+            self._persist_closed_key(dedup_key)
+
             # ── STEP 8: 清理 ──
             self._position_open_times.pop(sym_full, None)
 
@@ -822,13 +856,22 @@ class DeepSeekQuantBot:
                 "trade_id": dedup_key, "already_processed": False,
             }
             self._closed_trades_cache[dedup_key] = result
+            # v4.5→Phase2: 同时注册 ts: 键 — 防止 pos-tpsl 检测路径重复
+            if not dedup_key.startswith("ts:"):
+                ts_fallback = f"ts:{sym_full}:{int(open_ts)}:{int(contracts)}"
+                if ts_fallback not in self._closed_trades_cache:
+                    self._closed_trades_cache[ts_fallback] = result
             return result
 
         except Exception as e:
             logger.error(f"💥 _finalize_closed_position 异常: {e}", exc_info=True)
-            # 回退: 至少记录 PnL 不丢失
-            fallback = {"pnl": upl, "pnl_pct": 0, "pnl_source": "FALLBACK",
-                        "funding_fee": 0, "fees": 0, "trade_id": dedup_key,
+            # v4.5→Phase2: 异常回退也扣除估算费 (与正常 FALLBACK 一致)
+            csize = self.exchange.get_contract_size(sym_full)
+            taker_fee = self.exchange.get_taker_fee(sym_full)
+            est_fee = entry * abs(contracts) * csize * taker_fee * 2
+            fallback_pnl = upl - est_fee
+            fallback = {"pnl": fallback_pnl, "pnl_pct": 0, "pnl_source": "FALLBACK",
+                        "funding_fee": 0, "fees": est_fee, "trade_id": dedup_key,
                         "already_processed": False}
             self._closed_trades_cache[dedup_key] = fallback
             self._position_open_times.pop(sym_full, None)
@@ -1829,17 +1872,12 @@ class DeepSeekQuantBot:
 
         # ── v3.1: 检测平仓交易 (当前持仓 vs 上一轮) ──
         prev_positions = getattr(self, '_prev_positions', {})
-        # v4.0: 已处理平仓集合, 防止重复记录
-        if not hasattr(self, '_closed_positions_done'):
-            self._closed_positions_done: set = set()
+        # v4.5→Phase2: 去重改用 _finalize_closed_position 幂等缓存, 不再维护独立 set
         if self.learner and prev_positions:
             current_syms = {p["symbol"] + "/USDT:USDT" for p in acct["positions_detail"]}
-            closed = {
-                sym: pos for sym, pos in prev_positions.items()
-                if sym not in current_syms
-                and (sym, round(float(pos.get("entryPrice", 0) or 0), 4), int(abs(float(pos.get("contracts", 0) or 0))), today_str()) not in self._closed_positions_done
-            }
-            for sym, old_pos in closed.items():
+            for sym, old_pos in prev_positions.items():
+                if sym in current_syms:
+                    continue
                 entry = float(old_pos.get("entryPrice", 0) or 0)
                 contracts = abs(float(old_pos.get("contracts", 0) or 0))
                 mark = float(old_pos.get("markPrice", 0) or 0)
@@ -1847,11 +1885,10 @@ class DeepSeekQuantBot:
                 margin = float(old_pos.get("margin", 0) or 0)
                 upl = float(old_pos.get("unrealizedPnl", 0) or 0)
 
-                base = sym.replace("/USDT:USDT", "")
                 close_strategy = getattr(self, '_position_strategies', {}).get(sym, "pullback")
                 open_ts = self._position_open_times.get(sym, 0)
 
-                # v4.5→Phase2: 统一平仓出口 (pos-tpsl 检测 — 无 close_order_result)
+                # v4.5→Phase2: 统一出口 — _closed_trades_cache 幂等保护防止重复
                 self._finalize_closed_position(
                     symbol=sym, side=side,
                     entry=entry, contracts=contracts, margin=margin,
@@ -1859,12 +1896,9 @@ class DeepSeekQuantBot:
                     open_ts=open_ts, strategy=close_strategy,
                     close_order_result=None, mark_price=mark,
                 )
-
-                # v4.5→Phase2: _finalize_closed_position 已包含所有后处理，以下仅保留去重注册
-                self._closed_positions_done.add((sym, round(entry, 4), int(contracts), today_str()))
-        # v4.0: 每日清理平仓记录 (防止内存泄漏)
+        # v4.5→Phase2: 每日清理 _closed_trades_cache (防止内存泄漏)
         if getattr(self, '_closed_date', '') != today_str():
-            self._closed_positions_done = set()
+            self._closed_trades_cache.clear()
             self._closed_date = today_str()
         # v4.1 fix: 包含本周期新开仓 (acct 是周期初快照, 不含本周期执行的交易)
         self._prev_positions = {
@@ -2850,7 +2884,34 @@ class DeepSeekQuantBot:
                     logger.error(
                         f"🔥 日损清仓复核: 仍有 {len(remaining_positions)} 个残留 → 重试"
                     )
-                    self.safety.emergency_close_all(remaining_positions)
+                    # v4.5→Phase2: 内联重试循环 (替代 emergency_close_all), 接入统一出口
+                    for rsym, rpos in remaining_positions.items():
+                        try:
+                            rct = abs(float(rpos.get("contracts", 0) or 0))
+                            if rct <= 0:
+                                continue
+                            rh = rpos.get("info", {}).get("holdSide", "").lower()
+                            if not rh:
+                                rh = "short" if str(rpos.get("side", "")).upper() == "SHORT" else "long"
+                            rs = "buy" if rh == "short" else "sell"
+                            close_or = self.exchange.create_market_order_close(rsym, rct, rs, rh)
+                            if close_or:
+                                rside = "LONG" if rh == "long" else "SHORT"
+                                self._finalize_closed_position(
+                                    symbol=rsym, side=rside,
+                                    entry=float(rpos.get("entryPrice", 0) or 0),
+                                    contracts=rct,
+                                    margin=float(rpos.get("initialMargin", 0) or 0),
+                                    upl=float(rpos.get("unrealizedPnl", 0) or 0),
+                                    close_reason="DAILY_LOSS_CLOSE",
+                                    open_ts=self._position_open_times.get(rsym, 0),
+                                    strategy=getattr(self, '_position_strategies', {}).get(rsym, "pullback"),
+                                    close_order_result=close_or,
+                                    mark_price=float(rpos.get("markPrice", 0) or 0),
+                                    is_emergency=True,
+                                )
+                        except Exception:
+                            pass
                     final_check = self.exchange.get_open_positions()
                     if final_check:
                         for sym in list(final_check.keys()):
@@ -3367,9 +3428,27 @@ class DeepSeekQuantBot:
                             try:
                                 rp = remaining[sym2]
                                 rc = abs(float(rp.get("contracts", 0) or 0))
-                                rh = rp.get("info", {}).get("holdSide", "").lower() or "long"
+                                rh = rp.get("info", {}).get("holdSide", "").lower()
+                                if not rh:
+                                    rh = "short" if str(rp.get("side", "")).upper() == "SHORT" else "long"
                                 rs = "buy" if rh == "short" else "sell"
-                                self.exchange.create_market_order_close(sym2, rc, rs, rh)
+                                close_o2 = self.exchange.create_market_order_close(sym2, rc, rs, rh)
+                                if close_o2:
+                                    # v4.5→Phase2: 紧急重试也接入统一出口
+                                    em_side2 = "LONG" if rh == "long" else "SHORT"
+                                    em_entry2 = float(rp.get("entryPrice", 0) or 0)
+                                    em_mark2 = float(rp.get("markPrice", 0) or 0)
+                                    em_margin2 = float(rp.get("initialMargin", 0) or 0)
+                                    em_upl2 = float(rp.get("unrealizedPnl", 0) or 0)
+                                    self._finalize_closed_position(
+                                        symbol=sym2, side=em_side2,
+                                        entry=em_entry2, contracts=rc, margin=em_margin2,
+                                        upl=em_upl2, close_reason="EMERGENCY_STOP",
+                                        open_ts=self._position_open_times.get(sym2, 0),
+                                        strategy=getattr(self, '_position_strategies', {}).get(sym2, "pullback"),
+                                        close_order_result=close_o2, mark_price=em_mark2,
+                                        is_emergency=True,
+                                    )
                             except Exception:
                                 pass
                     # 最终确认
@@ -3625,6 +3704,8 @@ class DeepSeekQuantBot:
         logger.info("按 Ctrl+C 停止\n")
 
         # ── v3.4: 检测停机期间的平仓 ──
+        # v4.5→Phase2: 先恢复去重键防止崩溃后重复处理
+        self._restore_closed_keys()
         self._detect_startup_closes()
 
         # ── v3.3: 启动时为所有存量仓位补挂 SL/TP ──
