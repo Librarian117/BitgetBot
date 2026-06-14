@@ -193,37 +193,42 @@ class PerformanceTracker:
     # ════════════════════════════════════════════
 
     def get_strategy_metrics(self) -> Dict[str, Dict]:
-        """按策略拆分"""
+        """按策略拆分 (P2: ledger-first source)"""
         result = {}
-        for strat in set(t.get("strategy", "pullback") for t in self.trades):
-            subset = [t for t in self.trades if t.get("strategy") == strat]
+        trades = self._get_trades_from_ledger_or_memory()
+        for strat in set(t.get("strategy", "pullback") for t in trades):
+            subset = [t for t in trades if t.get("strategy") == strat]
             result[strat] = self.get_metrics(subset)
         return result
 
     def get_direction_metrics(self) -> Dict[str, Dict]:
-        """按方向拆分"""
+        """按方向拆分 (P2: ledger-first source)"""
         result = {}
-        for d in set(t.get("direction", "SHORT") for t in self.trades):
-            subset = [t for t in self.trades if t.get("direction") == d]
+        trades = self._get_trades_from_ledger_or_memory()
+        for d in set(t.get("direction", "SHORT") for t in trades):
+            subset = [t for t in trades if t.get("direction") == d]
             result[d] = self.get_metrics(subset)
         return result
 
     def get_symbol_metrics(self) -> Dict[str, Dict]:
-        """按币种拆分"""
+        """按币种拆分 (P2: ledger-first source)"""
         result = {}
-        for sym in set(t.get("symbol", "?") for t in self.trades):
-            subset = [t for t in self.trades if t.get("symbol") == sym]
+        trades = self._get_trades_from_ledger_or_memory()
+        for sym in set(t.get("symbol", "?") for t in trades):
+            subset = [t for t in trades if t.get("symbol") == sym]
             result[sym] = self.get_metrics(subset)
         return result
 
     def get_rolling_metrics(self, window: int = 20) -> Dict[str, Any]:
-        """最近 N 笔滚动窗口指标"""
-        return self.get_metrics(self.trades[-window:])
+        """最近 N 笔滚动窗口指标 (P2: ledger-first source)"""
+        trades = self._get_trades_from_ledger_or_memory()
+        return self.get_metrics(trades[-window:])
 
     def get_today_metrics(self) -> Dict[str, Any]:
-        """今日指标"""
+        """今日指标 (P2: ledger-first source)"""
         today = today_str()
-        subset = [t for t in self.trades if t.get("date") == today]
+        trades = self._get_trades_from_ledger_or_memory()
+        subset = [t for t in trades if t.get("date") == today]
         return self.get_metrics(subset)
 
     # ════════════════════════════════════════════

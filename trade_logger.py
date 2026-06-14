@@ -367,7 +367,7 @@ class TradeLogger:
         })
 
     # ════════════════════════════════════════════
-    # v4.4: 影子模式 — WOULD_REJECT_RR / RR_OUTCOME / OPPOSITE_HELD 增强
+    # v4.4: R:R 影子模式 — WOULD_REJECT_RR (RR_OUTCOME 已移除, 无消费者)
     # ════════════════════════════════════════════
 
     def log_rr_shadow(self, symbol: str, direction: str, strategy: str,
@@ -387,14 +387,3 @@ class TradeLogger:
             "actual_pnl": None,  # 平仓后由 RR_OUTCOME 回填
         })
 
-    def log_rr_outcome(self, symbol: str, direction: str, rr_ratio: float,
-                       actual_pnl: float, exit_reason: str = ""):
-        """P4: R:R 结果回填 — 平仓后补充 actual_pnl，用于按 RR 区间统计"""
-        self._write({
-            "event": "RR_OUTCOME",
-            "symbol": symbol,
-            "direction": direction,
-            "rr_ratio": round(rr_ratio, 2),
-            "actual_pnl": round(actual_pnl, 4),
-            "exit_reason": exit_reason,
-        })

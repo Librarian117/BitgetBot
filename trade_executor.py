@@ -26,18 +26,18 @@ class TradeExecutor:
         # ── v3.0: 安全层引用（由 DeepSeekQuantBot 在加载 safety 后设置） ──
         self.safety: Any = None
         self._skip_safety: bool = True  # 默认跳过安全校验，由 bot 启用
-        # ── v4.4: R:R 影子模式存储 — 开仓时记录, 平仓时回填 RR_OUTCOME ──
-        self._rr_shadow_store: Dict[str, dict] = {}
 
-    # v4.0: 市场状态 → 仓位/SL 乘数
+    # P2: 市场状态 → 仓位/SL/TP 乘数 (key 对齐 _detect_market_regime() regime labels)
+    # 注意: 之前 7 个旧 key (strong_trend/weak_trend/ranging 等) 与当前 regime labels
+    # (strong_bull/bull/range/bear/strong_bear/panic) 完全不匹配, 导致始终 fallback 到 1.0/1.0/1.0
+    # P2 修复: 保守乘数, 不激进放大仓位
     REGIME_MULTIPLIERS = {
-        "strong_trend":          {"pos": 1.20, "sl": 1.00, "tp": 1.10},
-        "weak_trend":            {"pos": 1.00, "sl": 1.00, "tp": 1.00},
-        "ranging":               {"pos": 0.70, "sl": 0.80, "tp": 1.20},
-        "low_vol_ranging":       {"pos": 0.80, "sl": 0.70, "tp": 1.30},
-        "high_vol_strong_trend": {"pos": 0.80, "sl": 1.30, "tp": 0.80},
-        "low_vol_weak_trend":    {"pos": 1.00, "sl": 0.85, "tp": 1.15},
-        "conflicting":           {"pos": 0.50, "sl": 1.00, "tp": 1.00},
+        "strong_bull":  {"pos": 1.10, "sl": 1.00, "tp": 1.05},  # 强牛: 仓位+10%, TP 微扩
+        "bull":         {"pos": 1.00, "sl": 1.00, "tp": 1.00},  # 牛市: 中性
+        "range":        {"pos": 0.80, "sl": 0.90, "tp": 1.10},  # 震荡: 仓位-20%, SL 收紧
+        "bear":         {"pos": 1.00, "sl": 1.00, "tp": 1.00},  # 熊市: 中性
+        "strong_bear":  {"pos": 1.10, "sl": 1.00, "tp": 1.05},  # 强熊: 仓位+10%, TP 微扩
+        "panic":        {"pos": 0.50, "sl": 1.00, "tp": 1.00},  # 恐慌: 仓位-50%, 不放 TP
     }
 
     def execute(self, symbol: str, direction: str, price: float,
@@ -521,13 +521,6 @@ class TradeExecutor:
             # v4.4: 回传 RR 数据到结果, 供 ENTRY_SNAPSHOT 持久化 (跨重启安全)
             result["rr_ratio"] = _rr_ratio
             result["rr_expected_profit"] = _rr_expected_profit
-            # v4.4: 内存存储 RR 数据, 供平仓时回填 RR_OUTCOME (重启后丢失但可从日志恢复)
-            symbol_short = symbol.split(':')[0].split('/')[0]
-            self._rr_shadow_store[symbol_short + '_' + direction] = {
-                'rr_ratio': _rr_ratio,
-                'expected_profit': _rr_expected_profit,
-                'strategy': strategy,
-            }
             self.logger.log_trade(
                 symbol=symbol, direction=direction, price=price,
                 sl=sl_price, tp_info=result["tp_info"],
@@ -547,19 +540,6 @@ class TradeExecutor:
             )
 
         return result
-
-    def pop_rr_shadow(self, symbol: str, direction: str) -> dict:
-        """v4.4: 平仓时取出 RR 影子数据并发射 RR_OUTCOME"""
-        key = symbol + '_' + direction
-        data = self._rr_shadow_store.pop(key, None)
-        if data and data.get('rr_ratio', 0) > 0:
-            self.logger.log_rr_outcome(
-                symbol=symbol, direction=direction,
-                rr_ratio=data['rr_ratio'],
-                actual_pnl=0,  # 由调用方回填
-                exit_reason="",
-            )
-        return data or {}
 
 
 # ============================================================================

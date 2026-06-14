@@ -306,5 +306,120 @@ class TestRuntimeLedgerSource(unittest.TestCase):
             PerformanceTracker.LEDGER_FILE = old_ledger
 
 
+# ============================================================
+# P2 Commit 3: Split metrics read from ledger
+# ============================================================
+
+class TestSplitMetricsLedgerSource(unittest.TestCase):
+    """P2: get_strategy/direction/symbol/rolling/today_metrics all use ledger"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ledger_path = tempfile.mktemp(suffix=".jsonl")
+
+    def _write_ledger(self, lines):
+        with open(self.ledger_path, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(json.dumps(line) + "\n")
+
+    def _make_trade(self, symbol, side, pnl, strategy="pullback", **kw):
+        return {
+            "event": "TRADE_CLOSE", "symbol": symbol, "side": side,
+            "pnl": pnl, "pnl_pct": 1.0, "entry": 100.0, "exit": 100 + pnl,
+            "strategy": strategy,
+            "pnl_source": "API", "fee": 0.0, "funding": 0.0,
+            "close_reason": "TEST", "open_ts": 1700000000,
+            "close_ts": 1710000000, "duration_min": 1.0,
+        }
+
+    def test_strategy_metrics_from_ledger(self):
+        """strategy split uses ledger data"""
+        self._write_ledger([
+            self._make_trade("A", "LONG", 5.0, strategy="pullback"),
+            self._make_trade("B", "LONG", -2.0, strategy="momentum"),
+            self._make_trade("C", "SHORT", 3.0, strategy="pullback"),
+        ])
+        old_ledger = PerformanceTracker.LEDGER_FILE
+        PerformanceTracker.LEDGER_FILE = self.ledger_path
+        try:
+            pt = PerformanceTracker()
+            sm = pt.get_strategy_metrics()
+            self.assertIn("pullback", sm)
+            self.assertIn("momentum", sm)
+            self.assertEqual(sm["pullback"]["total_trades"], 2)
+            self.assertEqual(sm["momentum"]["total_trades"], 1)
+        finally:
+            PerformanceTracker.LEDGER_FILE = old_ledger
+
+    def test_direction_metrics_from_ledger(self):
+        """direction split uses ledger data"""
+        self._write_ledger([
+            self._make_trade("A", "LONG", 5.0),
+            self._make_trade("B", "SHORT", -2.0),
+            self._make_trade("C", "LONG", 3.0),
+        ])
+        old_ledger = PerformanceTracker.LEDGER_FILE
+        PerformanceTracker.LEDGER_FILE = self.ledger_path
+        try:
+            pt = PerformanceTracker()
+            dm = pt.get_direction_metrics()
+            self.assertIn("LONG", dm)
+            self.assertIn("SHORT", dm)
+            self.assertEqual(dm["LONG"]["total_trades"], 2)
+            self.assertEqual(dm["SHORT"]["total_trades"], 1)
+        finally:
+            PerformanceTracker.LEDGER_FILE = old_ledger
+
+    def test_symbol_metrics_from_ledger(self):
+        """symbol split uses ledger data"""
+        self._write_ledger([
+            self._make_trade("BTC", "LONG", 5.0),
+            self._make_trade("ETH", "SHORT", -2.0),
+            self._make_trade("BTC", "LONG", 3.0),
+        ])
+        old_ledger = PerformanceTracker.LEDGER_FILE
+        PerformanceTracker.LEDGER_FILE = self.ledger_path
+        try:
+            pt = PerformanceTracker()
+            sm = pt.get_symbol_metrics()
+            self.assertIn("BTC", sm)
+            self.assertIn("ETH", sm)
+            self.assertEqual(sm["BTC"]["total_trades"], 2)
+            self.assertEqual(sm["ETH"]["total_trades"], 1)
+        finally:
+            PerformanceTracker.LEDGER_FILE = old_ledger
+
+    def test_split_fallback_when_ledger_missing(self):
+        """ledger missing -> split methods fallback to self.trades"""
+        pt = PerformanceTracker()
+        pt.trades = [{
+            "timestamp": "", "date": "", "symbol": "X", "direction": "LONG",
+            "entry": 100.0, "exit": 110.0, "pnl": 10.0, "pnl_pct": 10.0,
+            "strategy": "pullback", "duration_min": 1.0, "win": True,
+        }]
+        old_ledger = PerformanceTracker.LEDGER_FILE
+        PerformanceTracker.LEDGER_FILE = "/nonexistent/ledger.jsonl"
+        try:
+            sm = pt.get_strategy_metrics()
+            self.assertIn("pullback", sm)
+            self.assertEqual(sm["pullback"]["total_trades"], 1)
+        finally:
+            PerformanceTracker.LEDGER_FILE = old_ledger
+
+    def test_rolling_metrics_from_ledger(self):
+        """rolling metrics use ledger data"""
+        trades = [self._make_trade(chr(65+i), "LONG", float(i+1)) for i in range(5)]
+        self._write_ledger(trades)
+        old_ledger = PerformanceTracker.LEDGER_FILE
+        PerformanceTracker.LEDGER_FILE = self.ledger_path
+        try:
+            pt = PerformanceTracker()
+            rm = pt.get_rolling_metrics(window=3)
+            self.assertEqual(rm["total_trades"], 3)
+            self.assertAlmostEqual(rm["total_pnl"], 12.0)  # 3+4+5=12
+        finally:
+            PerformanceTracker.LEDGER_FILE = old_ledger
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -116,9 +116,10 @@ Market Data
 
 ### Strategy Notes
 
-- Strategy generation is not separated into individual classes. Most strategy logic is inside `DeepSeekQuantBot.scan_single_symbol()`.
+- P3-A: 4/6 strategy evaluators (pullback/momentum/ema_cross/bollinger) extracted to `strategy_engine.py` as pure functions. Remaining inline: counter_trend (Kalman downgrade identity), grid (GridManager).
 - Grid is separate and optional; it is not fully integrated into finalize/ledger.
 - DeepSeek is not the decision-maker. The current execution path treats AI as research/commentary, while quant score gates decide.
+- Filter pipeline: regime detection + Kalman resolver extracted to `filter_pipeline.py`. Volume/BTC/direction filters still inline.
 
 ## 5. Filter Layer
 
@@ -151,7 +152,7 @@ The current code already attempts “evidence consumed once”:
 
 Remaining risk:
 
-<span style="color:red"><strong>ARCHITECTURE MISALIGNMENT</strong></span>: Filters are conceptually layered but still implemented mostly as scattered logic inside `deepseek_quant_bot.py`, making future drift likely.
+<span style="color:orange"><strong>PARTIALLY ADDRESSED (P3-A)</strong></span>: Strategy evaluators (pullback/momentum/ema_cross/bollinger) extracted to `strategy_engine.py`. Regime detection + Kalman resolver extracted to `filter_pipeline.py`. Orchestrator methods are thin wrappers. Remaining: volume/BTC/direction filters, phase methods, orchestrator reduction (P3-B/P4).
 
 ## 6. Risk Layer
 
@@ -471,7 +472,7 @@ Current (P1 Commit 1+2):
 
 Status:
 
-<span style="color:orange"><strong>PARTIALLY MIGRATED</strong></span>: runtime `get_metrics()` is ledger-first. `record_trade()` and `performance.json` retained for backward compatibility. Multi-dimensional splits (`get_strategy_metrics`, etc.) still use `self.trades`, not ledger.
+<span style="color:green"><strong>FIXED (P2 Commit 3)</strong></span>: runtime `get_metrics()` is ledger-first. All split methods (`get_strategy_metrics`, `get_direction_metrics`, `get_symbol_metrics`, `get_rolling_metrics`, `get_today_metrics`) also use ledger-first via shared `_get_trades_from_ledger_or_memory()`. `record_trade()` and `performance.json` retained for backward compatibility.
 
 ## 13. Data Flow Diagram
 
@@ -559,8 +560,8 @@ Finalize -> Ledger -> Performance / Equity / Dashboard / Watchdog
 | `SafetyManager.emergency_close_all()` | Legacy bypass | Direct close without finalize; main loop now inlines emergency close and calls finalize |
 | `audit_trades.py` | <span style="color:green">FIXED (P1)</span> | Now reads `trade_ledger.jsonl`, filters `TRADE_CLOSE`, deduplicates by `trade_id` |
 | `bot_watchdog.py` | <span style="color:green">FIXED (P1)</span> | Now reads `data/status.json` and counts `TRADE_CLOSE` in `trade_ledger.jsonl`; falls back to old logs if ledger missing |
-| `TradeExecutor.pop_rr_shadow()` | Likely dead | Defined but not used by main close/finalize path |
-| `TradeExecutor.REGIME_MULTIPLIERS` | Non-functional | Keys (`strong_trend`, `ranging`, etc.) do not match regime labels (`strong_bull`, `bull`, `range`, etc.) — default multiplier ALWAYS used |
+| `TradeExecutor.pop_rr_shadow()` | <span style="color:green">REMOVED (P2)</span> | Dead code — no runtime caller found; `_rr_shadow_store` write-only leak also removed. `log_rr_shadow` preserved (active entry path) |
+| `TradeExecutor.REGIME_MULTIPLIERS` | <span style="color:green">FIXED (P2)</span> | Keys now aligned to regime labels (`strong_bull`, `bull`, `range`, `bear`, `strong_bear`, `panic`). Conservative multipliers: pos 0.50-1.10, sl 0.90-1.00, tp 1.00-1.10 |
 | `GridManager` close lifecycle | Not ledger-first | TP/SL orders are managed independently and use `reduceOnly=True` in hedge context |
 | `performance.json` as trade store | <span style="color:orange">Compatibility cache</span> | Runtime reads from ledger; `performance.json` retained as fallback. Multi-dimensional splits still use `self.trades` |
 | daily `POSITION_CLOSE` logs as accounting source | Audit log | No longer a downstream source — `trade_ledger.jsonl` is the closed-trade SSoT |
@@ -592,14 +593,20 @@ The biggest remaining architecture risk is that not all downstream analytics rea
 ```text
 Finalize unified exit:        implemented (P0: all paths covered)
 Ledger write path:             implemented
-Ledger read model:             partially implemented (performance, watchdog, audit)
+Ledger read model:             performance + splits + watchdog + audit (P1+P2)
 API PnL path:                  aligned (pnl gross, netProfit, totalFunding, fee sign)
 Funding PnL path:              aligned (P0-4: totalFunding mapped)
 Equity truth:                  exchange account equity
 Equity audit:                  dual-basis (P1 Commit 3)
-Performance truth:             ledger-first with performance.json fallback (P1 Commit 1+2)
+Performance truth:             ledger-first, all split methods aligned (P1+P2)
 Watchdog:                      aligned to ledger (P1 Commit 4)
 Offline audit:                 aligned to ledger (P1 Commit 4)
+REGIME_MULTIPLIERS:            aligned to regime labels (P2 Commit 2)
+Dead code (pop_rr_shadow):     removed (P2 Commit 1)
+Strategy extraction (4/6):      done (P3-A: strategy_engine.py)
+Regime + Kalman extraction:     done (P3-A: filter_pipeline.py)
+Volume/BTC/direction filters:   remaining (P3-B)
+Orchestrator reduction:         remaining (P3-B)
 Dashboard truth:               exchange live API
 ```
 

@@ -40,6 +40,8 @@ from equity_auditor import EquityAuditor
 from exchange_interface import ExchangeInterface
 from quant_math import compute_quant_signals
 from session_manager import SessionManager
+from strategy_engine import evaluate_pullback, evaluate_momentum, evaluate_ema_cross, evaluate_bollinger  # P3
+from filter_pipeline import resolve_kalman, detect_market_regime  # P3
 from trade_executor import TradeExecutor
 
 # ── Phase 1: 服务类提取 ──
@@ -494,75 +496,9 @@ class DeepSeekQuantBot:
                         kalman_dir: str, kalman_score: float,
                         ema_kalman_conflict: bool,
                         is_bearish_trend: bool, is_bullish_trend: bool) -> Dict[str, Any]:
-        """v4.5: Kalman 单一决策 — 一次计算，一次消费。
-
-        替代旧逻辑中 Kalman 同时做四件事的分散架构:
-          ① 改策略 (pullback→counter_trend)
-          ② 扣 confidence
-          ③ 提 required_score (通过 kalman_conflict_for_scorer)
-          ④ 改方向门槛 (通过 kalman_ema_disagree)
-
-        返回统一结果，下游只读取一次:
-          action: "allow" | "penalize" | "downgrade"
-          new_strategy: None (保持) 或 "counter_trend"
-          confidence_penalty: 扣分值
-          kalman_conflict_for_scorer: 传递给 SignalScorer 提升门槛
-        """
-        result = {
-            "action": "allow",
-            "new_strategy": None,
-            "confidence_penalty": 0,
-            "kalman_conflict_for_scorer": False,
-        }
-
-        # ── 检查1: Kalman 方向 vs 信号方向冲突 ──
-        kalman_signal_conflict = (
-            kalman_dir != "flat"
-            and ((direction == "SHORT" and kalman_dir == "up")
-                 or (direction == "LONG" and kalman_dir == "down"))
-        )
-
-        if kalman_signal_conflict:
-            score = abs(kalman_score)
-            if score > 0.8:
-                result["action"] = "downgrade"
-                result["new_strategy"] = "counter_trend"
-                result["confidence_penalty"] = int(score * 25)
-                result["kalman_conflict_for_scorer"] = True
-            elif score > 0.5:
-                result["action"] = "downgrade"
-                result["new_strategy"] = "counter_trend"
-                result["confidence_penalty"] = int(score * 20)
-                result["kalman_conflict_for_scorer"] = True
-            elif score > 0.2:
-                result["action"] = "penalize"
-                result["confidence_penalty"] = int(score * 25)
-            # score <= 0.2: Kalman 噪声 → 忽略
-            return result
-
-        # ── 检查2: EMA-Kalman 分歧 (信号逆EMA趋势) ──
-        # v4.5: 弱 Kalman (score≤0.5) 仅降级不扣分 (匹配旧 Phase B 行为)
-        #       强 Kalman (score>0.5) 降级+扣分+提门槛 (匹配旧 Phase B+D 行为)
-        if ema_kalman_conflict:
-            goes_against_ema = (
-                (direction == "LONG" and is_bearish_trend)
-                or (direction == "SHORT" and is_bullish_trend)
-            )
-            strong_kalman = abs(kalman_score) > 0.5
-            if goes_against_ema and strategy == "pullback":
-                result["action"] = "downgrade"
-                result["new_strategy"] = "counter_trend"
-                if strong_kalman:
-                    result["confidence_penalty"] = min(int(abs(kalman_score) * 20), 20)
-                    result["kalman_conflict_for_scorer"] = True
-            elif goes_against_ema:
-                if strong_kalman:
-                    result["action"] = "penalize"
-                    result["confidence_penalty"] = min(int(abs(kalman_score) * 20), 20)
-            # goes_against_ema=False: EMA趋势与信号同向 → 不干预
-            return result
-
-        return result
+        """P3: wrapper → filter_pipeline.resolve_kalman()"""
+        return resolve_kalman(direction, strategy, kalman_dir, kalman_score,
+                              ema_kalman_conflict, is_bearish_trend, is_bullish_trend)
 
     # ==================================================================
     # v4.5→Phase2: 统一平仓出口 — 所有平仓路径的唯一记录点
@@ -941,197 +877,10 @@ class DeepSeekQuantBot:
                               atr: float = 0, close: float = 0,
                               adx: float = 0, vol_ratio: float = 1.0,
                               markov_result: Dict[str, Any] = None) -> Dict[str, Any]:
-        """v4.0: 6 状态市场分类 — 多维度综合 + Markov 长期偏向。
-
-        六状态 → 默认策略映射:
-          strong_bull  → momentum, pullback, ema_cross (顺势做多)
-          bull         → pullback, ema_cross (回调做多+EMA交叉)
-          range        → grid, bollinger, pullback, ema_cross (震荡+温和趋势)
-          bear         → pullback, ema_cross (回调做空+EMA交叉)
-          strong_bear  → momentum, pullback, ema_cross (顺势做空)
-          panic        → 不推荐开仓 (极端波动, 仅观望/减仓)
-
-        输入:
-          - tf_context: 多 TF 趋势上下文 (必需)
-          - atr, close: 用于波动率分级
-          - adx: 趋势强度
-          - vol_ratio: 量比
-          - markov_result: Markov 长期状态 (可选, 用于偏向微调)
-
-        返回 dict (向后兼容, 用 .get("regime") 取标签):
-        """
-        # ── 1. 多 TF 方向共识 ──
-        bull_tfs = 0
-        bear_tfs = 0
-        total_tfs = 0
-        for tf in self.config.higher_timeframes:
-            ctx = tf_context.get(tf, {})
-            trend = ctx.get("trend", "unknown")
-            if trend == "bullish":
-                bull_tfs += 1
-                total_tfs += 1
-            elif trend == "bearish":
-                bear_tfs += 1
-                total_tfs += 1
-
-        # ── 2. 波动率分级 (ATR%) ──
-        atr_pct = (atr / close * 100) if close > 0 else 0
-        # crypto 15m ATR% 通常 0.1%-3%, >2.5% 极端
-        if atr_pct >= 2.5:
-            volatility = "extreme"
-        elif atr_pct >= 1.0:
-            volatility = "high"
-        elif atr_pct >= 0.3:
-            volatility = "normal"
-        else:
-            volatility = "low"
-
-        # ── 3. ADX 趋势强度 ──
-        if adx >= 25:
-            adx_tier = "strong"
-        elif adx >= 20:
-            adx_tier = "moderate"
-        else:
-            adx_tier = "weak"
-
-        # ── 4. 方向判断 ──
-        if bull_tfs > bear_tfs:
-            direction = "bullish"
-            consensus = bull_tfs / max(total_tfs, 1)
-        elif bear_tfs > bull_tfs:
-            direction = "bearish"
-            consensus = bear_tfs / max(total_tfs, 1)
-        else:
-            direction = "neutral"
-            consensus = 0.0
-
-        # ── 5. Markov 长期偏向 (可选) ──
-        markov_bias = 0.0
-        if markov_result and markov_result.get("confidence", 0) >= 40:
-            markov_bias = markov_result.get("signal", 0)  # -1.0 ~ +1.0
-
-        # ── 6. 六状态分类 ──
-        regime = "range"
-        recommended = []
-        detail_parts = []
-
-        # Panic: 极端波动 → 不推荐开仓
-        if volatility == "extreme":
-            regime = "panic"
-            recommended = []
-            detail_parts.append("🚨极端波动-仅观望/减仓")
-
-        # Strong Bull: 全TF看涨 + ADX强势 + 高共识
-        elif direction == "bullish" and consensus >= 1.0 and adx_tier == "strong":
-            regime = "strong_bull"
-            recommended = ["momentum", "pullback", "ema_cross"]
-            detail_parts.append("🐂强牛市-顺势做多")
-
-        # Strong Bear: 全TF看跌 + ADX强势 + 高共识
-        elif direction == "bearish" and consensus >= 1.0 and adx_tier == "strong":
-            regime = "strong_bear"
-            recommended = ["momentum", "pullback", "ema_cross"]
-            detail_parts.append("🐻强熊市-顺势做空")
-
-        # Bull: 多数TF看涨
-        elif direction == "bullish" and consensus >= 0.5:
-            regime = "bull"
-            recommended = ["pullback", "ema_cross"]
-            if adx_tier == "strong":
-                recommended.insert(0, "momentum")
-            detail_parts.append("📈牛市-回调做多+EMA交叉")
-
-        # Bear: 多数TF看跌
-        elif direction == "bearish" and consensus >= 0.5:
-            regime = "bear"
-            recommended = ["pullback", "ema_cross"]
-            if adx_tier == "strong":
-                recommended.insert(0, "momentum")
-            detail_parts.append("📉熊市-回调做空+EMA交叉")
-
-        # Range: 无明确方向
-        else:
-            regime = "range"
-            # v4.1 fix: range市场也允许ema_cross — 震荡≠完全横盘，
-            # 当前很多"range"实际是温和偏向市场(EMA>200), ema_cross能捕捉小趋势
-            if volatility == "low":
-                recommended = ["grid", "bollinger", "pullback", "ema_cross"]
-                detail_parts.append("📊低波震荡-网格/布林/回调/EMA交叉")
-            else:
-                recommended = ["pullback", "bollinger", "ema_cross"]
-                # ADX强势时震荡突破有效，momentum也可用
-                if adx_tier == "strong":
-                    recommended.append("momentum")
-                detail_parts.append("📊震荡市-回调/布林/EMA交叉")
-
-        # ── 7. Markov 长期偏向微调 ──
-        if markov_bias > 0.3 and regime in ("range", "bear"):
-            detail_parts.append(f"Markov偏多({markov_bias:.2f})→升一级")
-            if regime == "bear":
-                regime = "range"
-                recommended = ["pullback", "bollinger", "ema_cross"]
-            elif regime == "range" and direction != "bearish":
-                regime = "bull"
-                recommended = ["pullback", "ema_cross"]
-        elif markov_bias < -0.3 and regime in ("range", "bull"):
-            detail_parts.append(f"Markov偏空({markov_bias:.2f})→降一级")
-            if regime == "bull":
-                regime = "range"
-                recommended = ["pullback", "bollinger", "ema_cross"]
-            elif regime == "range" and direction != "bullish":
-                regime = "bear"
-                recommended = ["pullback", "counter_trend"]
-
-        # ── 8. 允许方向 (v4.5: 吸收 _check_trend_alignment，统一趋势过滤) ──
-        # 每个 TF 仅在 trending 时约束方向；ranging TF 不投票
-        # 例如: 1h=bearish(trending) + 4h=bullish(trending) → 两个方向都被禁止
-        #       1h=bearish(trending) + 4h=ranging → 仅禁止 LONG
-        allowed_long = True
-        allowed_short = True
-        for tf in self.config.higher_timeframes:
-            ctx = tf_context.get(tf, {})
-            trend_tf = ctx.get("trend", "unknown")
-            regime_tf = ctx.get("regime", "unknown")
-            if regime_tf == "ranging" or trend_tf == "unknown":
-                continue  # 震荡TF不约束方向
-            if trend_tf == "bearish":
-                allowed_long = False
-            elif trend_tf == "bullish":
-                allowed_short = False
-        allowed_directions = []
-        if allowed_long:
-            allowed_directions.append("LONG")
-        if allowed_short:
-            allowed_directions.append("SHORT")
-        if not allowed_directions:
-            detail_parts.append("⚠️双向禁止-仅平仓")
-
-        # ── 9. 量比调整 ──
-        if vol_ratio > 2.0:
-            detail_parts.append(f"放量{vol_ratio:.1f}x")
-        elif vol_ratio < 0.5 and vol_ratio > 0:
-            detail_parts.append("缩量-谨慎")
-
-        # ── 10. 置信度 ──
-        confidence = 70 if consensus >= 1.0 else (55 if consensus >= 0.5 else 40)
-        # v4.5: ADX 不再独立加分 — trend_strength 已通过 Regime 分类和推荐策略体现
-        # 三重冗余修复: 移除 (1)信号层硬过滤 (2)此处的 Confidence 加分, 保留 (3)Regime 分类
-        if volatility == "extreme":
-            confidence = 85
-
-        return {
-            "regime": regime,
-            "direction": direction,
-            "volatility": volatility,
-            "trend_strength": adx_tier,
-            "atr_pct": round(atr_pct, 3),
-            "consensus": round(consensus, 2),
-            "recommended": recommended,
-            "allowed_directions": allowed_directions,  # v4.5: 统一方向过滤
-            "confidence": min(100, confidence),
-            "detail": " | ".join(detail_parts),
-            "markov_bias": round(markov_bias, 3),
-        }
+        """P3: wrapper → filter_pipeline.detect_market_regime()"""
+        return detect_market_regime(
+            tf_context, self.config.higher_timeframes,
+            atr, close, adx, vol_ratio, markov_result)
 
     # ==================================================================
     # v3.6: AI 持仓审核
@@ -1364,68 +1113,42 @@ class DeepSeekQuantBot:
             # 被动降级不应受counter_trend的极端RSI门槛限制
             _original_strategy = strategy
 
-            # 回调策略：趋势中等待回调 (v3.7: 干旱时自适应放宽)
-            if close > ema and rsi < effective_oversold:
-                direction = "LONG"
-                strategy = "pullback"
-            elif close < ema and rsi > effective_overbought:
-                direction = "SHORT"
-                strategy = "pullback"
+            # ── ③ 回调策略 (P3: extracted → evaluate_pullback) ──
+            pullback_signal = evaluate_pullback(
+                close, ema, rsi, effective_oversold, effective_overbought)
+            if pullback_signal:
+                direction = pullback_signal["direction"]
+                strategy = pullback_signal["strategy"]
 
-            # ── ④ 动量突破策略 (v2.4): 顺势追涨 + v3.2: 顺势追跌 ──
-            if direction is None and self.config.momentum_enabled:
-                # 做多动量：价格>EMA50 + ADX强 + RSI在动量区 + 突破近期高点
-                if close > ema and rsi > self.config.momentum_rsi_min and rsi < self.config.momentum_rsi_max and adx > self.config.momentum_adx_threshold:
-                    momentum_ema = float(df["close"].ewm(span=self.config.momentum_ema_period, adjust=False).mean().iloc[cidx])  # v4.5: 已闭合K线
-                    if close > momentum_ema:
-                        recent_high = float(df["high"].tail(self.config.momentum_breakout_bars).max())
-                        if close >= recent_high * 0.998:
-                            direction = "LONG"
-                            strategy = "momentum"
-                # v3.2: 做空动量：价格<EMA50 + ADX强 + RSI在弱势动量区 + 跌破近期低点
-                elif close < ema and rsi < (100 - self.config.momentum_rsi_min) and rsi > (100 - self.config.momentum_rsi_max) and adx > self.config.momentum_adx_threshold:
-                    momentum_ema = float(df["close"].ewm(span=self.config.momentum_ema_period, adjust=False).mean().iloc[cidx])  # v4.5: 已闭合K线
-                    if close < momentum_ema:
-                        recent_low = float(df["low"].tail(self.config.momentum_breakout_bars).min())
-                        if close <= recent_low * 1.002:
-                            direction = "SHORT"
-                            strategy = "momentum"
-
-            # ── v3.7: ⑤ EMA 交叉策略 —— 快慢线金叉死叉 ──
-            if direction is None and self.config.momentum_enabled:
-                ema_fast = float(df["close"].ewm(span=9, adjust=False).mean().iloc[cidx])       # v4.5: 已闭合K线
-                ema_slow = float(df["close"].ewm(span=21, adjust=False).mean().iloc[cidx])      # v4.5: 已闭合K线
-                ema_fast_prev = float(df["close"].ewm(span=9, adjust=False).mean().iloc[cidx - 1])
-                ema_slow_prev = float(df["close"].ewm(span=21, adjust=False).mean().iloc[cidx - 1])
-                # 金叉: 快线上穿慢线
-                if ema_fast_prev <= ema_slow_prev and ema_fast > ema_slow:
-                    # 额外确认: 价格 > EMA200 (多头环境) 或 RSI 不超买
-                    if close > ema200 or rsi < 60:
-                        direction = "LONG"
-                        strategy = "ema_cross"
-                # 死叉: 快线下穿慢线
-                elif ema_fast_prev >= ema_slow_prev and ema_fast < ema_slow:
-                    if close < ema200 or rsi > 40:
-                        direction = "SHORT"
-                        strategy = "ema_cross"
-
-            # ── v3.7: ⑥ 布林带均值回归 —— 震荡市触碰轨道反弹 ──
+            # ── ④ 动量突破策略 (P3: extracted → evaluate_momentum) ──
             if direction is None:
-                bb_std = float(df["close"].rolling(20).std().iloc[cidx])   # v4.5: 已闭合K线
-                bb_mid = float(df["close"].rolling(20).mean().iloc[cidx])  # v4.5: 已闭合K线
-                bb_upper = bb_mid + 2 * bb_std
-                bb_lower = bb_mid - 2 * bb_std
-                bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
-                # 布林带收窄 (<2%) → 突破在即 → 跳过，不加反向信号
-                if bb_width > 0.02:
-                    # 价格跌破下轨 → 超卖反弹做多 (需 RSI 不极端)
-                    if close <= bb_lower and rsi < 45 and rsi > 20:
-                        direction = "LONG"
-                        strategy = "bollinger"
-                    # 价格突破上轨 → 超买回调做空 (需 RSI 不极端)
-                    elif close >= bb_upper and rsi > 55 and rsi < 80:
-                        direction = "SHORT"
-                        strategy = "bollinger"
+                momentum_signal = evaluate_momentum(
+                    close, ema, rsi, adx, df, cidx,
+                    self.config.momentum_enabled,
+                    self.config.momentum_rsi_min,
+                    self.config.momentum_rsi_max,
+                    self.config.momentum_adx_threshold,
+                    self.config.momentum_ema_period,
+                    self.config.momentum_breakout_bars,
+                )
+                if momentum_signal:
+                    direction = momentum_signal["direction"]
+                    strategy = momentum_signal["strategy"]
+
+            # ── ⑤ EMA 交叉策略 (P3: extracted → evaluate_ema_cross) ──
+            if direction is None:
+                ema_cross_signal = evaluate_ema_cross(
+                    df, cidx, close, ema200, rsi, self.config.momentum_enabled)
+                if ema_cross_signal:
+                    direction = ema_cross_signal["direction"]
+                    strategy = ema_cross_signal["strategy"]
+
+            # ── ⑥ 布林带均值回归 (P3: extracted → evaluate_bollinger) ──
+            if direction is None:
+                bollinger_signal = evaluate_bollinger(df, cidx, close, rsi)
+                if bollinger_signal:
+                    direction = bollinger_signal["direction"]
+                    strategy = bollinger_signal["strategy"]
 
             if direction is None:
                 logger.debug(
