@@ -13,13 +13,14 @@ from config_manager import ConfigManager
 logger = logging.getLogger("QuantBot")
 
 class ExchangeInterface:
-    """Bitget 沙箱对接层：只暴露策略需要的方法"""
+    """Bitget 交易所封装层 (Classic + UTA 双路径)"""
 
     def __init__(self, config: ConfigManager):
         self.config = config
         self.exchange: ccxt.Exchange = self._build_exchange()
         self._trading_fees: Dict[str, float] = {}  # unified symbol -> taker fee
         self._tpsl_cache: Dict[Tuple[str, str, int], Tuple[float, float, float]] = {}  # v4.5: {(symbol, side, entry_int): (sl, tp, ts)} 含方向+entry+TTL
+        self._is_uta = not self.config.is_sandbox  # UTA V3 path for live, Classic for sandbox
         self._load_markets()
         self._load_trading_fees()
 
@@ -118,13 +119,32 @@ class ExchangeInterface:
         if self._cache_fresh(cache_key, 30):
             return self._cache_get(cache_key)
         try:
-            bal = self.exchange.fetch_balance()
-            usdt = bal.get("USDT", {})
-            result = {
-                "free": float(usdt.get("free", 0) or 0),
-                "total": float(usdt.get("total", 0) or 0),
-                "used": float(usdt.get("used", 0) or 0),
-            }
+            if self._is_uta:
+                # UTA V3: /api/v3/account/assets
+                resp = self.exchange.private_uta_get_v3_account_assets({})
+                if resp.get("code") == "00000":
+                    data = resp.get("data", {})
+                    total = float(data.get("usdtEquity", 0) or 0)
+                    assets = data.get("assets", [])
+                    free = total
+                    used = 0.0
+                    for a in assets:
+                        if a.get("coin") == "USDT":
+                            free = float(a.get("available", 0) or 0)
+                            locked = float(a.get("locked", 0) or 0)
+                            used = locked
+                            break
+                    result = {"free": free, "total": total, "used": used}
+                else:
+                    raise RuntimeError(f"UTA balance failed: code={resp.get('code')} msg={resp.get('msg')}")
+            else:
+                bal = self.exchange.fetch_balance()
+                usdt = bal.get("USDT", {})
+                result = {
+                    "free": float(usdt.get("free", 0) or 0),
+                    "total": float(usdt.get("total", 0) or 0),
+                    "used": float(usdt.get("used", 0) or 0),
+                }
             self._cache_set(cache_key, result)
             return result
         except Exception:
@@ -180,6 +200,21 @@ class ExchangeInterface:
 
             total_upnl += upnl
             total_margin += margin
+
+            # v4.5→Phase2: 提取 SL/TP 从持仓 info (place-pos-tpsl 设置后 API 可见)
+            # 热路径不再依赖 fetch_open_orders(stop=True) 判断 TPSL 是否存在
+            raw_info = pos.get("info", {})
+            sl_raw = raw_info.get("stopLoss", raw_info.get("stopLossPrice", ""))
+            tp_raw = raw_info.get("takeProfit", raw_info.get("takeProfitPrice", ""))
+            try:
+                sl_price = float(sl_raw) if sl_raw and str(sl_raw) not in ("0", "", "None") else 0.0
+            except (ValueError, TypeError):
+                sl_price = 0.0
+            try:
+                tp_price = float(tp_raw) if tp_raw and str(tp_raw) not in ("0", "", "None") else 0.0
+            except (ValueError, TypeError):
+                tp_price = 0.0
+
             pos_list.append({
                 "symbol": sym.replace("/USDT:USDT", ""),
                 "side": side,
@@ -188,6 +223,8 @@ class ExchangeInterface:
                 "mark_price": round(mark, 4),
                 "unrealized_pnl": round(upnl, 4),
                 "margin": round(margin, 4),
+                "sl_price": round(sl_price, 4) if sl_price > 0 else 0.0,
+                "tp_price": round(tp_price, 4) if tp_price > 0 else 0.0,
             })
 
         # ccxt total 已包含未实现盈亏 (等于 Bitget accountEquity)，不要重复加
@@ -203,7 +240,7 @@ class ExchangeInterface:
         }
 
     def get_open_positions(self) -> Dict[str, Any]:
-        """返回当前持仓字典 (v2.7: 批量查询，1 次 API 替代 10 次)"""
+        """返回当前持仓字典 (v2.7: 批量查询 + UTA V3)"""
         cache_key = "positions"
         if self._cache_fresh(cache_key, 30):
             cached = self._cache_get(cache_key)
@@ -211,29 +248,65 @@ class ExchangeInterface:
                 return cached
 
         positions: Dict[str, Any] = {}
-        api_ok = False  # v4.1: 标记 API 是否成功
+        api_ok = False
 
-        # ── v2.7: 优先批量查询所有币种 (1 次 API)，失败则逐币种降级 ──
-        try:
-            all_positions = self.exchange.fetch_positions(self.config.SYMBOLS)
-            api_ok = True
-            if all_positions:
-                for p in all_positions:
-                    sym = p.get("symbol", "")
-                    if sym and float(p.get("contracts", 0) or 0) != 0:
-                        positions[sym] = p
-        except Exception:
-            # 降级：逐币种查询
-            for sym in self.config.SYMBOLS:
-                try:
-                    pos = self.exchange.fetch_position(sym)
+        if self._is_uta:
+            # UTA V3: /api/v3/position/current-position
+            try:
+                resp = self.exchange.private_uta_get_v3_position_current_position(
+                    {"category": "USDT-FUTURES"})
+                if resp.get("code") == "00000":
                     api_ok = True
-                    if pos and float(pos.get("contracts", 0) or 0) != 0:
-                        positions[sym] = pos
-                except Exception:
-                    logger.warning("⚠️ 单个持仓查询失败 — 持仓同步可能不完整", exc_info=True)
-            logger.info(f"📊 当前持仓: {list(positions.keys())}")
-        # v4.1 fix: 仅 API 成功时缓存 (防止空结果污染30秒缓存)
+                    for p in resp.get("data", []) or []:
+                        # Normalize UTA V3 fields to Classic format
+                        contracts = float(p.get("available", 0) or 0)
+                        if contracts == 0:
+                            continue
+                        sym_raw = p.get("symbol", "")
+                        sym = sym_raw  # UTA returns e.g. "BTCUSDT"
+                        # Convert "BTCUSDT" → "BTC/USDT:USDT" if needed
+                        if "/" not in sym:
+                            for s in self.config.SYMBOLS:
+                                if s.replace("/USDT:USDT", "").replace("/", "") == sym_raw:
+                                    sym = s
+                                    break
+                        pos_side = p.get("posSide", p.get("holdSide", "long"))
+                        positions[sym] = {
+                            "symbol": sym,
+                            "contracts": contracts,
+                            "unrealizedPnl": float(p.get("unrealizedPL", p.get("unrealizedPnl", 0)) or 0),
+                            "initialMargin": float(p.get("margin", p.get("imr", 0)) or 0),
+                            "entryPrice": float(p.get("openPrice", p.get("avgOpenPrice", p.get("entryPrice", 0))) or 0),
+                            "markPrice": float(p.get("markPrice", 0) or 0),
+                            "side": pos_side,
+                            "info": {
+                                "holdSide": pos_side,
+                                "stopLoss": p.get("stopLossPrice", "0"),
+                                "takeProfit": p.get("takeProfitPrice", "0"),
+                            },
+                        }
+            except Exception:
+                logger.warning("UTA positions failed", exc_info=True)
+        else:
+            # Classic V2 path
+            try:
+                all_positions = self.exchange.fetch_positions(self.config.SYMBOLS)
+                api_ok = True
+                if all_positions:
+                    for p in all_positions:
+                        sym = p.get("symbol", "")
+                        if sym and float(p.get("contracts", 0) or 0) != 0:
+                            positions[sym] = p
+            except Exception:
+                for sym in self.config.SYMBOLS:
+                    try:
+                        pos = self.exchange.fetch_position(sym)
+                        api_ok = True
+                        if pos and float(pos.get("contracts", 0) or 0) != 0:
+                            positions[sym] = pos
+                    except Exception:
+                        logger.warning("single position fetch failed", exc_info=True)
+
         if api_ok:
             self._cache_set(cache_key, positions)
         return positions
@@ -452,44 +525,38 @@ class ExchangeInterface:
 
     def fetch_closed_position_pnl(self, symbol: str,
                                    since: float = None) -> Optional[Dict]:
-        """
-        v4.0: 从 Bitget V2 持仓历史 API 获取最近已平仓的真实 PnL。
-        参考: https://www.bitget.com/api-doc/contract/position/Get-History-Position
-
-        symbol: "BTC/USDT:USDT"
-        since:   Unix 时间戳 (秒), 查询此后平仓的仓位
-        Returns: {"pnl": float, "net_profit": float, "funding_fee": float,
-                  "exit_price": float, "fee": float, "open_fee": float,
-                  "position_id": str, "holding_ms": int}
-        P0: 新增 net_profit (净利润), funding_fee (totalFunding), position_id
-        """
+        """获取最近已平仓的真实 PnL (Classic V2 or UTA V3)"""
         try:
-            params = {
-                "symbol": symbol.replace("/USDT:USDT", "USDT"),
-                "productType": "usdt-futures",
-                "limit": "3",
-            }
-            if since:
-                params["startTime"] = str(int(since * 1000))
-            # V2 API: GET /api/v2/mix/position/history-position
-            resp = self.exchange.privateMixGetV2MixPositionHistoryPosition(params)
+            raw_symbol = symbol.replace("/USDT:USDT", "USDT")
+            if self._is_uta:
+                # UTA V3: /api/v3/position/history-position
+                params = {"category": "USDT-FUTURES", "symbol": raw_symbol, "limit": "3"}
+                if since:
+                    params["startTime"] = str(int(since * 1000))
+                resp = self.exchange.private_uta_get_v3_position_history_position(params)
+            else:
+                # Classic V2
+                params = {"symbol": raw_symbol, "productType": "usdt-futures", "limit": "3"}
+                if since:
+                    params["startTime"] = str(int(since * 1000))
+                resp = self.exchange.privateMixGetV2MixPositionHistoryPosition(params)
+
             if isinstance(resp, dict) and resp.get("code") == "00000":
-                records = resp.get("data", {}).get("list", [])
+                records = resp.get("data", {}).get("list", resp.get("data", []))
                 if not records:
                     return None
                 latest = records[0]
                 return {
                     "pnl": float(latest.get("pnl", 0) or 0),
-                    "net_profit": float(latest.get("netProfit", 0) or 0),    # P0: 净利润 (已扣 fee+funding)
-                    "funding_fee": float(latest.get("totalFunding", 0) or 0), # P0: 累计资金费率
+                    "net_profit": float(latest.get("netProfit", 0) or 0),
+                    "funding_fee": float(latest.get("totalFunding", 0) or 0),
                     "exit_price": float(latest.get("closeAvgPrice", 0) or 0),
                     "fee": float(latest.get("closeFee", 0) or 0),
                     "open_fee": float(latest.get("openFee", 0) or 0),
-                    "position_id": latest.get("positionId", ""),              # P0: 仓位 ID (审计追溯)
+                    "position_id": latest.get("positionId", ""),
                     "holding_ms": int(latest.get("holdTime", 0) or 0),
                 }
-            # V2 返回非 00000 (非错误情况: 无记录等)
-            logger.debug(f"📊 history-position V2: code={resp.get('code')} msg={resp.get('msg','')}")
+            logger.debug("history-position: code=" + str(resp.get("code")))
             return None
         except Exception as e:
             logger.debug(f"📊 获取 {symbol} 平仓历史失败: {e}")
