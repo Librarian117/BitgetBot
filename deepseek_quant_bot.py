@@ -703,12 +703,19 @@ class DeepSeekQuantBot:
             except Exception:
                 pass
 
-            # ── STEP 6: 取消残留计划单 ──
+            # ── STEP 6: 取消已平仓仓位的 TPSL (仅孤立单, 不影响其他活跃持仓) ──
             try:
-                for o in (self.exchange.exchange.fetch_open_orders(
-                    sym_full, params={"stop": True}) or []):
-                    if self.exchange._is_reduce_only(o):
-                        self.exchange.cancel_order(str(o.get('id', '')), sym_full)
+                if hasattr(self.exchange, '_uta_cancel_orphan_tpsl'):
+                    # UTA V3: 只取消当前 symbol+side 的 TPSL
+                    raw_sym = sym_full.split(":")[0].replace("/", "")
+                    active_set = {(raw_sym, side.lower())}
+                    self.exchange._uta_cancel_orphan_tpsl(active_set)
+                else:
+                    # Classic V2 fallback
+                    for o in (self.exchange.exchange.fetch_open_orders(
+                        sym_full, params={"stop": True}) or []):
+                        if self.exchange._is_reduce_only(o):
+                            self.exchange.cancel_order(str(o.get('id', '')), sym_full)
             except Exception:
                 pass
 

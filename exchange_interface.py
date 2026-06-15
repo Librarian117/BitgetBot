@@ -400,7 +400,7 @@ class ExchangeInterface:
                     raw_data = resp.get("data", []) or []
                     # UTA returns: dict{} (0 pos), list (old), or dict{"list": [...]} (new)
                     if isinstance(raw_data, dict):
-                        pos_list = raw_data.get("list", [])
+                        pos_list = raw_data.get("list") or []
                     elif isinstance(raw_data, list):
                         pos_list = raw_data
                     else:
@@ -459,6 +459,76 @@ class ExchangeInterface:
         if api_ok:
             self._cache_set(cache_key, positions)
         return positions
+
+    # ── UTA V3 TPSL Lifecycle ──────────────────────────────────────
+    def _uta_get_active_tpsl(self, symbol: str = None) -> Dict[str, Dict]:
+        """UTA V3: 查询所有活跃策略单 → TPSL source-of-truth
+
+        返回 {(symbol, posSide): {sl, tp, orderId}} dict。
+        position.info 不含 stopLoss/takeProfit，此方法为唯一可信来源。
+        """
+        result = {}
+        try:
+            params = {"category": "USDT-FUTURES"}
+            if symbol:
+                raw_sym = symbol.split(":")[0].replace("/", "")
+                params["symbol"] = raw_sym
+            resp = self.exchange.private_uta_get_v3_trade_unfilled_strategy_orders(params)
+            if resp.get("code") != "00000":
+                return result
+            data = resp.get("data", {})
+            orders = data.get("list") or [] if isinstance(data, dict) else []
+            for o in orders:
+                sym = o.get("symbol", "")
+                ps = o.get("posSide", "")
+                sl = float(o.get("stopLoss", 0) or 0)
+                tp = float(o.get("takeProfit", 0) or 0)
+                key = (sym, ps)
+                existing = result.get(key)
+                if not existing or (sl > 0 and not existing.get("sl")):
+                    result[key] = {
+                        "symbol": sym,
+                        "posSide": ps,
+                        "sl": sl if sl > 0 else (existing.get("sl", 0) if existing else 0),
+                        "tp": tp if tp > 0 else (existing.get("tp", 0) if existing else 0),
+                        "orderId": o.get("orderId", ""),
+                    }
+        except Exception:
+            logger.warning("UTA TPSL query failed", exc_info=True)
+        return result
+
+    def _uta_cancel_orphan_tpsl(self, active_positions: set) -> int:
+        """取消无对应持仓的孤立 TPSL 策略单。返回取消数量。"""
+        cancelled = 0
+        try:
+            all_tpsl = self._uta_get_active_tpsl()
+            for key, tpsl in all_tpsl.items():
+                sym_raw, ps = key
+                # 检查是否有对应持仓
+                has_pos = False
+                for pos_key in active_positions:
+                    pos_sym = pos_key[0].split(":")[0].replace("/", "")
+                    pos_ps = pos_key[1]
+                    if pos_sym == sym_raw and pos_ps == ps:
+                        has_pos = True
+                        break
+                if not has_pos:
+                    try:
+                        oid = tpsl.get("orderId", "")
+                        if oid:
+                            raw_sym = sym_raw
+                            self.exchange.private_uta_post_v3_trade_cancel_strategy_order({
+                                "category": "USDT-FUTURES",
+                                "symbol": raw_sym,
+                                "orderId": oid,
+                            })
+                            cancelled += 1
+                            logger.info(f"🧹 取消孤立TPSL: {raw_sym} {ps} oid={oid[:16]}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 取消TPSL失败 {sym_raw}: {e}")
+        except Exception:
+            logger.warning("orphan TPSL cleanup failed", exc_info=True)
+        return cancelled
 
     def count_open_positions(self) -> int:
         """快速查询持仓数量"""
@@ -794,14 +864,26 @@ class ExchangeInterface:
         检测持仓是否有 SL/TP 保护。
 
         方法:
-          0. (v4.5) 内存缓存 — 沙箱 pos-tpsl 成功但 API 不可见时信任缓存
-          1. (主力) fetch_positions → info.stopLoss/takeProfit — 实盘返回
-          2. (兜底) fetch_open_orders(stop=True) — 独立计划单
+          0. (UTA V3) unfilled_strategy_orders — TPSL source-of-truth
+          1. (v4.5) 内存缓存 — 沙箱 pos-tpsl 成功但 API 不可见时信任缓存
+          2. (Classic) fetch_positions → info.stopLoss/takeProfit
+          3. (Classic 兜底) fetch_open_orders(stop=True)
 
         side: "buy"/"LONG" 或 "sell"/"SHORT"
         返回 (has_sl, has_tp)
         """
         has_sl, has_tp = False, False
+
+        # 方法0: UTA V3 — unfilled_strategy_orders 为 TPSL SSoT
+        if getattr(self, '_is_uta', False):
+            side_norm = "long" if str(side).upper() in ("BUY", "LONG") else "short"
+            raw_sym = symbol.split(":")[0].replace("/", "")
+            tpsl_map = self._uta_get_active_tpsl(symbol)
+            tpsl = tpsl_map.get((raw_sym, side_norm))
+            if tpsl:
+                has_sl = tpsl.get("sl", 0) > 0
+                has_tp = tpsl.get("tp", 0) > 0
+            return (has_sl, has_tp)
 
         # 方法0: v4.5 内存缓存 — 沙箱 set_position_sl_tp 的 code=00000 信任
         # 缓存键: (symbol, side, entry_int) — 含entry防同方向不同价位的缓存穿越
