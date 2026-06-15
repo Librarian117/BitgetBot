@@ -398,8 +398,13 @@ class ExchangeInterface:
                 if resp.get("code") == "00000":
                     api_ok = True
                     raw_data = resp.get("data", []) or []
-                    # UTA returns dict (0 pos) or list (1+ pos)
-                    pos_list = raw_data if isinstance(raw_data, list) else []
+                    # UTA returns: dict{} (0 pos), list (old), or dict{"list": [...]} (new)
+                    if isinstance(raw_data, dict):
+                        pos_list = raw_data.get("list", [])
+                    elif isinstance(raw_data, list):
+                        pos_list = raw_data
+                    else:
+                        pos_list = []
                     for p in pos_list:
                         # Normalize UTA V3 fields to Classic format
                         contracts = float(p.get("available", 0) or 0)
