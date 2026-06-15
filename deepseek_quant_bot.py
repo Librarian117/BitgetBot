@@ -41,7 +41,9 @@ from exchange_interface import ExchangeInterface
 from quant_math import compute_quant_signals
 from session_manager import SessionManager
 from strategy_engine import evaluate_pullback, evaluate_momentum, evaluate_ema_cross, evaluate_bollinger  # P3
-from filter_pipeline import resolve_kalman, detect_market_regime  # P3
+from filter_pipeline import (resolve_kalman, detect_market_regime,
+                            filter_volume, adjust_direction_bias,
+                            filter_btc_linkage)  # P3
 from trade_executor import TradeExecutor
 
 # ── Phase 1: 服务类提取 ──
@@ -664,12 +666,14 @@ class DeepSeekQuantBot:
                 api_net_profit = real_pnl.get("net_profit", 0)  # P0: 审计口径
                 funding_fee = api_funding  # Bitget totalFunding 字段
             else:
+                # v4.5→Phase2: Bitget fee 为负值 (openFee/closeFee < 0 = 支出)
+                # FALLBACK 路径: pnl = upl - est_fee (已扣费), api_fee 统一为负值
                 est_fee = entry * abs(contracts) * csize * taker_fee * 2
                 pnl = upl - est_fee
                 pnl_source = "FALLBACK"
                 exit_price = 0
-                api_fee = est_fee
-                api_net_profit = 0  # P0: FALLBACK 无 netProfit
+                api_fee = -est_fee              # 负值 = 支出 (与 API 路径一致)
+                api_net_profit = pnl             # FALLBACK: pnl 已扣费 → net_profit = pnl
                 # FALLBACK: 尝试从持仓 API 获取 funding fee
                 try:
                     funding_fee = self.exchange.fetch_position_funding_fee(sym_full)
@@ -775,7 +779,7 @@ class DeepSeekQuantBot:
                 "entry": entry, "exit": final_exit_price,
                 "pnl": pnl, "pnl_pct": pnl_pct,
                 "fee": api_fee, "funding": funding_fee,
-                "net_profit": api_net_profit if pnl_source == "API" else 0,
+                "net_profit": api_net_profit,
                 "close_reason": close_reason, "pnl_source": pnl_source,
                 "open_ts": open_ts, "close_ts": time.time(),
                 "duration_min": dur_min,
@@ -887,11 +891,12 @@ class DeepSeekQuantBot:
     # ==================================================================
     def _review_open_positions(self, positions_detail: list):
         """
-        v3.6: 定期审查所有持仓，AI 判断是否应提前平仓。
+        v4.5→Phase2: 规则引擎持仓审查 — 定期检查已持仓是否需要提前平仓。
+        AI 决策层已禁用 (v4.1); 所有出场决策由硬编码规则引擎完成。
         每 N 轮执行一次（默认 N=3，即每15分钟）。
-        仅审查 ROI > ai_position_review_min_roi 的仓位。
+        仅审查 ROI > rule_exit_review_min_roi 的仓位。
         """
-        logger.info(f"🔍 持仓检查 (规则引擎+AI解释): {len(positions_detail)} 个持仓 …")
+        logger.info(f"🔍 持仓审查 (规则引擎, AI决策层已禁用): {len(positions_detail)} 个持仓 …")
 
         for pos_d in positions_detail:
             symbol = pos_d.get("symbol", "")
@@ -909,8 +914,8 @@ class DeepSeekQuantBot:
             roi = upl / margin if margin > 0 else 0
 
             # 只审核有显著浮盈或浮亏的仓位（跳过接近 0 的）
-            if abs(roi) < self.config.ai_position_review_min_roi:
-                logger.debug(f"🔍 {symbol} ROI={roi*100:.1f}% < {self.config.ai_position_review_min_roi*100:.0f}%，跳过审核")
+            if abs(roi) < self.config.rule_exit_review_min_roi:
+                logger.debug(f"🔍 {symbol} ROI={roi*100:.1f}% < {self.config.rule_exit_review_min_roi*100:.0f}%，跳过审核")
                 continue
 
             try:
@@ -937,7 +942,7 @@ class DeepSeekQuantBot:
                     decision, reason = "CLOSE", f"僵尸仓规则-持仓{holding_hours:.0f}h"
                     rule_exit_reason = "RULE_STALE"
 
-                # ── v4.1: 规则引擎决策 (AI 出场审核已移除 —— 全部解析失败) ──
+                # ── v4.5→Phase2: 规则引擎决策 (AI 出场审核已永久禁用) ──
                 self.tlogger.log_rule_exit_review(
                     symbol=symbol, direction=side,
                     decision=decision, reason=reason,
@@ -1023,25 +1028,18 @@ class DeepSeekQuantBot:
             session = SessionManager.get_session(
                 self.config.adx_threshold, self.config.vol_ratio_threshold)
 
-            # ── ② 成交量确认 (沙箱跳过——量数据不可靠；实盘严格过滤) ──
-            if not self.config.is_sandbox:
-                try:
-                    cur_vol = float(df["volume"].iloc[cidx])  # v4.5: 已闭合K线
-                    avg_vol = float(df["volume"].tail(20).mean())
-                    vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
-                except Exception:
-                    vol_ratio = 1.0
-                if vol_ratio < session["vol_ratio"]:
-                    logger.debug(
-                        f"{symbol} 量比={vol_ratio:.2f} < {session['vol_ratio']} "
-                        f"({session['label']})，跳过"
-                    )
-                    self.tlogger.log_vol_skip(symbol, vol_ratio)
-                    self.tlogger.log_filter_reject(symbol, "VOL_TOO_LOW",
-                        f"VolRatio={vol_ratio:.2f}<{session['vol_ratio']}")
-                    return None
-            else:
-                vol_ratio = 1.0  # 沙箱默认通过
+            # ── ② 成交量确认 (P3-B: wrapper → filter_pipeline.filter_volume) ──
+            vol_result = filter_volume(df, cidx, session, self.config.is_sandbox)
+            vol_ratio = vol_result["vol_ratio"]
+            if not vol_result["passed"]:
+                logger.debug(
+                    f"{symbol} 量比={vol_ratio:.2f} < {session['vol_ratio']} "
+                    f"({session['label']})，跳过"
+                )
+                self.tlogger.log_vol_skip(symbol, vol_ratio)
+                self.tlogger.log_filter_reject(symbol, "VOL_TOO_LOW",
+                    f"VolRatio={vol_ratio:.2f}<{session['vol_ratio']}")
+                return None
 
             # ── v3.6: 趋势方向校验 (EMA50 vs EMA200) ──
             # v4.5: 使用已闭合K线，与信号生成保持一致
@@ -1090,21 +1088,14 @@ class DeepSeekQuantBot:
                 )
                 kalman_ema_disagree = True  # v4.3: 标记冲突, 后续降分+降级
 
-            # v4.3: 大趋势偏向 — Kalman 冲突时降级而非硬拒绝
-            bearish_bias = is_bearish_trend
-            bullish_bias = is_bullish_trend
-            # 当EMA和Kalman冲突时, 不硬阻止 — 改在方向检查处降分+降级
-            block_long = bearish_bias and not kalman_ema_disagree
-            block_short = bullish_bias and not kalman_ema_disagree
-            if bearish_bias:
-                # 熊市: 做空门槛从 overbought 降到 overbought-10 (最低45)
-                effective_overbought = max(45, effective_overbought - 10)
-                # 做多需要更深超卖
-                effective_oversold = max(10, effective_oversold - 5)
-            elif bullish_bias:
-                # 牛市: 做多门槛从 oversold 升到 oversold+10 (最高55)
-                effective_oversold = min(55, effective_oversold + 10)
-                effective_overbought = min(85, effective_overbought + 5)
+            # v4.3: 大趋势偏向 (P3-B: wrapper → filter_pipeline.adjust_direction_bias)
+            bias = adjust_direction_bias(
+                is_bearish_trend, is_bullish_trend, kalman_ema_disagree,
+                effective_oversold, effective_overbought)
+            block_long = bias["block_long"]
+            block_short = bias["block_short"]
+            effective_oversold = bias["effective_oversold"]
+            effective_overbought = bias["effective_overbought"]
 
             # ── ③ 信号初筛 ──
             direction = None
@@ -2475,43 +2466,25 @@ class DeepSeekQuantBot:
         if btc_change is not None:
             logger.info(f"📊 BTC {self.config.btc_filter_timeframe} 涨跌幅: {btc_change*100:+.2f}%")
 
-            filtered_candidates = []
-            for sig in candidates:
-                symbol = sig["symbol"]
-                direction = sig["direction"]
-
-                if "BTC" in symbol:
-                    filtered_candidates.append(sig)
-                    continue
-
-                if (direction == "LONG" and
-                        btc_change < self.config.btc_drop_block_long):
-                    logger.warning(
-                        f"⏭️  {symbol} {direction} 因 BTC 暴跌 {btc_change*100:+.1f}% 被拦截"
-                    )
-                    self.tlogger.log_btc_filter(
-                        symbol, direction, btc_change, "btc_drop_block_long"
-                    )
-                    self.stats["btc_filters"] += 1
-                    continue
-                if (direction == "SHORT" and
-                        btc_change > self.config.btc_pump_block_short):
-                    logger.warning(
-                        f"⏭️  {symbol} {direction} 因 BTC 暴涨 {btc_change*100:+.1f}% 被拦截"
-                    )
-                    self.tlogger.log_btc_filter(
-                        symbol, direction, btc_change, "btc_pump_block_short"
-                    )
-                    self.stats["btc_filters"] += 1
-                    continue
-
-                filtered_candidates.append(sig)
-
-            if len(filtered_candidates) < len(candidates):
-                logger.info(
-                    f"📊 BTC 过滤: {len(candidates)} → {len(filtered_candidates)} 个候选"
+            # P3-B: wrapper → filter_pipeline.filter_btc_linkage
+            btc_result = filter_btc_linkage(
+                candidates, btc_change,
+                self.config.btc_drop_block_long, self.config.btc_pump_block_short)
+            candidates = btc_result["passed"]
+            for blocked in btc_result["blocked"]:
+                logger.warning(
+                    f"⏭️  {blocked['symbol']} {blocked['direction']} "
+                    f"因 BTC {'暴跌' if 'drop' in blocked['reason'] else '暴涨'} "
+                    f"{btc_change*100:+.1f}% 被拦截"
                 )
-            candidates = filtered_candidates
+                self.tlogger.log_btc_filter(
+                    blocked["symbol"], blocked["direction"], btc_change, blocked["reason"])
+                self.stats["btc_filters"] += 1
+            if btc_result["blocked"]:
+                logger.info(
+                    f"📊 BTC 过滤: {len(candidates) + len(btc_result['blocked'])} "
+                    f"→ {len(candidates)} 个候选"
+                )
         else:
             btc_change = None  # 无法获取BTC数据时跳过滤镜
 
@@ -2714,9 +2687,9 @@ class DeepSeekQuantBot:
             self.config.adx_threshold, self.config.vol_ratio_threshold)
         if session_live.get("name") == "weekend_dead":
             logger.info(f"🛑 周末凌晨({session_live['label']})低流动性，本轮只平仓不开仓")
-            # 仍然执行持仓检查 (规则引擎平仓 + AI 解释)
-            if self.config.ai_position_review_enabled and acct.get("positions_detail"):
-                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
+            # 仍然执行持仓检查 (规则引擎平仓，AI决策层已禁用)
+            if self.config.rule_exit_review_enabled and acct.get("positions_detail"):
+                if self.total_scans > 0 and self.total_scans % self.config.rule_exit_review_interval == 0:
                     self._review_open_positions(acct["positions_detail"])
             # 扫描生成信号但不执行
             candidates = self.scan_all()
@@ -2760,7 +2733,7 @@ class DeepSeekQuantBot:
         return {"blocked": False, "reason": "ok"}
 
     def _phase_position_protect(self, acct, session):
-        """持仓保护: 移动止损+锁仓+浮亏止损+僵尸仓退出+波动熔断+AI审核+订单清理+TPSL检查"""
+        """持仓保护: 移动止损+锁仓+浮亏止损+僵尸仓退出+波动熔断+规则审核+订单清理+TPSL检查"""
         # ── v3.2: 移动止损检查 ──
         if self.trailing_sl and acct.get("positions_detail"):
             for pos_d in acct["positions_detail"]:
@@ -2768,16 +2741,32 @@ class DeepSeekQuantBot:
                 side = pos_d["side"]
                 mark = pos_d["mark_price"]
                 entry = pos_d["entry_price"]
-                # 获取当前 SL
+                # 获取当前 SL (v4.5→Phase2: 修复 source-of-truth — 优先 position.info 而非 fetch_open_orders)
                 try:
-                    stop_ords = self.exchange.fetch_open_orders(sym_full)
-                    current_sl = None
-                    for o in stop_ords:
-                        if self.exchange._is_reduce_only(o) and o.get("type") == "market":
-                            t = float(o.get("info", {}).get("triggerPrice", 0) or 0)
-                            if (side == "LONG" and t < mark) or (side == "SHORT" and t > mark):
-                                current_sl = t
-                                break
+                    # Layer 1: 从 positions_detail 读取 (info.stopLoss, 已在 get_account_summary 提取)
+                    current_sl = float(pos_d.get("sl_price", 0) or 0)
+                    # Layer 1b: positions_detail 无数据 → 直接查缓存的原始持仓
+                    if current_sl <= 0:
+                        try:
+                            raw_positions = self.exchange.get_open_positions()
+                            raw_pos = raw_positions.get(sym_full, {})
+                            raw_info = raw_pos.get("info", {})
+                            sl_raw = raw_info.get("stopLoss", raw_info.get("stopLossPrice", ""))
+                            if sl_raw and str(sl_raw) not in ("0", "", "None"):
+                                current_sl = float(sl_raw)
+                        except Exception:
+                            pass
+                    # Layer 2: 兜底 — 独立计划单 (非 pos-tpsl 场景, 如 _set_sl_tp_via_plan_orders 降级)
+                    if current_sl <= 0:
+                        stop_ords = self.exchange.exchange.fetch_open_orders(
+                            sym_full, params={"stop": True}
+                        )
+                        for o in (stop_ords or []):
+                            if self.exchange._is_reduce_only(o) and o.get("type") == "market":
+                                t = float(o.get("info", {}).get("triggerPrice", 0) or 0)
+                                if (side == "LONG" and t < mark) or (side == "SHORT" and t > mark):
+                                    current_sl = t
+                                    break
                     if current_sl:
                         try:
                             df = self.indicator.compute_all(
@@ -2791,24 +2780,9 @@ class DeepSeekQuantBot:
                             )
                             if new_sl:
                                 # 找到现有 TP 价格，避免 SL 更新时摧毁 TP
-                                existing_tp = 0
-                                try:
-                                    all_stop = self.exchange.exchange.fetch_open_orders(
-                                        sym_full, params={"stop": True}
-                                    ) or []
-                                    for o in all_stop:
-                                        if self.exchange._is_reduce_only(o):
-                                            tp_val = float(o.get("info", {}).get("triggerPrice", 0) or 0)
-                                            # TP: LONG 止盈价高于入场价, SHORT 止盈价低于入场价
-                                            if side == "LONG" and tp_val > entry:
-                                                existing_tp = tp_val
-                                                break
-                                            if side == "SHORT" and tp_val < entry:
-                                                existing_tp = tp_val
-                                                break
-                                except Exception:
-                                    logger.debug("⚠️  静默异常", exc_info=True)
-                                # v4.5: 计划单未找到TP → 从交易所持仓 info.takeProfit 读取
+                                # v4.5→Phase2: 优先从持仓 info 读取 (pos-tpsl 已设)
+                                existing_tp = float(pos_d.get("tp_price", 0) or 0)
+                                # Layer 1b: positions_detail 无数据 → 直接查缓存的原始持仓
                                 if existing_tp <= 0:
                                     try:
                                         raw_positions = self.exchange.get_open_positions()
@@ -2819,6 +2793,24 @@ class DeepSeekQuantBot:
                                             existing_tp = float(tp_raw)
                                     except Exception:
                                         pass
+                                # Layer 2: 兜底 — 独立计划单 (非 pos-tpsl 降级场景)
+                                if existing_tp <= 0:
+                                    try:
+                                        all_stop = self.exchange.exchange.fetch_open_orders(
+                                            sym_full, params={"stop": True}
+                                        ) or []
+                                        for o in all_stop:
+                                            if self.exchange._is_reduce_only(o):
+                                                tp_val = float(o.get("info", {}).get("triggerPrice", 0) or 0)
+                                                # TP: LONG 止盈价高于入场价, SHORT 止盈价低于入场价
+                                                if side == "LONG" and tp_val > entry:
+                                                    existing_tp = tp_val
+                                                    break
+                                                if side == "SHORT" and tp_val < entry:
+                                                    existing_tp = tp_val
+                                                    break
+                                    except Exception:
+                                        logger.debug("⚠️  静默异常", exc_info=True)
                                 # v4.5: TP仍为0 → 跳过更新, 避免传无效TP破坏现有保护
                                 if existing_tp <= 0:
                                     logger.warning(
@@ -3061,14 +3053,11 @@ class DeepSeekQuantBot:
                 except Exception:
                     logger.debug("⚠️  静默异常", exc_info=True)  # OI/ATR 获取失败不影响主循环
 
-        # ── v3.6: AI 持仓审核 —— 定期审查已持仓是否需要提前退出 ──
-        if self.config.ai_position_review_enabled and acct.get("positions_detail"):
-            if not self.analyst.circuit_breaker_open():
-                # 按 interval 间隔执行 (默认每3轮=15分钟)
-                if self.total_scans > 0 and self.total_scans % self.config.ai_position_review_interval == 0:
-                    self._review_open_positions(acct["positions_detail"])
-            else:
-                logger.debug("🔌 断路器熔断，跳过 AI 持仓审核")
+        # ── v4.5→Phase2: 规则引擎持仓审核 (AI决策层已永久禁用, 无需断路器) ──
+        if self.config.rule_exit_review_enabled and acct.get("positions_detail"):
+            # 按 interval 间隔执行 (默认每3轮=15分钟)
+            if self.total_scans > 0 and self.total_scans % self.config.rule_exit_review_interval == 0:
+                self._review_open_positions(acct["positions_detail"])
 
         # ── v3.5: 清理无主订单（已平仓但计划单残留的币种）──
         current_symbols = {f"{p['symbol']}/USDT:USDT" for p in acct.get("positions_detail", [])}
@@ -3479,6 +3468,7 @@ class DeepSeekQuantBot:
             f.write(str(os.getpid()))
 
         logger.info("\n🎯 DeepSeekQuantBot v4.5 进入主循环 (每 5 分钟)")
+        logger.info("🧠 AI决策层: 已禁用 (v4.1+ 永久禁用, 出场使用规则引擎)")
         logger.info("按 Ctrl+C 停止\n")
 
         # ── v3.4: 检测停机期间的平仓 ──
