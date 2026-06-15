@@ -30,6 +30,7 @@ class TestLowRRShadowPath(unittest.TestCase):
         }
         self.mock_exchange.get_contract_size.return_value = 1.0
         self.mock_exchange.get_min_amount.return_value = 1.0
+        self.mock_exchange.get_min_notional.return_value = 5.0   # v4.5→Phase2: 交易所最小下单额
         self.mock_exchange.get_taker_fee.return_value = 0.0006  # 必须返回 float
 
         # 市价单成交返回 (模拟主单成功)
@@ -59,6 +60,7 @@ class TestLowRRShadowPath(unittest.TestCase):
         self.mock_config.max_position_pct = 0.05
         self.mock_config.min_rr_ratio = 5.0               # 高门槛 → 容易触发影子
         self.mock_config.max_position_ratio = 1.0
+        self.mock_config.risk_per_trade_pct = 0.02          # v4.5→Phase2: 每笔风险预算
         self.mock_config.is_sandbox = True
         self.mock_config.sandbox_safety = True             # 走入 R:R 检查路径
         self.mock_config.momentum_enabled = False
