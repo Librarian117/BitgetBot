@@ -411,20 +411,21 @@ class ExchangeInterface:
                         if contracts == 0:
                             continue
                         sym_raw = p.get("symbol", "")
-                        sym = sym_raw  # UTA returns e.g. "BTCUSDT"
-                        # Convert "BTCUSDT" → "BTC/USDT:USDT" if needed
+                        sym = sym_raw
+                        # Convert "SOLUSDT" → "SOL/USDT:USDT" if needed
                         if "/" not in sym:
+                            base = sym_raw.replace("USDT", "")
                             for s in self.config.SYMBOLS:
-                                if s.replace("/USDT:USDT", "").replace("/", "") == sym_raw:
+                                if base == s.replace("/USDT:USDT", "").replace("/", ""):
                                     sym = s
                                     break
                         pos_side = p.get("posSide", p.get("holdSide", "long"))
                         positions[sym] = {
                             "symbol": sym,
                             "contracts": contracts,
-                            "unrealizedPnl": float(p.get("unrealizedPL", p.get("unrealizedPnl", 0)) or 0),
-                            "initialMargin": float(p.get("margin", p.get("imr", 0)) or 0),
-                            "entryPrice": float(p.get("openPrice", p.get("avgOpenPrice", p.get("entryPrice", 0))) or 0),
+                            "unrealizedPnl": float(p.get("unrealisedPnl", p.get("unrealizedPL", p.get("unrealizedPnl", 0))) or 0),
+                            "initialMargin": float(p.get("positionBalance", p.get("margin", p.get("imr", 0))) or 0),
+                            "entryPrice": float(p.get("avgPrice", p.get("openPrice", p.get("avgOpenPrice", p.get("entryPrice", 0)))) or 0),
                             "markPrice": float(p.get("markPrice", 0) or 0),
                             "side": pos_side,
                             "info": {
