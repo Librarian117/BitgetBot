@@ -120,8 +120,10 @@ class ExchangeInterface:
             if not allowed:
                 logger.warning(f"⛔ {reason}")
                 return None
-        except Exception:
-            pass  # guard failure → fall through to existing checks
+        except Exception as e:
+            # guard failure → fail-safe: reject the order
+            logger.warning(f"⛔ SKIP_GUARD_FAIL {symbol}: {e} → 拒绝下单")
+            return None
 
         # ── 最小下单量保护 ──
         min_qty = self.get_min_amount(symbol)
