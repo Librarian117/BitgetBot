@@ -130,6 +130,9 @@ class ExchangeInterface:
             "executePrice": ep_str,
             "holdSide": hold_side,
             "posSide": hold_side,       # V3 requirement: posSide must not be empty
+            # V3 40310 fix: planType=pos_loss 需要 stopLoss, planType=pos_profit 需要 takeProfit
+            "stopLoss": tp_str if plan_type == "pos_loss" else "",
+            "takeProfit": tp_str if plan_type == "pos_profit" else "",
         }
         try:
             resp = self.exchange.private_uta_post_v3_trade_place_strategy_order(params)
