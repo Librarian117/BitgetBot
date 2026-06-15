@@ -14,6 +14,7 @@
 
 import sys
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -40,23 +41,43 @@ def _make_uta_exchange():
         mock_ex = MagicMock()
         mock_ex.markets = {
             "BTC/USDT:USDT": {
-                "id": "BTCUSDT",
-                "swap": True,
-                "contractSize": 0.001,
+                "id": "BTCUSDT", "swap": True, "contractSize": 1.0,
                 "precision": {"price": 0.1, "amount": 1},
                 "limits": {"amount": {"min": 1}, "cost": {"min": 5}},
             },
             "ETH/USDT:USDT": {
-                "id": "ETHUSDT",
-                "swap": True,
-                "contractSize": 0.01,
+                "id": "ETHUSDT", "swap": True, "contractSize": 1.0,
                 "precision": {"price": 0.01, "amount": 1},
+                "limits": {"amount": {"min": 1}, "cost": {"min": 5}},
+            },
+            "SOL/USDT:USDT": {
+                "id": "SOLUSDT", "swap": True, "contractSize": 1.0,
+                "precision": {"price": 0.001, "amount": 1},
+                "limits": {"amount": {"min": 1}, "cost": {"min": 5}},
+            },
+            "DOT/USDT:USDT": {
+                "id": "DOTUSDT", "swap": True, "contractSize": 1.0,
+                "precision": {"price": 0.001, "amount": 1},
+                "limits": {"amount": {"min": 1}, "cost": {"min": 5}},
+            },
+            "LINK/USDT:USDT": {
+                "id": "LINKUSDT", "swap": True, "contractSize": 1.0,
+                "precision": {"price": 0.001, "amount": 1},
+                "limits": {"amount": {"min": 1}, "cost": {"min": 5}},
+            },
+            "XRP/USDT:USDT": {
+                "id": "XRPUSDT", "swap": True, "contractSize": 1.0,
+                "precision": {"price": 0.0001, "amount": 1},
                 "limits": {"amount": {"min": 1}, "cost": {"min": 5}},
             },
         }
         mock_ex.markets_by_id = {
             "BTCUSDT": {"symbol": "BTC/USDT:USDT"},
             "ETHUSDT": {"symbol": "ETH/USDT:USDT"},
+            "SOLUSDT": {"symbol": "SOL/USDT:USDT"},
+            "DOTUSDT": {"symbol": "DOT/USDT:USDT"},
+            "LINKUSDT": {"symbol": "LINK/USDT:USDT"},
+            "XRPUSDT": {"symbol": "XRP/USDT:USDT"},
         }
         # mock price_to_precision
         mock_ex.price_to_precision = MagicMock(side_effect=lambda sym, p: str(round(p, 2)))
@@ -104,31 +125,31 @@ class TestUTAMarketOrderPayload(unittest.TestCase):
     def test_long_entry_payload(self):
         """Long entry: side=buy, posSide=long, tradeSide=open"""
         order = self.ei._uta_v3_create_market_order(
-            symbol="BTC/USDT:USDT", side="buy", amount=1.0,
+            symbol="SOL/USDT:USDT", side="buy", amount=2.0,
             pos_side="long", trade_side="open")
         self.assertIsNotNone(order)
         self.assertEqual(order["id"], "ut_ord_001")
         self.assertEqual(order["average"], 50000.0)
 
         call_params = self.ex.private_uta_post_v3_trade_place_order.call_args[0][0]
-        self.assertEqual(call_params["symbol"], "BTCUSDT")
+        self.assertEqual(call_params["symbol"], "SOLUSDT")
         self.assertEqual(call_params["category"], "USDT-FUTURES")
         self.assertEqual(call_params["marginCoin"], "USDT")
         self.assertEqual(call_params["side"], "buy")
         self.assertEqual(call_params["posSide"], "long")
         self.assertEqual(call_params["orderType"], "market")
-        self.assertEqual(call_params["qty"], "1.0")
+        self.assertEqual(call_params["qty"], "2.0")
         self.assertEqual(call_params["tradeSide"], "open")
 
     def test_short_entry_payload(self):
         """Short entry: side=sell, posSide=short, tradeSide=open"""
         order = self.ei._uta_v3_create_market_order(
-            symbol="ETH/USDT:USDT", side="sell", amount=2.0,
+            symbol="DOT/USDT:USDT", side="sell", amount=2.0,
             pos_side="short", trade_side="open")
         self.assertIsNotNone(order)
 
         call_params = self.ex.private_uta_post_v3_trade_place_order.call_args[0][0]
-        self.assertEqual(call_params["symbol"], "ETHUSDT")
+        self.assertEqual(call_params["symbol"], "DOTUSDT")
         self.assertEqual(call_params["side"], "sell")
         self.assertEqual(call_params["posSide"], "short")
         self.assertEqual(call_params["qty"], "2.0")
@@ -357,9 +378,9 @@ class TestUTAWritePathIntegration(unittest.TestCase):
         self.ex.private_uta_post_v3_trade_place_strategy_order.reset_mock()
 
         order = self.ei.create_market_order_with_partial_tp(
-            symbol="BTC/USDT:USDT", side="buy", amount=1.0,
-            sl_price=49000.0,
-            tp_parts=[(51000.0, 0.5), (52000.0, 0.5)],
+            symbol="SOL/USDT:USDT", side="buy", amount=2.0,
+            sl_price=70.0,
+            tp_parts=[(80.0, 0.5), (85.0, 0.5)],
             pos_side="long")
         self.assertIsNotNone(order)
 
@@ -387,6 +408,64 @@ class TestUTAWritePathIntegration(unittest.TestCase):
                 self.assertFalse(
                     getattr(self.ex, attr_name).called,
                     f"{attr_name} should not be called in UTA path")
+
+
+class TestUTASizingGuard(unittest.TestCase):
+    """50U canary sizing guard"""
+
+    def setUp(self):
+        self.ei, self.ex = _make_uta_exchange()
+        # Mock instruments cache
+        self.ei._uta_instruments_cache = {
+            "BTCUSDT": {"minQty": 0.0001, "multiplier": 0.0001, "qtyPrecision": 4, "pricePrecision": 1},
+            "SOLUSDT": {"minQty": 0.1, "multiplier": 0.1, "qtyPrecision": 1, "pricePrecision": 3},
+            "DOTUSDT": {"minQty": 1, "multiplier": 1, "qtyPrecision": 0, "pricePrecision": 3},
+            "LINKUSDT": {"minQty": 1, "multiplier": 1, "qtyPrecision": 0, "pricePrecision": 3},
+            "XRPUSDT": {"minQty": 1, "multiplier": 1, "qtyPrecision": 0, "pricePrecision": 4},
+        }
+        self.ei._uta_instruments_ts = time.time() + 600
+
+    def test_allowlist_allows_sol(self):
+        ok, reason = self.ei._uta_validate_order("SOL/USDT:USDT", 1.0, 75.0)
+        self.assertTrue(ok, reason)
+
+    def test_allowlist_allows_dot(self):
+        ok, reason = self.ei._uta_validate_order("DOT/USDT:USDT", 41.0, 1.0)
+        self.assertTrue(ok, reason)
+
+    def test_allowlist_allows_link(self):
+        ok, reason = self.ei._uta_validate_order("LINK/USDT:USDT", 4.0, 8.0)
+        self.assertTrue(ok, reason)
+
+    def test_allowlist_allows_xrp(self):
+        ok, reason = self.ei._uta_validate_order("XRP/USDT:USDT", 22.0, 1.2)
+        self.assertTrue(ok, reason)
+
+    def test_not_allowlist_btc_skipped(self):
+        ok, reason = self.ei._uta_validate_order("BTC/USDT:USDT", 1.0, 70000.0)
+        self.assertFalse(ok)
+        self.assertIn("SKIP_CANARY_NOT_ALLOWLIST", reason)
+
+    def test_not_allowlist_eth_skipped(self):
+        ok, reason = self.ei._uta_validate_order("ETH/USDT:USDT", 1.0, 2000.0)
+        self.assertFalse(ok)
+        self.assertIn("SKIP_CANARY_NOT_ALLOWLIST", reason)
+
+    def test_below_min_qty_skipped(self):
+        ok, reason = self.ei._uta_validate_order("SOL/USDT:USDT", 0.05, 75.0)
+        self.assertFalse(ok)
+        self.assertIn("SKIP_BELOW_MIN_QTY", reason)
+
+    def test_qty_multiplier_aligned(self):
+        ok, reason = self.ei._uta_validate_order("SOL/USDT:USDT", 0.3, 75.0)
+        self.assertTrue(ok)  # 0.3 is multiple of 0.1
+
+    def test_create_market_order_allowlist_guard(self):
+        """_uta_v3_create_market_order rejects non-allowlist symbols"""
+        order = self.ei._uta_v3_create_market_order(
+            symbol="BTC/USDT:USDT", side="buy", amount=1.0,
+            pos_side="long", trade_side="open")
+        self.assertIsNone(order)
 
 
 if __name__ == "__main__":

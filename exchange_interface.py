@@ -39,6 +39,70 @@ class ExchangeInterface:
         ex.set_sandbox_mode(self.config.is_sandbox)
         return ex
 
+    # ── UTA V3 Sizing Guard ──────────────────────────────────────
+    CANARY_ALLOWLIST = {"SOL", "DOT", "LINK", "XRP"}  # 50U canary 已验证币种
+
+    def _uta_get_instruments(self) -> dict:
+        """从 UTA V3 instruments API 获取合约参数，缓存 600s。"""
+        if getattr(self, '_uta_instruments_ts', 0) > time.time() - 600:
+            return getattr(self, '_uta_instruments_cache', {})
+        try:
+            resp = self.exchange.public_uta_get_v3_market_instruments(
+                {"category": "USDT-FUTURES"})
+            if resp.get("code") == "00000":
+                cache = {}
+                for item in resp.get("data", []):
+                    sym = item.get("symbol", "")
+                    cache[sym] = {
+                        "minQty": float(item.get("minOrderQty", 0) or 0),
+                        "multiplier": float(item.get("quantityMultiplier", 1) or 1),
+                        "qtyPrecision": int(item.get("quantityPrecision", 0) or 0),
+                        "pricePrecision": int(item.get("pricePrecision", 2) or 2),
+                    }
+                self._uta_instruments_cache = cache
+                self._uta_instruments_ts = time.time()
+                return cache
+        except Exception:
+            logger.warning("UTA instruments fetch failed", exc_info=True)
+        return getattr(self, '_uta_instruments_cache', {})
+
+    def _uta_validate_order(self, symbol: str, amount: float, price: float) -> tuple:
+        """下单前校验: (allowed, reason)。返回 (True, "") 表示通过。"""
+        raw_sym = symbol.split(":")[0].replace("/", "")
+
+        # 50U canary allowlist
+        base = raw_sym.replace("USDT", "")
+        if base not in self.CANARY_ALLOWLIST:
+            return (False, f"SKIP_CANARY_NOT_ALLOWLIST {symbol} (allowlist: {self.CANARY_ALLOWLIST})")
+
+        instruments = self._uta_get_instruments()
+        spec = instruments.get(raw_sym)
+        if not spec:
+            return (True, "")  # no metadata → allow with existing checks
+
+        min_qty = spec["minQty"]
+        multiplier = spec["multiplier"]
+        qty_precision = spec["qtyPrecision"]
+
+        # 1. qty >= minOrderQty
+        if amount < min_qty:
+            return (False, f"SKIP_BELOW_MIN_QTY {symbol}: qty={amount} < min={min_qty}")
+
+        # 2. notional check (from instruments if available)
+        # minOrderAmount not returned by this endpoint; use existing get_min_notional
+
+        # 3. qty aligned to multiplier
+        if multiplier > 0 and amount % multiplier != 0:
+            aligned = round(amount / multiplier) * multiplier
+            aligned = round(aligned, qty_precision)
+            if aligned < min_qty:
+                aligned = min_qty
+            if aligned > amount * 1.05:
+                return (False, f"SKIP_QTY_NOT_ALIGNED {symbol}: qty={amount} multiplier={multiplier} aligned={aligned}")
+            # qty aligned within tolerance → allow
+
+        return (True, "")
+
     # ── UTA V3 写路径辅助方法 ──────────────────────────────────────
     def _uta_v3_create_market_order(self, symbol: str, side: str, amount: float,
                                      pos_side: str, trade_side: str = "open") -> Optional[Dict]:
@@ -47,8 +111,18 @@ class ExchangeInterface:
         side: "buy"|"sell"
         pos_side: "long"|"short"
         trade_side: "open"|"close"
-        amount: 合约张数（由 trade_executor 计算，已对齐最小下单量）
+        amount: 合约张数（由 trade_executor 计算）
         """
+        # ── 50U canary sizing guard ──
+        try:
+            price = 0  # will be filled by market
+            allowed, reason = self._uta_validate_order(symbol, amount, price)
+            if not allowed:
+                logger.warning(f"⛔ {reason}")
+                return None
+        except Exception:
+            pass  # guard failure → fall through to existing checks
+
         # ── 最小下单量保护 ──
         min_qty = self.get_min_amount(symbol)
         if amount < min_qty:
