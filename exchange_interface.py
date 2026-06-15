@@ -564,6 +564,8 @@ class ExchangeInterface:
         except Exception:
             logger.debug("UTA history-position query failed", exc_info=True)
             return None
+
+    def count_open_positions(self) -> int:
         """快速查询持仓数量"""
         return len(self.get_open_positions())
 
