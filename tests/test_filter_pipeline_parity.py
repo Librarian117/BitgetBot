@@ -4,7 +4,9 @@
 import sys, os, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from filter_pipeline import resolve_kalman, detect_market_regime
+from filter_pipeline import (resolve_kalman, detect_market_regime,
+                            filter_volume, adjust_direction_bias,
+                            filter_btc_linkage)
 
 
 class TestKalmanResolver(unittest.TestCase):
@@ -130,6 +132,132 @@ class TestRegimeDetection(unittest.TestCase):
                   "atr_pct", "consensus", "recommended", "allowed_directions",
                   "confidence", "detail", "markov_bias"):
             self.assertIn(k, r)
+
+
+class TestVolumeFilter(unittest.TestCase):
+    """filter_volume matches original inline logic"""
+
+    def _df_vol(self, volumes):
+        import pandas as pd
+        n = len(volumes)
+        return pd.DataFrame({"open": [100]*n, "high": [100]*n, "low": [100]*n,
+                             "close": [100]*n, "volume": volumes})
+
+    def test_sandbox_always_passes(self):
+        df = self._df_vol([100]*30)
+        r = filter_volume(df, -2, {"vol_ratio": 1.5}, is_sandbox=True)
+        self.assertTrue(r["passed"])
+        self.assertEqual(r["vol_ratio"], 1.0)
+
+    def test_live_pass_when_ratio_high(self):
+        volumes = [50]*18 + [200]*2 + [300]*10  # cur vol >> avg vol
+        df = self._df_vol(volumes)
+        r = filter_volume(df, -2, {"vol_ratio": 1.5}, is_sandbox=False)
+        self.assertTrue(r["passed"])
+
+    def test_live_block_when_ratio_low(self):
+        volumes = [500]*20 + [50]*8 + [50, 50]  # cur=50, avg~350, ratio<0.3
+        df = self._df_vol(volumes)
+        r = filter_volume(df, -2, {"vol_ratio": 1.5}, is_sandbox=False)
+        self.assertFalse(r["passed"])
+        self.assertLess(r["vol_ratio"], 1.5)
+
+    def test_live_pass_ratio_at_threshold(self):
+        volumes = [100]*30
+        df = self._df_vol(volumes)
+        r = filter_volume(df, -2, {"vol_ratio": 0.5}, is_sandbox=False)
+        self.assertTrue(r["passed"])
+
+
+class TestDirectionBias(unittest.TestCase):
+    """adjust_direction_bias matches original inline logic"""
+
+    def test_bearish_bias(self):
+        r = adjust_direction_bias(True, False, False, 30.0, 70.0)
+        self.assertTrue(r["block_long"])
+        self.assertFalse(r["block_short"])
+        self.assertEqual(r["effective_overbought"], 60.0)  # 70-10
+        self.assertEqual(r["effective_oversold"], 25.0)     # 30-5
+
+    def test_bullish_bias(self):
+        r = adjust_direction_bias(False, True, False, 30.0, 70.0)
+        self.assertFalse(r["block_long"])
+        self.assertTrue(r["block_short"])
+        self.assertEqual(r["effective_oversold"], 40.0)     # 30+10
+        self.assertEqual(r["effective_overbought"], 75.0)    # 70+5
+
+    def test_neutral_no_bias(self):
+        r = adjust_direction_bias(False, False, False, 30.0, 70.0)
+        self.assertFalse(r["block_long"])
+        self.assertFalse(r["block_short"])
+        self.assertEqual(r["effective_oversold"], 30.0)
+        self.assertEqual(r["effective_overbought"], 70.0)
+
+    def test_kalman_conflict_unblocks(self):
+        """Kalman conflict -> no hard block even in bearish/bullish"""
+        r = adjust_direction_bias(True, False, True, 30.0, 70.0)
+        self.assertFalse(r["block_long"])  # unblocked by kalman conflict
+        self.assertFalse(r["block_short"])
+
+    def test_boundary_floor_ceil(self):
+        """RSI adjustments don't exceed floor/ceiling"""
+        r = adjust_direction_bias(True, False, False, 10.0, 40.0)
+        self.assertEqual(r["effective_overbought"], 45.0)  # floor 45
+        self.assertEqual(r["effective_oversold"], 10.0)     # floor 10
+        r2 = adjust_direction_bias(False, True, False, 50.0, 80.0)
+        self.assertEqual(r2["effective_oversold"], 55.0)     # ceiling 55
+        self.assertEqual(r2["effective_overbought"], 85.0)    # ceiling 85
+
+
+class TestBtcLinkage(unittest.TestCase):
+    """filter_btc_linkage matches original inline logic"""
+
+    def _cand(self, symbol, direction):
+        return {"symbol": symbol, "direction": direction}
+
+    def test_btc_always_passes(self):
+        """BTC symbol itself passes regardless of btc_change"""
+        cands = [self._cand("BTC/USDT", "LONG"), self._cand("BTC/USDT", "SHORT")]
+        r = filter_btc_linkage(cands, -0.05, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 2)
+        self.assertEqual(len(r["blocked"]), 0)
+
+    def test_long_blocked_by_btc_drop(self):
+        cands = [self._cand("ETH/USDT", "LONG")]
+        r = filter_btc_linkage(cands, -0.05, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 0)
+        self.assertEqual(len(r["blocked"]), 1)
+        self.assertEqual(r["blocked"][0]["reason"], "btc_drop_block_long")
+
+    def test_short_blocked_by_btc_pump(self):
+        cands = [self._cand("ETH/USDT", "SHORT")]
+        r = filter_btc_linkage(cands, 0.05, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 0)
+        self.assertEqual(r["blocked"][0]["reason"], "btc_pump_block_short")
+
+    def test_long_passes_when_btc_not_below(self):
+        cands = [self._cand("ETH/USDT", "LONG")]
+        r = filter_btc_linkage(cands, -0.01, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 1)
+
+    def test_short_passes_when_btc_not_above(self):
+        cands = [self._cand("ETH/USDT", "SHORT")]
+        r = filter_btc_linkage(cands, 0.01, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 1)
+
+    def test_btc_change_none_skips(self):
+        cands = [self._cand("ETH/USDT", "LONG")]
+        r = filter_btc_linkage(cands, None, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 1)
+        self.assertEqual(len(r["blocked"]), 0)
+
+    def test_multiple_candidates_preserve_order(self):
+        cands = [self._cand("A/USDT", "LONG"), self._cand("B/USDT", "SHORT"),
+                 self._cand("C/USDT", "LONG")]
+        r = filter_btc_linkage(cands, 0.0, btc_drop_block_long=-0.03, btc_pump_block_short=0.03)
+        self.assertEqual(len(r["passed"]), 3)
+        self.assertEqual(r["passed"][0]["symbol"], "A/USDT")
+        self.assertEqual(r["passed"][2]["symbol"], "C/USDT")
 
 
 if __name__ == "__main__":

@@ -243,3 +243,97 @@ def detect_market_regime(
         "detail": " | ".join(detail_parts),
         "markov_bias": round(markov_bias, 3),
     }
+
+
+def filter_volume(
+    df, cidx: int, session: dict, is_sandbox: bool,
+) -> dict:
+    """成交量确认过滤。
+
+    原始位置: deepseek_quant_bot.py scan_single_symbol() lines 1026-1044
+
+    Returns {"passed": bool, "vol_ratio": float}
+    sandbox 模式下始终 passed=True, vol_ratio=1.0。
+    """
+    vol_ratio = 1.0
+    if not is_sandbox:
+        try:
+            cur_vol = float(df["volume"].iloc[cidx])
+            avg_vol = float(df["volume"].tail(20).mean())
+            vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+        except Exception:
+            vol_ratio = 1.0
+        if vol_ratio < session.get("vol_ratio", 1.0):
+            return {"passed": False, "vol_ratio": vol_ratio}
+    return {"passed": True, "vol_ratio": vol_ratio}
+
+
+def adjust_direction_bias(
+    is_bearish_trend: bool, is_bullish_trend: bool,
+    kalman_ema_disagree: bool,
+    effective_oversold: float, effective_overbought: float,
+) -> dict:
+    """趋势方向偏向 + RSI 阈值调整。
+
+    原始位置: deepseek_quant_bot.py scan_single_symbol() lines 1093-1107
+
+    Returns {
+        "block_long": bool, "block_short": bool,
+        "effective_oversold": float, "effective_overbought": float,
+    }
+    """
+    block_long = is_bearish_trend and not kalman_ema_disagree
+    block_short = is_bullish_trend and not kalman_ema_disagree
+
+    if is_bearish_trend:
+        effective_overbought = max(45, effective_overbought - 10)
+        effective_oversold = max(10, effective_oversold - 5)
+    elif is_bullish_trend:
+        effective_oversold = min(55, effective_oversold + 10)
+        effective_overbought = min(85, effective_overbought + 5)
+
+    return {
+        "block_long": block_long,
+        "block_short": block_short,
+        "effective_oversold": effective_oversold,
+        "effective_overbought": effective_overbought,
+    }
+
+
+def filter_btc_linkage(
+    candidates: list, btc_change: float,
+    btc_drop_block_long: float, btc_pump_block_short: float,
+) -> dict:
+    """BTC 联动过滤: BTC 暴跌时阻止做多, BTC 暴涨时阻止做空。
+
+    原始位置: deepseek_quant_bot.py _phase_scan_and_filter() lines 2466-2501
+
+    Returns {"passed": list, "blocked": list[dict]}
+    blocked items have {symbol, direction, reason} for tlogger/stats consumption.
+    BTC symbol itself always passes.
+    """
+    if btc_change is None:
+        return {"passed": candidates, "blocked": []}
+
+    passed = []
+    blocked = []
+    for sig in candidates:
+        symbol = sig["symbol"]
+        direction = sig["direction"]
+
+        if "BTC" in symbol:
+            passed.append(sig)
+            continue
+
+        if direction == "LONG" and btc_change < btc_drop_block_long:
+            blocked.append({"symbol": symbol, "direction": direction,
+                            "reason": "btc_drop_block_long"})
+            continue
+        if direction == "SHORT" and btc_change > btc_pump_block_short:
+            blocked.append({"symbol": symbol, "direction": direction,
+                            "reason": "btc_pump_block_short"})
+            continue
+
+        passed.append(sig)
+
+    return {"passed": passed, "blocked": blocked}
