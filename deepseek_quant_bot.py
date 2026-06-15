@@ -894,6 +894,67 @@ class DeepSeekQuantBot:
             atr, close, adx, vol_ratio, markov_result)
 
     # ==================================================================
+    # v4.5→P0: TPSL 触发平仓检测
+    # ==================================================================
+    def _detect_disappeared_positions(self, current_positions: list):
+        """检测因 TPSL 触发而消失的持仓 → 查询历史 → finalize → ledger。
+
+        返回 finalize 成功/失败数。
+        """
+        current_keys = set()
+        for p in current_positions:
+            sym = p.get("symbol", "")
+            side = p.get("side", "LONG").lower()
+            current_keys.add((sym, side))
+
+        last_known = getattr(self, '_last_known_position_keys', set())
+        disappeared = last_known - current_keys
+
+        finalized = 0
+        for sym, side in disappeared:
+            sym_full = sym if "/" in sym else f"{sym}/USDT:USDT"
+            # 幂等: 检查是否已经 finalize 过
+            dedup_key = f"TPSL_DETECT_{sym}_{side}"
+            if hasattr(self, '_closed_trades_cache') and dedup_key in self._closed_trades_cache:
+                continue
+
+            logger.info(f"🔍 检测到消失仓位: {sym} {side} → 查询 TPSL 平仓历史")
+            try:
+                # 查询 history-position 获取 PnL
+                pos_side = "long" if side == "long" else "short"
+                open_ts = getattr(self, '_position_open_times', {}).get(sym_full, time.time() - 3600)
+                close_ctx = self.exchange._uta_get_closed_position(
+                    sym_full, pos_side, since_sec=open_ts - 60)
+                if not close_ctx:
+                    logger.warning(f"⚠️ {sym} {side} 未找到平仓历史记录")
+                    continue
+
+                # 调用统一 finalize
+                result = self._finalize_closed_position(
+                    symbol=sym_full,
+                    side=side.upper(),
+                    entry=0,  # 从 position_open_times 或 history 补
+                    contracts=0,
+                    margin=1.0,
+                    upl=0,
+                    close_reason="TPSL_TRIGGERED",
+                    open_ts=open_ts,
+                    strategy=getattr(self, '_position_strategies', {}).get(sym_full, "unknown"),
+                    mark_price=close_ctx.get("exit_price", 0),
+                )
+                finalized += 1
+                logger.info(
+                    f"✅ TPSL触发 finalize: {sym} {side} "
+                    f"pnl={close_ctx.get('pnl'):+.4f} net={close_ctx.get('net_profit'):+.4f}"
+                )
+            except Exception as e:
+                logger.error(f"❌ TPSL触发检测失败 {sym} {side}: {e}")
+
+        # 更新 last_known
+        self._last_known_position_keys = current_keys
+        return finalized
+
+    # ==================================================================
     # v3.6: AI 持仓审核
     # ==================================================================
     def _review_open_positions(self, positions_detail: list):
@@ -2694,6 +2755,8 @@ class DeepSeekQuantBot:
             self.config.adx_threshold, self.config.vol_ratio_threshold)
         if session_live.get("name") == "weekend_dead":
             logger.info(f"🛑 周末凌晨({session_live['label']})低流动性，本轮只平仓不开仓")
+            # P0: 检测 TPSL 触发平仓
+            self._detect_disappeared_positions(acct.get("positions_detail", []))
             # 仍然执行持仓检查 (规则引擎平仓，AI决策层已禁用)
             if self.config.rule_exit_review_enabled and acct.get("positions_detail"):
                 if self.total_scans > 0 and self.total_scans % self.config.rule_exit_review_interval == 0:
@@ -3060,6 +3123,8 @@ class DeepSeekQuantBot:
                 except Exception:
                     logger.debug("⚠️  静默异常", exc_info=True)  # OI/ATR 获取失败不影响主循环
 
+        # P0: 检测 TPSL 触发平仓
+        self._detect_disappeared_positions(acct.get("positions_detail", []))
         # ── v4.5→Phase2: 规则引擎持仓审核 (AI决策层已永久禁用, 无需断路器) ──
         if self.config.rule_exit_review_enabled and acct.get("positions_detail"):
             # 按 interval 间隔执行 (默认每3轮=15分钟)

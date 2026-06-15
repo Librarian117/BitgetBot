@@ -530,7 +530,40 @@ class ExchangeInterface:
             logger.warning("orphan TPSL cleanup failed", exc_info=True)
         return cancelled
 
-    def count_open_positions(self) -> int:
+    def _uta_get_closed_position(self, symbol: str, pos_side: str,
+                                  since_sec: float = 3600) -> Optional[Dict]:
+        """UTA V3: 查询最近平仓的 history-position，返回 close context 供 finalize 使用。
+
+        返回 None 表示未找到，或返回 {pnl, net_profit, exit_price, fee, open_fee, funding}。
+        """
+        try:
+            raw_sym = symbol.split(":")[0].replace("/", "")
+            params = {"category": "USDT-FUTURES", "symbol": raw_sym, "limit": "5"}
+            if since_sec:
+                params["startTime"] = str(int(since_sec * 1000))
+            resp = self.exchange.private_uta_get_v3_position_history_position(params)
+            if resp.get("code") != "00000":
+                return None
+            data = resp.get("data", {})
+            records = data.get("list") or [] if isinstance(data, dict) else []
+            # v4.5→P0: 只返回最近 1 小时内且匹配方向的
+            for r in records:
+                hold_side = r.get("holdSide", "")
+                if hold_side.lower() != pos_side.lower():
+                    continue
+                return {
+                    "pnl": float(r.get("pnl", 0) or 0),
+                    "net_profit": float(r.get("netProfit", 0) or 0),
+                    "exit_price": float(r.get("closeAvgPrice", 0) or 0),
+                    "fee": float(r.get("closeFee", 0) or 0),
+                    "open_fee": float(r.get("openFee", 0) or 0),
+                    "funding": float(r.get("totalFunding", 0) or 0),
+                    "position_id": r.get("positionId", ""),
+                }
+            return None
+        except Exception:
+            logger.debug("UTA history-position query failed", exc_info=True)
+            return None
         """快速查询持仓数量"""
         return len(self.get_open_positions())
 
