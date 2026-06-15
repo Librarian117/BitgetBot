@@ -39,6 +39,129 @@ class ExchangeInterface:
         ex.set_sandbox_mode(self.config.is_sandbox)
         return ex
 
+    # ── UTA V3 写路径辅助方法 ──────────────────────────────────────
+    def _uta_v3_create_market_order(self, symbol: str, side: str, amount: float,
+                                     pos_side: str, trade_side: str = "open") -> Optional[Dict]:
+        """UTA V3: POST /api/v3/trade/place-order → 市价单
+
+        side: "buy"|"sell"
+        pos_side: "long"|"short"
+        trade_side: "open"|"close"
+        """
+        raw_symbol = symbol.split(":")[0].replace("/", "")
+        params = {
+            "symbol": raw_symbol,
+            "category": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "side": side,
+            "posSide": pos_side,
+            "orderType": "market",
+            "size": str(amount),
+            "tradeSide": trade_side,
+        }
+        try:
+            resp = self.exchange.private_uta_post_v3_trade_place_order(params)
+            if resp.get("code") == "00000":
+                data = resp.get("data", {})
+                return {
+                    "id": data.get("orderId", ""),
+                    "price": float(data.get("fillPrice", 0) or 0),
+                    "average": float(data.get("fillPrice", 0) or 0),
+                    "amount": amount,
+                    "side": side,
+                    "symbol": symbol,
+                    "info": data,
+                }
+            logger.error(f"❌ UTA V3 市价单失败: code={resp.get('code')} msg={resp.get('msg')}")
+            return None
+        except Exception as e:
+            logger.error(f"❌ UTA V3 市价单异常: {e}")
+            return None
+
+    def _uta_v3_place_strategy_order(self, symbol: str, plan_type: str,
+                                      trigger_price: float, hold_side: str,
+                                      execute_price: float = None) -> bool:
+        """UTA V3: POST /api/v3/trade/place-strategy-order → 止损/止盈计划单
+
+        plan_type: "pos_loss"|"pos_profit"
+        hold_side: "long"|"short"
+        """
+        raw_symbol = symbol.split(":")[0].replace("/", "")
+        if execute_price is None:
+            execute_price = trigger_price
+
+        try:
+            tp_str = self.exchange.price_to_precision(symbol, trigger_price)
+            ep_str = self.exchange.price_to_precision(symbol, execute_price)
+        except Exception:
+            try:
+                market = self.exchange.market(symbol)
+                precision = market.get("precision", {}).get("price", 0.01)
+                if precision < 1:
+                    import math
+                    decimals = max(0, int(-math.log10(precision)))
+                else:
+                    decimals = 2
+            except Exception:
+                decimals = 2
+            tp_str = str(round(trigger_price, decimals))
+            ep_str = str(round(execute_price, decimals))
+
+        params = {
+            "symbol": raw_symbol,
+            "category": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "planType": plan_type,
+            "triggerPrice": tp_str,
+            "triggerType": "mark_price",
+            "executePrice": ep_str,
+            "holdSide": hold_side,
+        }
+        try:
+            resp = self.exchange.private_uta_post_v3_trade_place_strategy_order(params)
+            code = resp.get("code", "")
+            if code == "00000":
+                label = "SL" if plan_type == "pos_loss" else "TP"
+                logger.info(f"🛡️  UTA V3 {label} 计划单 OK: {symbol} @ {tp_str}")
+                return True
+            logger.warning(f"⚠️ UTA V3 {plan_type} 计划单失败: code={code} msg={resp.get('msg')}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ UTA V3 {plan_type} 计划单异常: {e}")
+            return False
+
+    def _uta_v3_close_positions(self, symbol: str, pos_side: str) -> Optional[Dict]:
+        """UTA V3: POST /api/v3/trade/close-positions → 一键平仓
+
+        pos_side: "long"|"short"
+        """
+        raw_symbol = symbol.split(":")[0].replace("/", "")
+        params = {
+            "category": "USDT-FUTURES",
+            "symbol": raw_symbol,
+            "posSide": pos_side,
+            "marginCoin": "USDT",
+        }
+        try:
+            resp = self.exchange.private_uta_post_v3_trade_close_positions(params)
+            if resp.get("code") == "00000":
+                logger.info(f"📦 UTA V3 平仓 OK: {symbol} posSide={pos_side}")
+                return {"id": resp.get("data", {}).get("orderId", ""), "info": resp.get("data", {}),
+                        "note": "UTA V3 close positions"}
+            # Already closed
+            if "40757" in str(resp.get("msg", "")) or "Not enough" in str(resp.get("msg", "")):
+                logger.info(f"📦 {symbol} 仓位已不存在")
+                return {"id": "already_closed", "note": "position already closed"}
+            logger.error(f"❌ UTA V3 平仓失败: code={resp.get('code')} msg={resp.get('msg')}")
+            return None
+        except Exception as e:
+            err_str = str(e)
+            if "40757" in err_str or "Not enough position" in err_str or "position is not available" in err_str:
+                logger.info(f"📦 {symbol} 仓位已不存在")
+                return {"id": "already_closed", "note": "position already closed by pos-tpsl"}
+            logger.error(f"❌ UTA V3 平仓异常: {e}")
+            return None
+
     def _load_markets(self):
         logger.info("⏳ 正在加载 Bitget 沙箱市场信息 …")
         for attempt in range(5):
@@ -380,10 +503,20 @@ class ExchangeInterface:
             # ── v3.6 重构: 市价开仓 + place-pos-tpsl 一次设 SL/TP ──
 
             # 1. 下市价单（纯开仓）
-            order = self.exchange.create_order(
-                symbol=symbol, type="market", side=side, amount=amount,
-                params={'tradeSide': 'open', 'marginMode': 'crossed'},
-            )
+            if self._is_uta:
+                # UTA V3: POST /api/v3/trade/place-order
+                order = self._uta_v3_create_market_order(
+                    symbol=symbol, side=side, amount=amount,
+                    pos_side=_pos_side, trade_side="open")
+            else:
+                # Classic V2: ccxt unified create_order
+                order = self.exchange.create_order(
+                    symbol=symbol, type="market", side=side, amount=amount,
+                    params={'tradeSide': 'open', 'marginMode': 'crossed'},
+                )
+            if not order:
+                logger.error(f"❌ {symbol} 市价单失败")
+                return None
             logger.info(f"✅ 主单成交: {symbol} | ID={order.get('id', 'N/A')}")
 
             # 2. 用 place-pos-tpsl API 一次设 SL+TP (自动替换旧单，不累积)
@@ -455,27 +588,37 @@ class ExchangeInterface:
 
             # v4.0: 多级 TP (第2级+) 用独立计划单补充
             if tp_parts and len(tp_parts) > 1:
-                raw_symbol = symbol.split(":")[0].replace("/", "")
                 hold_side = _pos_side  # v4.5: 直接用持仓方向
                 for tp_p, ratio in tp_parts[1:]:
                     try:
-                        # v4.0 fix: 使用 price_to_precision 适配不同价格精度
-                        tp_str = self.exchange.price_to_precision(symbol, tp_p)
-                        tp_params = {
-                            "symbol": raw_symbol,
-                            "productType": "usdt-futures",
-                            "marginCoin": "USDT",
-                            "holdSide": hold_side,
-                            "planType": "pos_profit",
-                            "triggerPrice": tp_str,
-                            "triggerType": "mark_price",
-                            "executePrice": tp_str,  # 必须 > 0，与 triggerPrice 一致
-                        }
-                        tp_r = self.exchange.private_mix_post_v2_mix_order_place_tpsl_order(tp_params)
-                        if tp_r.get("code") == "00000":
-                            logger.info(f"  📏 附加TP @ {tp_str} ({ratio*100:.0f}%)")
+                        if self._is_uta:
+                            # UTA V3: POST /api/v3/trade/place-strategy-order (pos_profit)
+                            ok = self._uta_v3_place_strategy_order(
+                                symbol=symbol, plan_type="pos_profit",
+                                trigger_price=tp_p, hold_side=hold_side)
+                            if ok:
+                                logger.info(f"  📏 附加TP(U) @ {tp_p:.4f} ({ratio*100:.0f}%)")
+                            else:
+                                logger.warning(f"  ⚠️ 附加TP(U)失败")
                         else:
-                            logger.warning(f"  ⚠️ 附加TP失败: {tp_r.get('msg','?')}")
+                            # Classic V2: place_tpsl_order
+                            raw_symbol = symbol.split(":")[0].replace("/", "")
+                            tp_str = self.exchange.price_to_precision(symbol, tp_p)
+                            tp_params = {
+                                "symbol": raw_symbol,
+                                "productType": "usdt-futures",
+                                "marginCoin": "USDT",
+                                "holdSide": hold_side,
+                                "planType": "pos_profit",
+                                "triggerPrice": tp_str,
+                                "triggerType": "mark_price",
+                                "executePrice": tp_str,
+                            }
+                            tp_r = self.exchange.private_mix_post_v2_mix_order_place_tpsl_order(tp_params)
+                            if tp_r.get("code") == "00000":
+                                logger.info(f"  📏 附加TP @ {tp_str} ({ratio*100:.0f}%)")
+                            else:
+                                logger.warning(f"  ⚠️ 附加TP失败: {tp_r.get('msg','?')}")
                     except Exception as e:
                         logger.warning(f"  ⚠️ 附加TP异常: {e}")
 
@@ -758,13 +901,23 @@ class ExchangeInterface:
     ) -> Optional[Dict]:
         """
         市价平仓单（紧急停止 / AI平仓 / 自动止损用）。
-        v3.6 fix: 根据 Bitget v2 API 文档，双向持仓模式平仓规则：
-          - 平多: side=buy, tradeSide=close (不是 sell!)
-          - 平空: side=sell, tradeSide=close (不是 buy!)
+
+        Classic V2: Hedge模式 close_position / create_order(tradeSide=close)
+          - 平多: side=buy,  tradeSide=close
+          - 平空: side=sell, tradeSide=close
           - 双向模式禁止传 reduceOnly (会导致 40774)
-          - holdSide 不是请求参数，仅出现在持仓返回中
+
+        UTA V3: POST /api/v3/trade/close-positions
+          - category=USDT-FUTURES, symbol, posSide
+
         pos_side: "long" or "short"
         """
+        # UTA V3: 一键平仓 API (不依赖 reduceOnly, 不依赖方向推导)
+        if self._is_uta:
+            _ps = pos_side if pos_side else ("short" if str(side).upper() in ("SELL", "SHORT") else "long")
+            return self._uta_v3_close_positions(symbol, _ps)
+
+        # Classic V2 path
         try:
             # 优先使用 ccxt 的 close_position (内部处理了参数转换)
             if pos_side and hasattr(self.exchange, 'close_position'):
@@ -797,8 +950,11 @@ class ExchangeInterface:
         self, symbol: str, side: str, sl_price: float, tp_price: float
     ) -> bool:
         """
-        v3.6 重构: 使用 Bitget v2 place-pos-tpsl API，一次调用设好 SL+TP，自动替换旧的。
-        文档: POST /api/v2/mix/order/place-pos-tpsl
+        TPSL 设置 (Classic V2 + UTA V3 双路径)
+
+        Classic V2: POST /api/v2/mix/order/place-pos-tpsl — 一次设 SL+TP
+        UTA V3:    POST /api/v3/trade/place-strategy-order × 2 — pos_loss + pos_profit
+
         彻底解决重复计划单累积问题。
         """
         try:
@@ -843,23 +999,45 @@ class ExchangeInterface:
             try:
                 ticker = self.exchange.fetch_ticker(symbol)
                 mark = float(ticker.get("mark", ticker.get("last", 0)))
-                if mark > 0:
-                    # SL 校验
-                    if hold_side == "long" and sl_val >= mark:
-                        sl_str = self.exchange.price_to_precision(symbol, mark * 0.995)
-                    elif hold_side == "short" and sl_val <= mark:
-                        sl_str = self.exchange.price_to_precision(symbol, mark * 1.005)
-                    # TP 校验 (v4.0: 新增)
-                    tp_val = float(tp_str)
-                    if hold_side == "long" and tp_val <= mark:
-                        tp_str = self.exchange.price_to_precision(symbol, mark * 1.02)
-                        logger.warning(f"⚠️  TP方向修正: LONG TP必须>mark({mark}), 设为{mark*1.02:.4f}")
-                    elif hold_side == "short" and tp_val >= mark:
-                        tp_str = self.exchange.price_to_precision(symbol, mark * 0.98)
-                        logger.warning(f"⚠️  TP方向修正: SHORT TP必须<mark({mark}), 设为{mark*0.98:.4f}")
             except Exception:
-                logger.debug("⚠️  静默异常", exc_info=True)
+                mark = 0.0
+            if mark > 0:
+                # SL 校验
+                if hold_side == "long" and sl_val >= mark:
+                    sl_str = self.exchange.price_to_precision(symbol, mark * 0.995)
+                    sl_val = float(sl_str)
+                elif hold_side == "short" and sl_val <= mark:
+                    sl_str = self.exchange.price_to_precision(symbol, mark * 1.005)
+                    sl_val = float(sl_str)
+                # TP 校验 (v4.0: 新增)
+                tp_val = float(tp_str)
+                if hold_side == "long" and tp_val <= mark:
+                    tp_str = self.exchange.price_to_precision(symbol, mark * 1.02)
+                    logger.warning(f"⚠️  TP方向修正: LONG TP必须>mark({mark}), 设为{mark*1.02:.4f}")
+                elif hold_side == "short" and tp_val >= mark:
+                    tp_str = self.exchange.price_to_precision(symbol, mark * 0.98)
+                    logger.warning(f"⚠️  TP方向修正: SHORT TP必须<mark({mark}), 设为{mark*0.98:.4f}")
 
+            # ── UTA V3 路径: 两次策略单 (pos_loss + pos_profit) ──
+            if self._is_uta:
+                sl_ok = self._uta_v3_place_strategy_order(
+                    symbol=symbol, plan_type="pos_loss",
+                    trigger_price=float(sl_str), hold_side=hold_side)
+                tp_ok = self._uta_v3_place_strategy_order(
+                    symbol=symbol, plan_type="pos_profit",
+                    trigger_price=float(tp_str), hold_side=hold_side)
+                if sl_ok and tp_ok:
+                    logger.info(f"🛡️🎯 {symbol} SL={sl_str} TP={tp_str} → UTA V3 OK")
+                    _entry_key = int(mark * 100) if mark > 0 else 0
+                    self._tpsl_cache[(symbol, hold_side, _entry_key)] = (
+                        float(sl_str), float(tp_str), time.time()
+                    )
+                    return True
+                # V3 不支持 place-pos-tpsl 降级, 部分失败即返回
+                logger.warning(f"⚠️ UTA V3 TPSL 部分失败: SL={sl_ok} TP={tp_ok}")
+                return sl_ok or tp_ok
+
+            # ── Classic V2 路径: place-pos-tpsl ──
             raw_symbol = symbol.split(":")[0].replace("/", "")
             params = {
                 "symbol": raw_symbol,
@@ -895,7 +1073,22 @@ class ExchangeInterface:
     def _set_sl_tp_via_plan_orders(self, symbol: str, hold_side: str,
                                     sl_str: str, tp_str: str,
                                     raw_symbol: str) -> bool:
-        """v4.0: 用独立 plan order 设 SL/TP (place-pos-tpsl 的降级方案)"""
+        """v4.0: 用独立 plan order 设 SL/TP (place-pos-tpsl 的降级方案)
+
+        UTA V3:    POST /api/v3/trade/place-strategy-order × 2
+        Classic V2: POST /api/v2/mix/order/place-tpsl-order × 2
+        """
+        # UTA V3 path
+        if self._is_uta:
+            sl_ok = self._uta_v3_place_strategy_order(
+                symbol=symbol, plan_type="pos_loss",
+                trigger_price=float(sl_str), hold_side=hold_side)
+            tp_ok = self._uta_v3_place_strategy_order(
+                symbol=symbol, plan_type="pos_profit",
+                trigger_price=float(tp_str), hold_side=hold_side)
+            return sl_ok and tp_ok
+
+        # Classic V2 path
         try:
             ok = True
             # 撤旧止损单
