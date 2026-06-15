@@ -95,6 +95,10 @@ class ExchangeInterface:
         plan_type: "pos_loss"|"pos_profit"
         hold_side: "long"|"short"
         """
+        # ── hold_side 值校验 ──
+        if hold_side not in ("long", "short"):
+            logger.error(f"❌ UTA V3 策略单拒绝: hold_side={hold_side} (只允许 long/short)")
+            return False
         raw_symbol = symbol.split(":")[0].replace("/", "")
         if execute_price is None:
             execute_price = trigger_price
@@ -125,6 +129,7 @@ class ExchangeInterface:
             "triggerType": "mark_price",
             "executePrice": ep_str,
             "holdSide": hold_side,
+            "posSide": hold_side,       # V3 requirement: posSide must not be empty
         }
         try:
             resp = self.exchange.private_uta_post_v3_trade_place_strategy_order(params)

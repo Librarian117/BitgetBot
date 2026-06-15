@@ -219,6 +219,7 @@ class TestUTATPSLPayload(unittest.TestCase):
         self.assertEqual(call_params["marginCoin"], "USDT")
         self.assertEqual(call_params["planType"], "pos_loss")
         self.assertEqual(call_params["holdSide"], "long")
+        self.assertEqual(call_params["posSide"], "long")    # V3: posSide must equal holdSide
         self.assertEqual(call_params["triggerType"], "mark_price")
         self.assertIn("triggerPrice", call_params)
         self.assertIn("executePrice", call_params)
@@ -234,6 +235,7 @@ class TestUTATPSLPayload(unittest.TestCase):
         self.assertEqual(call_params["symbol"], "ETHUSDT")
         self.assertEqual(call_params["planType"], "pos_profit")
         self.assertEqual(call_params["holdSide"], "short")
+        self.assertEqual(call_params["posSide"], "short")
 
     def test_pos_loss_short_payload(self):
         """Short pos_loss: holdSide=short"""
@@ -245,6 +247,7 @@ class TestUTATPSLPayload(unittest.TestCase):
         call_params = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args[0][0]
         self.assertEqual(call_params["planType"], "pos_loss")
         self.assertEqual(call_params["holdSide"], "short")
+        self.assertEqual(call_params["posSide"], "short")
 
     def test_pos_profit_long_payload(self):
         """Long pos_profit: holdSide=long"""
@@ -256,6 +259,7 @@ class TestUTATPSLPayload(unittest.TestCase):
         call_params = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args[0][0]
         self.assertEqual(call_params["planType"], "pos_profit")
         self.assertEqual(call_params["holdSide"], "long")
+        self.assertEqual(call_params["posSide"], "long")
 
     def test_strategy_order_failure_returns_false(self):
         """策略单失败返回 False"""
@@ -265,6 +269,15 @@ class TestUTATPSLPayload(unittest.TestCase):
             symbol="BTC/USDT:USDT", plan_type="pos_loss",
             trigger_price=49000.0, hold_side="long")
         self.assertFalse(ok)
+
+    def test_invalid_hold_side_rejected(self):
+        """非法 hold_side → 拒绝发单, 不调 API"""
+        self.ex.private_uta_post_v3_trade_place_strategy_order.reset_mock()
+        ok = self.ei._uta_v3_place_strategy_order(
+            symbol="BTC/USDT:USDT", plan_type="pos_loss",
+            trigger_price=49000.0, hold_side="buy")  # "buy" not "long"/"short"
+        self.assertFalse(ok)
+        self.ex.private_uta_post_v3_trade_place_strategy_order.assert_not_called()
 
 
 class TestUTAWritePathIntegration(unittest.TestCase):
