@@ -189,10 +189,11 @@ class ConfigManager:
         self.news_sentiment_enabled = os.getenv("NEWS_SENTIMENT_ENABLED", "false").lower() == "true"
         self.deepseek_anomaly_detection = os.getenv("DEEPSEEK_ANOMALY_DETECTION", "false").lower() == "true"
         self.deepseek_market_commentary = os.getenv("DEEPSEEK_MARKET_COMMENTARY", "false").lower() == "true"
-        # ── v3.6: AI 持仓审核 (定期审查已持仓是否需要提前退出) ──
-        self.ai_position_review_enabled = os.getenv("AI_POSITION_REVIEW_ENABLED", "true").lower() == "true"
-        self.ai_position_review_interval = int(os.getenv("AI_POSITION_REVIEW_INTERVAL", "3"))
-        self.ai_position_review_min_roi = float(os.getenv("AI_POSITION_REVIEW_MIN_ROI", "0.05"))
+        # ── v4.5→Phase2: 规则引擎持仓审查 (AI 决策层已永久禁用, 仅保留硬编码规则) ──
+        # 环境变量名 AI_POSITION_REVIEW_* 保留向后兼容, 内部已重命名为 rule_exit_review_*
+        self.rule_exit_review_enabled = os.getenv("AI_POSITION_REVIEW_ENABLED", "true").lower() == "true"
+        self.rule_exit_review_interval = int(os.getenv("AI_POSITION_REVIEW_INTERVAL", "3"))
+        self.rule_exit_review_min_roi = float(os.getenv("AI_POSITION_REVIEW_MIN_ROI", "0.05"))
         # ── v3.6: 浮亏自动止损 ──
         self.auto_sl_enabled = os.getenv("AUTO_SL_ENABLED", "true").lower() == "true"
         self.auto_sl_roi_threshold = float(os.getenv("AUTO_SL_ROI_THRESHOLD", "-0.30"))
