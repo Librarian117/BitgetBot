@@ -257,7 +257,10 @@ class ExchangeInterface:
                     {"category": "USDT-FUTURES"})
                 if resp.get("code") == "00000":
                     api_ok = True
-                    for p in resp.get("data", []) or []:
+                    raw_data = resp.get("data", []) or []
+                    # UTA returns dict (0 pos) or list (1+ pos)
+                    pos_list = raw_data if isinstance(raw_data, list) else []
+                    for p in pos_list:
                         # Normalize UTA V3 fields to Classic format
                         contracts = float(p.get("available", 0) or 0)
                         if contracts == 0:
