@@ -1041,24 +1041,45 @@ class ExchangeInterface:
                     tp_str = self.exchange.price_to_precision(symbol, mark * 0.98)
                     logger.warning(f"⚠️  TP方向修正: SHORT TP必须<mark({mark}), 设为{mark*0.98:.4f}")
 
-            # ── UTA V3 路径: 两次策略单 (pos_loss + pos_profit) ──
+            # ── UTA V3 路径: 一次策略单同时设 SL+TP ──
+            # V3 pos_loss/pos_profit 两次独立调用会互相覆盖导致只留一个。
+            # 正确做法: planType=normal + 同时传 stopLoss 和 takeProfit。
             if self._is_uta:
-                sl_ok = self._uta_v3_place_strategy_order(
-                    symbol=symbol, plan_type="pos_loss",
-                    trigger_price=float(sl_str), hold_side=hold_side)
-                tp_ok = self._uta_v3_place_strategy_order(
-                    symbol=symbol, plan_type="pos_profit",
-                    trigger_price=float(tp_str), hold_side=hold_side)
-                if sl_ok and tp_ok:
-                    logger.info(f"🛡️🎯 {symbol} SL={sl_str} TP={tp_str} → UTA V3 OK")
-                    _entry_key = int(mark * 100) if mark > 0 else 0
-                    self._tpsl_cache[(symbol, hold_side, _entry_key)] = (
-                        float(sl_str), float(tp_str), time.time()
-                    )
-                    return True
-                # V3 不支持 place-pos-tpsl 降级, 部分失败即返回
-                logger.warning(f"⚠️ UTA V3 TPSL 部分失败: SL={sl_ok} TP={tp_ok}")
-                return sl_ok or tp_ok
+                raw_symbol = symbol.split(":")[0].replace("/", "")
+                try:
+                    tp_val = float(tp_str)
+                    sl_val = float(sl_str)
+                except ValueError:
+                    logger.error(f"❌ UTA V3 TPSL 价格转换失败: SL={sl_str} TP={tp_str}")
+                    return False
+                params = {
+                    "symbol": raw_symbol,
+                    "category": "USDT-FUTURES",
+                    "marginCoin": "USDT",
+                    "planType": "normal",
+                    "triggerPrice": str(sl_val),
+                    "triggerType": "mark_price",
+                    "executePrice": str(sl_val),
+                    "holdSide": hold_side,
+                    "posSide": hold_side,
+                    "stopLoss": str(sl_val),
+                    "takeProfit": str(tp_val),
+                }
+                try:
+                    resp = self.exchange.private_uta_post_v3_trade_place_strategy_order(params)
+                    code = resp.get("code", "")
+                    if code == "00000":
+                        logger.info(f"🛡️🎯 {symbol} SL={sl_str} TP={tp_str} → UTA V3 OK")
+                        _entry_key = int(mark * 100) if mark > 0 else 0
+                        self._tpsl_cache[(symbol, hold_side, _entry_key)] = (
+                            float(sl_str), float(tp_str), time.time()
+                        )
+                        return True
+                    logger.warning(f"⚠️ UTA V3 TPSL 失败: code={code} msg={resp.get('msg')}")
+                    return False
+                except Exception as e:
+                    logger.error(f"❌ UTA V3 TPSL 异常: {e}")
+                    return False
 
             # ── Classic V2 路径: place-pos-tpsl ──
             raw_symbol = symbol.split(":")[0].replace("/", "")

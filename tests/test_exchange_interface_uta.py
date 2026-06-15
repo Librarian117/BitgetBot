@@ -298,34 +298,35 @@ class TestUTAWritePathIntegration(unittest.TestCase):
         self.assertEqual(call_params["posSide"], "long")
 
     def test_set_position_sl_tp_uta_path(self):
-        """set_position_sl_tp 走 UTA V3 路径 (两次策略单)"""
+        """set_position_sl_tp 走 UTA V3 路径 (一次合并 SL+TP)"""
         ok = self.ei.set_position_sl_tp(
             symbol="BTC/USDT:USDT", side="long",
             sl_price=49000.0, tp_price=52000.0)
         self.assertTrue(ok)
-        # 应调用两次 strategy order: pos_loss + pos_profit
+        # 应调用一次 strategy order: planType=normal + stopLoss + takeProfit
         self.assertEqual(
-            self.ex.private_uta_post_v3_trade_place_strategy_order.call_count, 2)
+            self.ex.private_uta_post_v3_trade_place_strategy_order.call_count, 1)
 
-        # 第一次调用: pos_loss
-        first_call = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args_list[0][0][0]
-        self.assertEqual(first_call["planType"], "pos_loss")
-        self.assertEqual(first_call["holdSide"], "long")
-
-        # 第二次调用: pos_profit
-        second_call = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args_list[1][0][0]
-        self.assertEqual(second_call["planType"], "pos_profit")
-        self.assertEqual(second_call["holdSide"], "long")
+        call_params = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args[0][0]
+        self.assertEqual(call_params["planType"], "normal")
+        self.assertEqual(call_params["holdSide"], "long")
+        self.assertEqual(call_params["posSide"], "long")
+        self.assertIn("stopLoss", call_params)
+        self.assertIn("takeProfit", call_params)
+        self.assertNotEqual(call_params.get("stopLoss"), "")
+        self.assertNotEqual(call_params.get("takeProfit"), "")
 
     def test_set_position_sl_tp_short_uta_path(self):
-        """Short TPSL via UTA V3"""
+        """Short TPSL via UTA V3 (一次合并 SL+TP)"""
         ok = self.ei.set_position_sl_tp(
             symbol="ETH/USDT:USDT", side="short",
             sl_price=2100.0, tp_price=1900.0)
         self.assertTrue(ok)
-
-        first_call = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args_list[0][0][0]
-        self.assertEqual(first_call["holdSide"], "short")
+        self.assertEqual(
+            self.ex.private_uta_post_v3_trade_place_strategy_order.call_count, 1)
+        call_params = self.ex.private_uta_post_v3_trade_place_strategy_order.call_args[0][0]
+        self.assertEqual(call_params["holdSide"], "short")
+        self.assertEqual(call_params["planType"], "normal")
 
     def test_uta_path_not_used_when_is_uta_false(self):
         """_is_uta=False 时仍走 Classic 路径"""
@@ -365,9 +366,9 @@ class TestUTAWritePathIntegration(unittest.TestCase):
         # place_order 调用1次 (市价单)
         self.assertEqual(self.ex.private_uta_post_v3_trade_place_order.call_count, 1)
 
-        # strategy_order: SL(pos_loss) + TP1(pos_profit) + TP2(pos_profit) = 3
+        # strategy_order: SL+TP combined(normal) + TP2(pos_profit) = 2
         self.assertGreaterEqual(
-            self.ex.private_uta_post_v3_trade_place_strategy_order.call_count, 3)
+            self.ex.private_uta_post_v3_trade_place_strategy_order.call_count, 2)
 
     def test_no_ccxt_classic_in_uta_path(self):
         """UTA path 不应调用任何 Classic V2 方法"""
