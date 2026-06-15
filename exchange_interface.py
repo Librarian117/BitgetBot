@@ -47,7 +47,16 @@ class ExchangeInterface:
         side: "buy"|"sell"
         pos_side: "long"|"short"
         trade_side: "open"|"close"
+        amount: 合约张数（由 trade_executor 计算，已对齐最小下单量）
         """
+        # ── 最小下单量保护 ──
+        min_qty = self.get_min_amount(symbol)
+        if amount < min_qty:
+            logger.warning(
+                f"⛔ SKIP_BELOW_MIN_ORDER {symbol}: qty={amount} < min={min_qty} → 跳过，不发送 POST"
+            )
+            return None
+
         raw_symbol = symbol.split(":")[0].replace("/", "")
         params = {
             "symbol": raw_symbol,
@@ -56,7 +65,7 @@ class ExchangeInterface:
             "side": side,
             "posSide": pos_side,
             "orderType": "market",
-            "size": str(amount),
+            "qty": str(amount),
             "tradeSide": trade_side,
         }
         try:

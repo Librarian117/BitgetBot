@@ -117,7 +117,7 @@ class TestUTAMarketOrderPayload(unittest.TestCase):
         self.assertEqual(call_params["side"], "buy")
         self.assertEqual(call_params["posSide"], "long")
         self.assertEqual(call_params["orderType"], "market")
-        self.assertEqual(call_params["size"], "1.0")
+        self.assertEqual(call_params["qty"], "1.0")
         self.assertEqual(call_params["tradeSide"], "open")
 
     def test_short_entry_payload(self):
@@ -131,8 +131,18 @@ class TestUTAMarketOrderPayload(unittest.TestCase):
         self.assertEqual(call_params["symbol"], "ETHUSDT")
         self.assertEqual(call_params["side"], "sell")
         self.assertEqual(call_params["posSide"], "short")
-        self.assertEqual(call_params["size"], "2.0")
+        self.assertEqual(call_params["qty"], "2.0")
         self.assertEqual(call_params["tradeSide"], "open")
+
+    def test_below_min_order_returns_none(self):
+        """qty < min_amount → 跳过, 不发送 POST"""
+        self.ex.private_uta_post_v3_trade_place_order.reset_mock()
+        order = self.ei._uta_v3_create_market_order(
+            symbol="BTC/USDT:USDT", side="buy", amount=0.0001,
+            pos_side="long", trade_side="open")
+        self.assertIsNone(order)
+        # 不应调用 place_order (在 min check 处直接 return)
+        self.ex.private_uta_post_v3_trade_place_order.assert_not_called()
 
     def test_market_order_failure_returns_none(self):
         """API 失败时返回 None"""
