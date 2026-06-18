@@ -197,6 +197,8 @@ class DeepSeekQuantBot:
                 self.news_client = CryptoPanicClient(
                     self.config.cryptopanic_api_key or None
                 )
+                # F&G 数据源统一: CryptoPanicClient 消费 MarketContextManager 的 F&G 缓存
+                self.news_client.set_fng_provider(self.market_ctx)
                 logger.info("📋 新闻集成: 已启用" + (
                     " (CryptoPanic)" if self.config.cryptopanic_api_key else " (免费源)"
                 ))
@@ -1197,7 +1199,7 @@ class DeepSeekQuantBot:
             # ── ⑤ EMA 交叉策略 (P3: extracted → evaluate_ema_cross) ──
             if direction is None:
                 ema_cross_signal = evaluate_ema_cross(
-                    df, cidx, close, ema200, rsi, self.config.momentum_enabled)
+                    df, cidx, close, ema200, rsi, self.config.ema_cross_enabled)
                 if ema_cross_signal:
                     direction = ema_cross_signal["direction"]
                     strategy = ema_cross_signal["strategy"]
@@ -1460,12 +1462,43 @@ class DeepSeekQuantBot:
                     except Exception:
                         logger.debug("⚠️  静默异常", exc_info=True)
 
-                # v4.5: 扫描期不再构建单TF regime_info — 单TF分类不可靠
-                # 执行期多TF Regime 已统一处理方向+策略路由
-                # 单TF regime 的 recommended 会在 scorer 里提前惩罚策略，
-                # 随后执行期又用多TF Regime 再路由一次 → 同类信息双重消费
-                # 现在扫描期 scorer 收到 regime_info=None → regime 维度返回中性 50
-                regime_info = None
+                # v4.5→fix: 构建简化单TF regime_info 供 scorer 消费
+                # 目的: 让 12% 的 regime 权重不再死权重(始终50)
+                # scorer 中的 regime 只影响评分(不阻断), 真实的硬阻止仍在 _phase_execute 中
+                # 这是评分信息补充, 不是双重消费 — 执行期多TF Regime 是 gate, 扫描期是 score
+                _atr_pct = (atr / close * 100) if close > 0 else 0
+                if _atr_pct >= 2.5:
+                    _simple_regime = "panic"
+                    _simple_recommended: List[str] = []
+                    _simple_conf = 85
+                elif is_bullish_trend and adx >= 25:
+                    _simple_regime = "strong_bull"
+                    _simple_recommended = ["momentum", "pullback", "ema_cross"]
+                    _simple_conf = 70
+                elif is_bullish_trend:
+                    _simple_regime = "bull"
+                    _simple_recommended = ["pullback", "ema_cross"]
+                    _simple_conf = 55
+                elif is_bearish_trend and adx >= 25:
+                    _simple_regime = "strong_bear"
+                    _simple_recommended = ["momentum", "pullback", "ema_cross"]
+                    _simple_conf = 70
+                elif is_bearish_trend:
+                    _simple_regime = "bear"
+                    _simple_recommended = ["pullback", "ema_cross"]
+                    _simple_conf = 55
+                else:
+                    _simple_regime = "range"
+                    _simple_recommended = ["pullback", "bollinger", "ema_cross"]
+                    if adx >= 25:
+                        _simple_recommended.append("momentum")
+                    _simple_conf = 40
+                regime_info = {
+                    "regime": _simple_regime,
+                    "recommended": _simple_recommended,
+                    "confidence": _simple_conf,
+                    "detail": f"单TF {_simple_regime} ADX={adx:.0f} ATR%={_atr_pct:.1f}",
+                }
 
                 score_result = self.scorer.score(
                     sig={"direction": direction, "strategy": strategy,
@@ -2446,58 +2479,66 @@ class DeepSeekQuantBot:
         num_existing = self.exchange.count_open_positions()
         max_new = max(0, effective_max_pos - num_existing)
         if max_new <= 0 and candidates:
-            # ── v3.3: 仓位轮动 —— 满仓时依次尝试换掉亏损仓 ──
-            rotated = 0
-            pos_list = sorted(acct.get("positions_detail", []),
-                             key=lambda x: x.get("unrealized_pnl", 0))  # 亏损最多的排前面
-            for sig in candidates[:3]:
-                if rotated >= 1:
-                    break
-                new_conf = sig.get("confidence", 50)
-                if new_conf < 55:
-                    continue
-                for worst in pos_list:
-                    worst_upl = worst.get("unrealized_pnl", 0)
-                    worst_symbol = worst.get("symbol", "?")
-                    if worst_upl >= 0:  # 只换亏损仓位
+            # ── v4.5→Phase2: 小额账户禁用轮动，避免杀盈利单 ──
+            if self.config.max_concurrent_positions <= 2:
+                logger.info(
+                    f"⛔ 仓位轮动已禁用 (max_positions={self.config.max_concurrent_positions}≤2)，"
+                    f"跳过{candidates[0].get('symbol','?')}等{len(candidates)}个候选"
+                )
+                max_new = 0  # 强制阻断
+            else:
+                # ── v3.3: 仓位轮动 —— 满仓时依次尝试换掉亏损仓 ──
+                rotated = 0
+                pos_list = sorted(acct.get("positions_detail", []),
+                                 key=lambda x: x.get("unrealized_pnl", 0))  # 亏损最多的排前面
+                for sig in candidates[:3]:
+                    if rotated >= 1:
+                        break
+                    new_conf = sig.get("confidence", 50)
+                    if new_conf < 55:
                         continue
-                    logger.info(
-                        f"🔄 仓位轮动: 平掉 {worst_symbol} "
-                        f"(浮亏{worst_upl:+.2f}) → 开 {sig['symbol']} "
-                        f"(置信度={new_conf})"
-                    )
-                    try:
-                        sym_full = f"{worst_symbol}/USDT:USDT"
-                        w_side = "buy" if worst.get("side") == "SHORT" else "sell"
-                        w_cts = int(worst.get("contracts", 0))
-                        w_hold = "short" if worst.get("side") == "SHORT" else "long"
-                        if w_cts > 0:
-                            close_o = self.exchange.create_market_order_close(
-                                sym_full, w_cts, w_side, w_hold
-                            )
-                            logger.info(f"🔄 平仓 {worst_symbol}: {close_o.get('id', '?') if close_o else 'CANCELLED'}")
-                            rotated += 1
-                            # v4.5→Phase2: 统一出口
-                            w_entry = worst.get("entry_price", 0)
-                            w_mark = worst.get("mark_price", 0)
-                            w_margin = worst.get("margin", 0)
-                            w_side2 = worst.get("side", "LONG")
-                            self._finalize_closed_position(
-                                symbol=sym_full, side=w_side2,
-                                entry=w_entry, contracts=w_cts, margin=w_margin,
-                                upl=worst_upl, close_reason="ROTATION_CLOSE",
-                                open_ts=self._position_open_times.get(sym_full, 0),
-                                strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
-                                close_order_result=close_o, mark_price=w_mark,
-                            )
-                            self.tlogger.log_risk("ROTATION_CLOSE",
-                                f"平{worst_symbol}浮亏{worst_upl:+.2f}→开{sig['symbol']}")
-                            num_existing = self.exchange.count_open_positions()
-                            max_new = max(0, self.config.max_concurrent_positions - num_existing)
-                            break  # 成功换仓，跳出最弱仓位循环
-                    except Exception as e:
-                        logger.warning(f"🔄 轮动平仓 {worst_symbol} 失败: {e}")
-                        continue  # 尝试下一个亏损仓位
+                    for worst in pos_list:
+                        worst_upl = worst.get("unrealized_pnl", 0)
+                        worst_symbol = worst.get("symbol", "?")
+                        if worst_upl >= 0:  # 只换亏损仓位
+                            continue
+                        logger.info(
+                            f"🔄 仓位轮动: 平掉 {worst_symbol} "
+                            f"(浮亏{worst_upl:+.2f}) → 开 {sig['symbol']} "
+                            f"(置信度={new_conf})"
+                        )
+                        try:
+                            sym_full = f"{worst_symbol}/USDT:USDT"
+                            w_side = "buy" if worst.get("side") == "SHORT" else "sell"
+                            w_cts = int(worst.get("contracts", 0))
+                            w_hold = "short" if worst.get("side") == "SHORT" else "long"
+                            if w_cts > 0:
+                                close_o = self.exchange.create_market_order_close(
+                                    sym_full, w_cts, w_side, w_hold
+                                )
+                                logger.info(f"🔄 平仓 {worst_symbol}: {close_o.get('id', '?') if close_o else 'CANCELLED'}")
+                                rotated += 1
+                                # v4.5→Phase2: 统一出口
+                                w_entry = worst.get("entry_price", 0)
+                                w_mark = worst.get("mark_price", 0)
+                                w_margin = worst.get("margin", 0)
+                                w_side2 = worst.get("side", "LONG")
+                                self._finalize_closed_position(
+                                    symbol=sym_full, side=w_side2,
+                                    entry=w_entry, contracts=w_cts, margin=w_margin,
+                                    upl=worst_upl, close_reason="ROTATION_CLOSE",
+                                    open_ts=self._position_open_times.get(sym_full, 0),
+                                    strategy=getattr(self, '_position_strategies', {}).get(sym_full, "pullback"),
+                                    close_order_result=close_o, mark_price=w_mark,
+                                )
+                                self.tlogger.log_risk("ROTATION_CLOSE",
+                                    f"平{worst_symbol}浮亏{worst_upl:+.2f}→开{sig['symbol']}")
+                                num_existing = self.exchange.count_open_positions()
+                                max_new = max(0, self.config.max_concurrent_positions - num_existing)
+                                break  # 成功换仓，跳出最弱仓位循环
+                        except Exception as e:
+                            logger.warning(f"🔄 轮动平仓 {worst_symbol} 失败: {e}")
+                            continue  # 尝试下一个亏损仓位
 
         if max_new <= 0:
             logger.warning(
